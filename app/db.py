@@ -26,6 +26,7 @@ def init_db():
                 full_name TEXT,
                 personal_qr_token TEXT UNIQUE NOT NULL,
                 active_shop_id BIGINT NULL,
+                panel_mode TEXT NOT NULL DEFAULT 'auto',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """)
@@ -164,6 +165,38 @@ def get_user_by_qr_token(token: str):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE personal_qr_token = %s", (token,))
             return cur.fetchone()
+
+
+def get_panel_mode(telegram_user_id: int) -> str:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT panel_mode
+            FROM users
+            WHERE telegram_user_id = %s
+            """, (telegram_user_id,))
+            row = cur.fetchone()
+
+            if not row:
+                return "auto"
+
+            value = row["panel_mode"] or "auto"
+            if value not in ("auto", "super_admin", "owner"):
+                return "auto"
+            return value
+
+
+def set_panel_mode(telegram_user_id: int, mode: str):
+    if mode not in ("auto", "super_admin", "owner"):
+        raise ValueError("invalid panel mode")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            UPDATE users
+            SET panel_mode = %s
+            WHERE telegram_user_id = %s
+            """, (mode, telegram_user_id))
 
 
 def set_active_shop(telegram_user_id: int, shop_id: int):
@@ -587,5 +620,43 @@ def extend_subscription(shop_id: int, days: int, plan: str = "basic"):
             return cur.fetchone()
 
 
-def can_send_broadcast(user_id: int) -> bool:
-    return True
+def can_send_broadcast(shop_id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT COUNT(*) AS cnt
+            FROM broadcasts
+            WHERE shop_id = %s
+              AND created_at >= NOW() - INTERVAL '7 days'
+            """, (shop_id,))
+            row = cur.fetchone()
+            return row["cnt"] < 2
+
+
+def get_broadcast_recipients(shop_id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT u.telegram_user_id
+            FROM shop_clients sc
+            JOIN users u ON u.id = sc.user_id
+            WHERE sc.shop_id = %s
+              AND sc.last_activity_at >= NOW() - INTERVAL '60 days'
+            ORDER BY u.telegram_user_id
+            """, (shop_id,))
+            return cur.fetchall()
+
+
+def save_broadcast(shop_id: int, sender_telegram_user_id: int, text: str, recipients_count: int):
+    sender = get_user_by_telegram_id(sender_telegram_user_id)
+    if not sender:
+        return None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO broadcasts (shop_id, sender_user_id, text, recipients_count)
+            VALUES (%s, %s, %s, %s)
+            RETURNING *
+            """, (shop_id, sender["id"], text, recipients_count))
+            return cur.fetchone()
