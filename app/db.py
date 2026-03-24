@@ -129,6 +129,11 @@ def init_db():
             ADD COLUMN IF NOT EXISTS pending_owner_telegram_id BIGINT NULL
             """)
 
+            cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS panel_mode TEXT NOT NULL DEFAULT 'auto'
+            """)
+
 
 init_db()
 
@@ -582,43 +587,4 @@ def extend_subscription(shop_id: int, days: int, plan: str = "basic"):
             return cur.fetchone()
 
 
-def can_send_broadcast(shop_id: int):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            SELECT COUNT(*) AS cnt
-            FROM broadcasts
-            WHERE shop_id = %s
-              AND created_at >= NOW() - INTERVAL '7 days'
-            """, (shop_id,))
-            row = cur.fetchone()
-            return row["cnt"] < 2
-
-
-def get_broadcast_recipients(shop_id: int):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            SELECT u.telegram_user_id
-            FROM shop_clients sc
-            JOIN users u ON u.id = sc.user_id
-            WHERE sc.shop_id = %s
-              AND sc.last_activity_at >= NOW() - INTERVAL '60 days'
-            ORDER BY u.telegram_user_id
-            """, (shop_id,))
-            return cur.fetchall()
-
-
-def save_broadcast(shop_id: int, sender_telegram_user_id: int, text: str, recipients_count: int):
-    sender = get_user_by_telegram_id(sender_telegram_user_id)
-    if not sender:
-        return None
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            INSERT INTO broadcasts (shop_id, sender_user_id, text, recipients_count)
-            VALUES (%s, %s, %s, %s)
-            RETURNING *
-            """, (shop_id, sender["id"], text, recipients_count))
-            return cur.fetchone()
+def can_send_broadcast
