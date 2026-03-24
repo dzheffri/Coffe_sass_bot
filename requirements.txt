@@ -1,5 +1,7 @@
 aiogram
-psycopg[binary]
 python-dotenv
+psycopg[binary]
 qrcode
 Pillow
+aiohttp
+opencv-python-headless
