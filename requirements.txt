@@ -1,0 +1,5 @@
+aiogram
+psycopg[binary]
+python-dotenv
+qrcode
+Pillow
