@@ -22,19 +22,19 @@ async def send_correct_panel(message: types.Message):
     owner_flag = is_owner(user_id)
     super_admin_flag = user_id in SUPER_ADMIN_IDS
 
-   if not admin_flag and not super_admin_flag:
-    await message.answer(
-        "👋 Вітаємо у програмі лояльності <b>Наші Coffee Club Pass</b> ☕\n\n"
-        "✨ Ваша кава — тепер ще вигідніша\n\n"
-        "☕ За кожну покупку ти отримуєш чашки\n"
-        "🎁 Збери 7 — і отримай 8-му каву безкоштовно\n\n"
-        "📱 Просто натисни <b>«Мій QR-код»</b>\n"
-        "і покажи його баристі при замовленні\n\n"
-        "🚀 Один QR-код працює у всіх кав’ярнях,\n"
-        "які підключені до програми «Наші»",
-        reply_markup=user_main_keyboard()
-    )
-    return
+    if not admin_flag and not super_admin_flag:
+        await message.answer(
+            "👋 Вітаємо у програмі лояльності <b>Наші Coffee Club Pass</b> ☕\n\n"
+            "✨ Ваша кава — тепер ще вигідніша\n\n"
+            "☕ За кожну покупку ти отримуєш чашки\n"
+            "🎁 Збери 7 — і отримай 8-му каву безкоштовно\n\n"
+            "📱 Просто натисни <b>«Мій QR-код»</b>\n"
+            "і покажи його баристі при замовленні\n\n"
+            "🚀 Один QR-код працює у всіх кав’ярнях,\n"
+            "які підключені до програми «Наші»",
+            reply_markup=user_main_keyboard()
+        )
+        return
 
     panel_mode = get_panel_mode(user_id)
 
