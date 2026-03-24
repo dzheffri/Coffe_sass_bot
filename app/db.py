@@ -587,4 +587,5 @@ def extend_subscription(shop_id: int, days: int, plan: str = "basic"):
             return cur.fetchone()
 
 
-def can_send_broadcast
+def can_send_broadcast(user_id: int) -> bool:
+    return True
