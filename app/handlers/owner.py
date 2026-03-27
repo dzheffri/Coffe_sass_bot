@@ -1,5 +1,6 @@
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 from app.db import (
     is_owner,
@@ -14,27 +15,30 @@ from app.db import (
     save_broadcast,
 )
 from app.states import OwnerStates
+from app.keyboards import admin_main_keyboard
+from app.config import SCANNER_URL, SUPER_ADMIN_IDS
 
 router = Router()
 
-BLOCKED_BROADCAST_TEXTS = {
-    "📷 Режим: нарахування",
-    "✅ Режим: списання",
-    "📱 Відкрити сканер",
-    "📊 Статистика кав’ярні",
-    "➕ Додати адміністратора",
-    "➖ Видалити адміністратора",
-    "👤 Список адміністраторів",
-    "📣 Зробити розсилку",
-    "💳 Підписка",
-    "🌍 Вся система",
-    "🏪 Додати кав’ярню",
-    "🏪 Список кав’ярень",
-    "💳 Продовжити підписку",
-    "🏪 Режим owner",
-    "👑 Режим super admin",
-    "❌ Скасувати розсилку",
-}
+
+def broadcast_cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="❌ Скасувати розсилку")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def owner_main_keyboard_for_user(user_id: int):
+    is_super_admin = user_id in SUPER_ADMIN_IDS
+    return admin_main_keyboard(
+        scanner_url=SCANNER_URL,
+        is_owner=True,
+        is_super_admin=False,
+        can_switch_to_owner=False,
+        can_switch_to_super_admin=is_super_admin,
+    )
 
 
 @router.message(F.text == "📊 Статистика кав’ярні")
@@ -74,6 +78,7 @@ async def add_admin_start(message: types.Message, state: FSMContext):
 @router.message(OwnerStates.waiting_add_admin_id)
 async def add_admin_finish(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
+        await state.clear()
         return
 
     text = (message.text or "").strip()
@@ -90,7 +95,7 @@ async def add_admin_finish(message: types.Message, state: FSMContext):
         await message.answer("❌ Користувач ще не заходив у бота через /start.")
         return
 
-    await message.answer("✅ Адміністратора додано.")
+    await message.answer("✅ Адміністратора додано.", reply_markup=owner_main_keyboard_for_user(message.from_user.id))
 
 
 @router.message(F.text == "➖ Видалити адміністратора")
@@ -105,6 +110,7 @@ async def remove_admin_start(message: types.Message, state: FSMContext):
 @router.message(OwnerStates.waiting_remove_admin_id)
 async def remove_admin_finish(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
+        await state.clear()
         return
 
     text = (message.text or "").strip()
@@ -121,7 +127,7 @@ async def remove_admin_finish(message: types.Message, state: FSMContext):
         await message.answer("❌ Адміністратора не знайдено.")
         return
 
-    await message.answer("✅ Адміністратора видалено.")
+    await message.answer("✅ Адміністратора видалено.", reply_markup=owner_main_keyboard_for_user(message.from_user.id))
 
 
 @router.message(F.text == "👤 Список адміністраторів")
@@ -179,33 +185,31 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
     await message.answer(
         "Надішли текст або фото з підписом для розсилки.\n\n"
         "Розсилка піде тільки активним клієнтам цієї кав’ярні за останні 60 днів.\n\n"
-        "Щоб скасувати, надішли:\n"
-        "❌ Скасувати розсилку"
+        "Щоб скасувати, натисни кнопку нижче 👇",
+        reply_markup=broadcast_cancel_keyboard()
     )
 
 
 @router.message(OwnerStates.waiting_broadcast_text, F.text == "❌ Скасувати розсилку")
 async def broadcast_cancel_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("✅ Розсилку скасовано.")
+    await message.answer(
+        "✅ Розсилку скасовано.",
+        reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+    )
 
 
 @router.message(OwnerStates.waiting_broadcast_text)
 async def broadcast_send_handler(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         await state.clear()
+        await message.answer(
+            "❌ Доступ заборонено.",
+            reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+        )
         return
 
     text = (message.text or message.caption or "").strip()
-
-    if message.text and text in BLOCKED_BROADCAST_TEXTS:
-        await message.answer(
-            "⚠️ Зараз активна підготовка розсилки.\n"
-            "Надішли текст або фото з підписом,\n"
-            "або надішли:\n"
-            "❌ Скасувати розсилку"
-        )
-        return
 
     if not text:
         await message.answer("❌ Текст порожній.")
@@ -216,7 +220,10 @@ async def broadcast_send_handler(message: types.Message, state: FSMContext):
 
     if not recipients:
         await state.clear()
-        await message.answer("❌ Немає активних клієнтів для розсилки.")
+        await message.answer(
+            "❌ Немає активних клієнтів для розсилки.",
+            reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+        )
         return
 
     sent = 0
@@ -246,5 +253,6 @@ async def broadcast_send_handler(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ Розсилку завершено\n"
         f"📨 Відправлено: {sent}\n"
-        f"❌ Помилок: {failed}"
+        f"❌ Помилок: {failed}",
+        reply_markup=owner_main_keyboard_for_user(message.from_user.id)
     )
