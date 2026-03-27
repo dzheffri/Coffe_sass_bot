@@ -20,6 +20,9 @@ router = Router()
 
 @router.message(F.text == "📊 Статистика кав’ярні")
 async def shop_stats_handler(message: types.Message):
+    if not is_owner(message.from_user.id):
+        return
+
     admin_shop = get_admin_shop_and_role(message.from_user.id)
     if not admin_shop:
         return
@@ -44,6 +47,7 @@ async def shop_stats_handler(message: types.Message):
 async def add_admin_start(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
+
     await state.set_state(OwnerStates.waiting_add_admin_id)
     await message.answer("Надішли Telegram ID нового адміністратора.")
 
@@ -74,6 +78,7 @@ async def add_admin_finish(message: types.Message, state: FSMContext):
 async def remove_admin_start(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
+
     await state.set_state(OwnerStates.waiting_remove_admin_id)
     await message.answer("Надішли Telegram ID адміністратора, якого треба видалити.")
 
@@ -147,13 +152,13 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
     if not can_send_broadcast(admin_shop["id"]):
         await message.answer(
             "❌ Ліміт розсилок вичерпано.\n"
-            "Дозволено максимум 2 промо-розсилки за 7 днів на кав’ярню."
+            "Дозволено максимум 7 промо-розсилок за 7 днів на кав’ярню."
         )
         return
 
     await state.set_state(OwnerStates.waiting_broadcast_text)
     await message.answer(
-        "Надішли текст розсилки.\n\n"
+        "Надішли текст або фото з підписом для розсилки.\n\n"
         "Розсилка піде тільки активним клієнтам цієї кав’ярні за останні 60 днів."
     )
 
@@ -163,7 +168,7 @@ async def broadcast_send_handler(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
 
-    text = (message.text or "").strip()
+    text = (message.text or message.caption or "").strip()
     if not text:
         await message.answer("❌ Текст порожній.")
         return
@@ -181,10 +186,17 @@ async def broadcast_send_handler(message: types.Message, state: FSMContext):
 
     for row in recipients:
         try:
-            await message.bot.send_message(
-                row["telegram_user_id"],
-                f"🏪 {admin_shop['name']}\n\n{text}"
-            )
+            if message.photo:
+                await message.bot.send_photo(
+                    chat_id=row["telegram_user_id"],
+                    photo=message.photo[-1].file_id,
+                    caption=f"🏪 {admin_shop['name']}\n\n{text}"
+                )
+            else:
+                await message.bot.send_message(
+                    row["telegram_user_id"],
+                    f"🏪 {admin_shop['name']}\n\n{text}"
+                )
             sent += 1
         except Exception:
             failed += 1
