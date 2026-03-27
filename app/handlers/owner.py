@@ -17,6 +17,25 @@ from app.states import OwnerStates
 
 router = Router()
 
+BLOCKED_BROADCAST_TEXTS = {
+    "📷 Режим: нарахування",
+    "✅ Режим: списання",
+    "📱 Відкрити сканер",
+    "📊 Статистика кав’ярні",
+    "➕ Додати адміністратора",
+    "➖ Видалити адміністратора",
+    "👤 Список адміністраторів",
+    "📣 Зробити розсилку",
+    "💳 Підписка",
+    "🌍 Вся система",
+    "🏪 Додати кав’ярню",
+    "🏪 Список кав’ярень",
+    "💳 Продовжити підписку",
+    "🏪 Режим owner",
+    "👑 Режим super admin",
+    "❌ Скасувати розсилку",
+}
+
 
 @router.message(F.text == "📊 Статистика кав’ярні")
 async def shop_stats_handler(message: types.Message):
@@ -159,16 +178,35 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
     await state.set_state(OwnerStates.waiting_broadcast_text)
     await message.answer(
         "Надішли текст або фото з підписом для розсилки.\n\n"
-        "Розсилка піде тільки активним клієнтам цієї кав’ярні за останні 60 днів."
+        "Розсилка піде тільки активним клієнтам цієї кав’ярні за останні 60 днів.\n\n"
+        "Щоб скасувати, надішли:\n"
+        "❌ Скасувати розсилку"
     )
+
+
+@router.message(OwnerStates.waiting_broadcast_text, F.text == "❌ Скасувати розсилку")
+async def broadcast_cancel_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("✅ Розсилку скасовано.")
 
 
 @router.message(OwnerStates.waiting_broadcast_text)
 async def broadcast_send_handler(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
+        await state.clear()
         return
 
     text = (message.text or message.caption or "").strip()
+
+    if message.text and text in BLOCKED_BROADCAST_TEXTS:
+        await message.answer(
+            "⚠️ Зараз активна підготовка розсилки.\n"
+            "Надішли текст або фото з підписом,\n"
+            "або надішли:\n"
+            "❌ Скасувати розсилку"
+        )
+        return
+
     if not text:
         await message.answer("❌ Текст порожній.")
         return
@@ -194,11 +232,12 @@ async def broadcast_send_handler(message: types.Message, state: FSMContext):
                 )
             else:
                 await message.bot.send_message(
-                    row["telegram_user_id"],
-                    f"🏪 {admin_shop['name']}\n\n{text}"
+                    chat_id=row["telegram_user_id"],
+                    text=f"🏪 {admin_shop['name']}\n\n{text}"
                 )
             sent += 1
-        except Exception:
+        except Exception as e:
+            print(f"[broadcast] failed for {row['telegram_user_id']}: {e}")
             failed += 1
 
     save_broadcast(admin_shop["id"], message.from_user.id, text, sent)
