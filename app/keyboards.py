@@ -50,15 +50,16 @@ def admin_main_keyboard(
             [KeyboardButton(text="💳 Підписка")],
         ])
 
-    if is_super_admin:
-        keyboard.extend([
-            [KeyboardButton(text="🌍 Вся система")],
-            [
-                KeyboardButton(text="🏪 Додати кав’ярню"),
-                KeyboardButton(text="🏪 Список кав’ярень")
-            ],
-            [KeyboardButton(text="💳 Продовжити підписку")],
-        ])
+   if is_super_admin:
+    keyboard.extend([
+        [KeyboardButton(text="🌍 Вся система")],
+        [
+            KeyboardButton(text="🏪 Додати кав’ярню"),
+            KeyboardButton(text="🏪 Список кав’ярень")
+        ],
+        [KeyboardButton(text="🗑 Видалити кав’ярню")],
+        [KeyboardButton(text="💳 Продовжити підписку")],
+    ])
 
     if can_switch_to_owner:
         keyboard.append([KeyboardButton(text="🏪 Режим owner")])
