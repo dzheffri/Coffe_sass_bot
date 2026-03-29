@@ -215,7 +215,7 @@ def get_active_shop_for_user(telegram_user_id: int):
             cur.execute("""
             SELECT cs.*
             FROM users u
-            LEFT JOIN coffee_shops cs ON cs.id = u.active_shop_id
+            JOIN coffee_shops cs ON cs.id = u.active_shop_id
             WHERE u.telegram_user_id = %s
             """, (telegram_user_id,))
             return cur.fetchone()
