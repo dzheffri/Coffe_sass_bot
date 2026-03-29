@@ -29,7 +29,6 @@ def admin_main_keyboard(
     keyboard = [
         [KeyboardButton(text="📷 Режим: нарахування"), KeyboardButton(text="✅ Режим: списання")],
         [KeyboardButton(text="📱 Відкрити сканер", web_app=WebAppInfo(url=scanner_url))],
-        [KeyboardButton(text="📊 Статистика кав’ярні")],
     ]
 
     if is_owner:
