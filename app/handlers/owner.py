@@ -1,6 +1,11 @@
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 
 from app.db import (
     is_owner,
@@ -27,6 +32,17 @@ def broadcast_cancel_keyboard():
             [KeyboardButton(text="❌ Скасувати розсилку")]
         ],
         resize_keyboard=True
+    )
+
+
+def broadcast_preview_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Підтвердити", callback_data="broadcast_confirm"),
+                InlineKeyboardButton(text="❌ Скасувати", callback_data="broadcast_cancel"),
+            ]
+        ]
     )
 
 
@@ -95,7 +111,10 @@ async def add_admin_finish(message: types.Message, state: FSMContext):
         await message.answer("❌ Користувач ще не заходив у бота через /start.")
         return
 
-    await message.answer("✅ Адміністратора додано.", reply_markup=owner_main_keyboard_for_user(message.from_user.id))
+    await message.answer(
+        "✅ Адміністратора додано.",
+        reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+    )
 
 
 @router.message(F.text == "➖ Видалити адміністратора")
@@ -127,7 +146,10 @@ async def remove_admin_finish(message: types.Message, state: FSMContext):
         await message.answer("❌ Адміністратора не знайдено.")
         return
 
-    await message.answer("✅ Адміністратора видалено.", reply_markup=owner_main_keyboard_for_user(message.from_user.id))
+    await message.answer(
+        "✅ Адміністратора видалено.",
+        reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+    )
 
 
 @router.message(F.text == "👤 Список адміністраторів")
@@ -183,8 +205,12 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
 
     await state.set_state(OwnerStates.waiting_broadcast_text)
     await message.answer(
-        "Надішли текст або фото з підписом для розсилки.\n\n"
-        "Розсилка піде тільки активним клієнтам цієї кав’ярні за останні 60 днів.\n\n"
+        "Надішли текст, фото або відео для розсилки.\n\n"
+        "Можна:\n"
+        "• просто текст\n"
+        "• фото з текстом або без тексту\n"
+        "• відео з текстом або без тексту\n\n"
+        "Спочатку я покажу тобі передперегляд, і тільки після підтвердження розсилка піде клієнтам.\n\n"
         "Щоб скасувати, натисни кнопку нижче 👇",
         reply_markup=broadcast_cancel_keyboard()
     )
@@ -200,7 +226,7 @@ async def broadcast_cancel_handler(message: types.Message, state: FSMContext):
 
 
 @router.message(OwnerStates.waiting_broadcast_text)
-async def broadcast_send_handler(message: types.Message, state: FSMContext):
+async def broadcast_preview_handler(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         await state.clear()
         await message.answer(
@@ -209,50 +235,150 @@ async def broadcast_send_handler(message: types.Message, state: FSMContext):
         )
         return
 
-    text = (message.text or message.caption or "").strip()
-
-    if not text:
-        await message.answer("❌ Текст порожній.")
+    admin_shop = get_admin_shop_and_role(message.from_user.id)
+    if not admin_shop:
+        await state.clear()
+        await message.answer(
+            "❌ Не вдалося визначити кав’ярню.",
+            reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+        )
         return
 
-    admin_shop = get_admin_shop_and_role(message.from_user.id)
+    text = (message.text or message.caption or "").strip()
+    photo_id = message.photo[-1].file_id if message.photo else None
+    video_id = message.video.file_id if message.video else None
+
+    if not text and not photo_id and not video_id:
+        await message.answer("❌ Надішли текст, фото або відео.")
+        return
+
+    await state.update_data(
+        broadcast_text=text,
+        broadcast_photo=photo_id,
+        broadcast_video=video_id,
+        shop_name=admin_shop["name"],
+    )
+
+    preview_caption = f"👀 Передперегляд розсилки\n\n🏪 {admin_shop['name']}"
+    if text:
+        preview_caption += f"\n\n{text}"
+
+    if photo_id:
+        await message.answer_photo(
+            photo=photo_id,
+            caption=preview_caption,
+            reply_markup=broadcast_preview_keyboard()
+        )
+    elif video_id:
+        await message.answer_video(
+            video=video_id,
+            caption=preview_caption,
+            reply_markup=broadcast_preview_keyboard()
+        )
+    else:
+        await message.answer(
+            preview_caption,
+            reply_markup=broadcast_preview_keyboard()
+        )
+
+
+@router.callback_query(F.data == "broadcast_cancel")
+async def broadcast_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.message.answer(
+        "✅ Розсилку скасовано.",
+        reply_markup=owner_main_keyboard_for_user(callback.from_user.id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_confirm")
+async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await state.clear()
+        await callback.answer("❌ Доступ заборонено.", show_alert=True)
+        return
+
+    data = await state.get_data()
+
+    text = (data.get("broadcast_text") or "").strip()
+    photo_id = data.get("broadcast_photo")
+    video_id = data.get("broadcast_video")
+
+    admin_shop = get_admin_shop_and_role(callback.from_user.id)
+    if not admin_shop:
+        await state.clear()
+        await callback.answer("❌ Не вдалося визначити кав’ярню.", show_alert=True)
+        return
+
     recipients = get_broadcast_recipients(admin_shop["id"])
 
     if not recipients:
         await state.clear()
-        await message.answer(
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await callback.message.answer(
             "❌ Немає активних клієнтів для розсилки.",
-            reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+            reply_markup=owner_main_keyboard_for_user(callback.from_user.id)
         )
+        await callback.answer()
         return
+
+    await callback.answer("⏳ Запускаю розсилку...")
 
     sent = 0
     failed = 0
 
     for row in recipients:
         try:
-            if message.photo:
-                await message.bot.send_photo(
+            final_caption = f"🏪 {admin_shop['name']}"
+            if text:
+                final_caption += f"\n\n{text}"
+
+            if photo_id:
+                await callback.bot.send_photo(
                     chat_id=row["telegram_user_id"],
-                    photo=message.photo[-1].file_id,
-                    caption=f"🏪 {admin_shop['name']}\n\n{text}"
+                    photo=photo_id,
+                    caption=final_caption
+                )
+            elif video_id:
+                await callback.bot.send_video(
+                    chat_id=row["telegram_user_id"],
+                    video=video_id,
+                    caption=final_caption
                 )
             else:
-                await message.bot.send_message(
+                await callback.bot.send_message(
                     chat_id=row["telegram_user_id"],
-                    text=f"🏪 {admin_shop['name']}\n\n{text}"
+                    text=final_caption
                 )
+
             sent += 1
+
         except Exception as e:
             print(f"[broadcast] failed for {row['telegram_user_id']}: {e}")
             failed += 1
 
-    save_broadcast(admin_shop["id"], message.from_user.id, text, sent)
+    save_broadcast(admin_shop["id"], callback.from_user.id, text, sent)
     await state.clear()
 
-    await message.answer(
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.message.answer(
         f"✅ Розсилку завершено\n"
         f"📨 Відправлено: {sent}\n"
         f"❌ Помилок: {failed}",
-        reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+        reply_markup=owner_main_keyboard_for_user(callback.from_user.id)
     )
