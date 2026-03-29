@@ -1,10 +1,4 @@
-from aiogram.types import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    WebAppInfo,
-)
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 
 
 def user_main_keyboard():
@@ -27,22 +21,36 @@ def admin_main_keyboard(
     can_switch_to_super_admin: bool = False,
 ):
     keyboard = [
-        [KeyboardButton(text="📷 Режим: нарахування"), KeyboardButton(text="✅ Режим: списання")],
-        [KeyboardButton(text="📱 Відкрити сканер", web_app=WebAppInfo(url=scanner_url))],
+        [
+            KeyboardButton(text="📷 Режим: нарахування"),
+            KeyboardButton(text="✅ Режим: списання")
+        ],
+        [
+            KeyboardButton(text="📱 Відкрити сканер", web_app=WebAppInfo(url=scanner_url))
+        ],
     ]
 
     if is_owner:
         keyboard.extend([
-            [KeyboardButton(text="➕ Додати адміністратора"), KeyboardButton(text="➖ Видалити адміністратора")],
-            [KeyboardButton(text="👤 Список адміністраторів"), KeyboardButton(text="📣 Зробити розсилку")],
+            [KeyboardButton(text="📊 Статистика кав’ярні")],
+            [
+                KeyboardButton(text="➕ Додати адміністратора"),
+                KeyboardButton(text="➖ Видалити адміністратора")
+            ],
+            [
+                KeyboardButton(text="👤 Список адміністраторів"),
+                KeyboardButton(text="📣 Зробити розсилку")
+            ],
             [KeyboardButton(text="💳 Підписка")],
         ])
 
     if is_super_admin:
         keyboard.extend([
             [KeyboardButton(text="🌍 Вся система")],
-            [KeyboardButton(text="🏪 Додати кав’ярню")],
-            [KeyboardButton(text="🏪 Список кав’ярень")],
+            [
+                KeyboardButton(text="🏪 Додати кав’ярню"),
+                KeyboardButton(text="🏪 Список кав’ярень")
+            ],
             [KeyboardButton(text="💳 Продовжити підписку")],
         ])
 
@@ -52,7 +60,10 @@ def admin_main_keyboard(
     if can_switch_to_super_admin:
         keyboard.append([KeyboardButton(text="👑 Режим super admin")])
 
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True
+    )
 
 
 def shops_inline_keyboard(shops: list[dict]):
