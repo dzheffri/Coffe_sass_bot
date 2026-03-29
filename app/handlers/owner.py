@@ -25,6 +25,11 @@ from app.config import SCANNER_URL, SUPER_ADMIN_IDS
 
 router = Router()
 
+# ID твоей кофейни.
+# Поставь сюда ID именно своей кофейни из базы.
+# Для этой кофейни лимита на рассылку не будет.
+MY_SHOP_ID = 1
+
 
 def broadcast_cancel_keyboard():
     return ReplyKeyboardMarkup(
@@ -103,6 +108,14 @@ async def add_admin_finish(message: types.Message, state: FSMContext):
         return
 
     admin_shop = get_admin_shop_and_role(message.from_user.id)
+    if not admin_shop:
+        await state.clear()
+        await message.answer(
+            "❌ Не вдалося визначити кав’ярню.",
+            reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+        )
+        return
+
     result = add_shop_admin(admin_shop["id"], int(text), "admin")
 
     await state.clear()
@@ -138,6 +151,14 @@ async def remove_admin_finish(message: types.Message, state: FSMContext):
         return
 
     admin_shop = get_admin_shop_and_role(message.from_user.id)
+    if not admin_shop:
+        await state.clear()
+        await message.answer(
+            "❌ Не вдалося визначити кав’ярню.",
+            reply_markup=owner_main_keyboard_for_user(message.from_user.id)
+        )
+        return
+
     ok = remove_shop_admin(admin_shop["id"], int(text))
 
     await state.clear()
@@ -158,6 +179,9 @@ async def admins_handler(message: types.Message):
         return
 
     admin_shop = get_admin_shop_and_role(message.from_user.id)
+    if not admin_shop:
+        return
+
     admins = get_shop_admins(admin_shop["id"])
 
     if not admins:
@@ -178,6 +202,9 @@ async def subscription_handler(message: types.Message):
         return
 
     admin_shop = get_admin_shop_and_role(message.from_user.id)
+    if not admin_shop:
+        return
+
     sub = get_subscription(admin_shop["id"])
 
     await message.answer(
@@ -195,8 +222,13 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
         return
 
     admin_shop = get_admin_shop_and_role(message.from_user.id)
+    if not admin_shop:
+        await message.answer("❌ Не вдалося визначити кав’ярню.")
+        return
 
-    if not can_send_broadcast(admin_shop["id"]):
+    # Для твоей кофейни лимита нет.
+    # Для остальных кофеен лимит остается.
+    if admin_shop["id"] != MY_SHOP_ID and not can_send_broadcast(admin_shop["id"]):
         await message.answer(
             "❌ Ліміт розсилок вичерпано.\n"
             "Дозволено максимум 7 промо-розсилок за 7 днів на кав’ярню."
@@ -210,7 +242,7 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
         "• просто текст\n"
         "• фото з текстом або без тексту\n"
         "• відео з текстом або без тексту\n\n"
-        "Спочатку я покажу тобі передперегляд, і тільки після підтвердження розсилка піде клієнтам.\n\n"
+        "Спочатку я покажу передперегляд, і тільки після підтвердження розсилка піде клієнтам.\n\n"
         "Щоб скасувати, натисни кнопку нижче 👇",
         reply_markup=broadcast_cancel_keyboard()
     )
@@ -256,7 +288,6 @@ async def broadcast_preview_handler(message: types.Message, state: FSMContext):
         broadcast_text=text,
         broadcast_photo=photo_id,
         broadcast_video=video_id,
-        shop_name=admin_shop["name"],
     )
 
     preview_caption = f"👀 Передперегляд розсилки\n\n🏪 {admin_shop['name']}"
