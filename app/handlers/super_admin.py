@@ -8,10 +8,12 @@ from app.db import (
     add_shop_admin,
     get_user_by_telegram_id,
     get_global_stats,
+    delete_shop,
 )
 
 router = Router()
 pending_shop_data: dict[int, bool] = {}
+pending_delete_shop: dict[int, bool] = {}
 
 
 def is_super_admin(user_id: int):
@@ -45,12 +47,36 @@ async def add_shop_start(message: types.Message):
         return
 
     pending_shop_data[message.from_user.id] = True
+    pending_delete_shop.pop(message.from_user.id, None)
+
     await message.answer(
         "Надішли дані нової кав’ярні одним повідомленням у форматі:\n\n"
         "Назва | Місто | Адреса | Telegram_ID_власника\n\n"
         "Приклад:\n"
         "Coffee A | Київ | Хрещатик 1 | 123456789"
     )
+
+
+@router.message(F.text == "🗑 Видалити кав’ярню")
+async def delete_shop_start(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        return
+
+    pending_delete_shop[message.from_user.id] = True
+    pending_shop_data.pop(message.from_user.id, None)
+
+    shops = get_all_shops()
+
+    if not shops:
+        pending_delete_shop.pop(message.from_user.id, None)
+        await message.answer("Список кав’ярень порожній.")
+        return
+
+    text = ["🗑 Введи ID кав’ярні, яку треба видалити.", "", "🏪 Список кав’ярень:"]
+    for shop in shops:
+        text.append(f"• ID {shop['id']} — {shop['name']} ({shop['city'] or '-'})")
+
+    await message.answer("\n".join(text))
 
 
 @router.message(
@@ -94,6 +120,32 @@ async def add_shop_finish(message: types.Message):
         f"✅ Кав’ярню створено: {shop['name']}\n"
         f"⏳ Власник ще не заходив у бота.\n"
         f"Після його /start роль owner буде видано автоматично."
+    )
+
+
+@router.message(
+    lambda m: m.from_user.id in SUPER_ADMIN_IDS
+    and m.from_user.id in pending_delete_shop
+)
+async def delete_shop_finish(message: types.Message):
+    text = (message.text or "").strip()
+
+    if not text.isdigit():
+        await message.answer("❌ Надішли числовий ID кав’ярні.")
+        return
+
+    shop_id = int(text)
+    deleted_shop = delete_shop(shop_id)
+    pending_delete_shop.pop(message.from_user.id, None)
+
+    if not deleted_shop:
+        await message.answer("❌ Кав’ярню з таким ID не знайдено.")
+        return
+
+    await message.answer(
+        f"✅ Кав’ярню видалено\n"
+        f"🏪 {deleted_shop['name']}\n"
+        f"ID: {deleted_shop['id']}"
     )
 
 
