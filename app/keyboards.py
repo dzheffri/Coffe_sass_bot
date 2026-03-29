@@ -29,10 +29,10 @@ def admin_main_keyboard(
     keyboard = [
         [
             KeyboardButton(text="📷 Режим: нарахування"),
-            KeyboardButton(text="✅ Режим: списання")
+            KeyboardButton(text="✅ Режим: списання"),
         ],
         [
-            KeyboardButton(text="📱 Відкрити сканер", web_app=WebAppInfo(url=scanner_url))
+            KeyboardButton(text="📱 Відкрити сканер", web_app=WebAppInfo(url=scanner_url)),
         ],
     ]
 
@@ -41,25 +41,25 @@ def admin_main_keyboard(
             [KeyboardButton(text="📊 Статистика кав’ярні")],
             [
                 KeyboardButton(text="➕ Додати адміністратора"),
-                KeyboardButton(text="➖ Видалити адміністратора")
+                KeyboardButton(text="➖ Видалити адміністратора"),
             ],
             [
                 KeyboardButton(text="👤 Список адміністраторів"),
-                KeyboardButton(text="📣 Зробити розсилку")
+                KeyboardButton(text="📣 Зробити розсилку"),
             ],
             [KeyboardButton(text="💳 Підписка")],
         ])
 
-   if is_super_admin:
-    keyboard.extend([
-        [KeyboardButton(text="🌍 Вся система")],
-        [
-            KeyboardButton(text="🏪 Додати кав’ярню"),
-            KeyboardButton(text="🏪 Список кав’ярень")
-        ],
-        [KeyboardButton(text="🗑 Видалити кав’ярню")],
-        [KeyboardButton(text="💳 Продовжити підписку")],
-    ])
+    if is_super_admin:
+        keyboard.extend([
+            [KeyboardButton(text="🌍 Вся система")],
+            [
+                KeyboardButton(text="🏪 Додати кав’ярню"),
+                KeyboardButton(text="🏪 Список кав’ярень"),
+            ],
+            [KeyboardButton(text="🗑 Видалити кав’ярню")],
+            [KeyboardButton(text="💳 Продовжити підписку")],
+        ])
 
     if can_switch_to_owner:
         keyboard.append([KeyboardButton(text="🏪 Режим owner")])
