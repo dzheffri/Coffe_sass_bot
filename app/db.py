@@ -660,3 +660,16 @@ def save_broadcast(shop_id: int, sender_telegram_user_id: int, text: str, recipi
             RETURNING *
             """, (shop_id, sender["id"], text, recipients_count))
             return cur.fetchone()
+
+
+# 👇 ВАЖНО: без отступа!
+def delete_shop(shop_id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            DELETE FROM coffee_shops
+            WHERE id = %s
+            RETURNING *
+            """, (shop_id,))
+            return cur.fetchone()
+            
