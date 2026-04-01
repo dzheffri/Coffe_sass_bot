@@ -102,6 +102,14 @@ async def start_handler(message: types.Message):
     await send_correct_panel(message)
 
 
+# 🔥 ВОТ ЭТО МЫ ДОБАВИЛИ
+@router.message(Command("id"))
+async def my_id_command_handler(message: types.Message):
+    await message.answer(
+        f"Твій Telegram ID:\n<code>{message.from_user.id}</code>"
+    )
+
+
 @router.message(F.text == "🏪 Режим owner")
 async def switch_to_owner_mode(message: types.Message):
     user_id = message.from_user.id
