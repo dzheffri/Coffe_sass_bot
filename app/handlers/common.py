@@ -110,7 +110,7 @@ async def my_id_command_handler(message: types.Message):
     )
 
 
-@router.message(F.text == "🏪 Режим owner")
+@router.message(F.text == "👑 Режим owner")
 async def switch_to_owner_mode(message: types.Message):
     user_id = message.from_user.id
 
@@ -123,7 +123,7 @@ async def switch_to_owner_mode(message: types.Message):
     await send_correct_panel(message)
 
 
-@router.message(F.text == "👑 Режим super admin")
+@router.message(F.text == ""🛠 Режим super admin"")
 async def switch_to_super_admin_mode(message: types.Message):
     user_id = message.from_user.id
 
