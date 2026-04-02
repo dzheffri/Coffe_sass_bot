@@ -1,4 +1,9 @@
+import json
+import tempfile
+from datetime import datetime
+
 from aiogram import Router, types, F
+from aiogram.types import FSInputFile
 
 from app.config import SUPER_ADMIN_IDS, SUBSCRIPTION_PRICE_USD
 from app.db import (
@@ -9,9 +14,17 @@ from app.db import (
     get_user_by_telegram_id,
     get_global_stats,
     delete_shop,
+    get_all_users,
+    get_all_shop_admins,
+    get_all_shop_clients,
+    get_all_transactions,
+    get_all_subscriptions,
+    get_all_broadcasts,
+    get_all_reminder_logs,
 )
 
 router = Router()
+
 pending_shop_data: dict[int, bool] = {}
 pending_delete_shop: dict[int, bool] = {}
 
@@ -20,7 +33,7 @@ def is_super_admin(user_id: int):
     return user_id in SUPER_ADMIN_IDS
 
 
-@router.message(F.text == "🌍 Вся система")
+@router.message(F.text == " Вся система")
 async def global_stats_handler(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
@@ -29,19 +42,56 @@ async def global_stats_handler(message: types.Message):
     revenue = stats["active_subscriptions"] * SUBSCRIPTION_PRICE_USD
 
     await message.answer(
-        "🌍 Вся система\n\n"
-        f"🏪 Кавʼярень: {stats['shops_count']}\n"
-        f"👥 Користувачів: {stats['users_count']}\n"
+        " Вся система\n\n"
+        f" Кавʼярень: {stats['shops_count']}\n"
+        f" Користувачів: {stats['users_count']}\n"
         f"☕ Всього нарахувань: {stats['total_scans']}\n"
-        f"🎁 Безкоштовних зараз: {stats['free_balance']}\n"
+        f" Безкоштовних зараз: {stats['free_balance']}\n"
         f"✅ Списано бонусів: {stats['total_free_redeemed']}\n\n"
-        f"💰 Активних підписок: {stats['active_subscriptions']}\n"
+        f" Активних підписок: {stats['active_subscriptions']}\n"
         f"❌ Прострочених: {stats['expired_subscriptions']}\n"
-        f"💵 Поточний дохід: ${revenue:.2f}"
+        f" Поточний дохід: ${revenue:.2f}"
     )
 
 
-@router.message(F.text == "🏪 Додати кав’ярню")
+@router.message(F.text == "💾 Backup системи")
+async def backup_system_handler(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        return
+
+    await message.answer("⏳ Створюю backup системи...")
+
+    backup_data = {
+        "meta": {
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "type": "full_system_backup",
+            "format": "json",
+        },
+        "users": get_all_users(),
+        "coffee_shops": get_all_shops(),
+        "shop_admins": get_all_shop_admins(),
+        "shop_clients": get_all_shop_clients(),
+        "transactions": get_all_transactions(),
+        "subscriptions": get_all_subscriptions(),
+        "broadcasts": get_all_broadcasts(),
+        "reminder_logs": get_all_reminder_logs(),
+    }
+
+    filename = f"backup_system_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+        json.dump(backup_data, tmp, ensure_ascii=False, indent=2, default=str)
+        tmp_path = tmp.name
+
+    document = FSInputFile(tmp_path, filename=filename)
+
+    await message.answer_document(
+        document=document,
+        caption="✅ Backup системи готовий"
+    )
+
+
+@router.message(F.text == " Додати кав’ярню")
 async def add_shop_start(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
@@ -57,7 +107,7 @@ async def add_shop_start(message: types.Message):
     )
 
 
-@router.message(F.text == "🗑 Видалити кав’ярню")
+@router.message(F.text == " Видалити кав’ярню")
 async def delete_shop_start(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
@@ -66,13 +116,12 @@ async def delete_shop_start(message: types.Message):
     pending_shop_data.pop(message.from_user.id, None)
 
     shops = get_all_shops()
-
     if not shops:
         pending_delete_shop.pop(message.from_user.id, None)
         await message.answer("Список кав’ярень порожній.")
         return
 
-    text = ["🗑 Введи ID кав’ярні, яку треба видалити.", "", "🏪 Список кав’ярень:"]
+    text = [" Введи ID кав’ярні, яку треба видалити.", "", " Список кав’ярень:"]
     for shop in shops:
         text.append(f"• ID {shop['id']} — {shop['name']} ({shop['city'] or '-'})")
 
@@ -80,9 +129,7 @@ async def delete_shop_start(message: types.Message):
 
 
 @router.message(
-    lambda m: m.from_user.id in SUPER_ADMIN_IDS
-    and m.from_user.id in pending_shop_data
-    and "|" in (m.text or "")
+    lambda m: m.from_user.id in SUPER_ADMIN_IDS and m.from_user.id in pending_shop_data and "|" in (m.text or "")
 )
 async def add_shop_finish(message: types.Message):
     parts = [x.strip() for x in (message.text or "").split("|")]
@@ -97,6 +144,7 @@ async def add_shop_finish(message: types.Message):
         return
 
     owner_telegram_id = int(owner_id)
+
     shop = create_shop(
         name=name,
         city=city,
@@ -111,8 +159,8 @@ async def add_shop_finish(message: types.Message):
         add_shop_admin(shop["id"], owner_telegram_id, "owner")
         await message.answer(
             f"✅ Кав’ярню створено\n"
-            f"🏪 {shop['name']}\n"
-            f"👑 Owner призначено одразу"
+            f" {shop['name']}\n"
+            f" Owner призначено одразу"
         )
         return
 
@@ -124,8 +172,7 @@ async def add_shop_finish(message: types.Message):
 
 
 @router.message(
-    lambda m: m.from_user.id in SUPER_ADMIN_IDS
-    and m.from_user.id in pending_delete_shop
+    lambda m: m.from_user.id in SUPER_ADMIN_IDS and m.from_user.id in pending_delete_shop
 )
 async def delete_shop_finish(message: types.Message):
     text = (message.text or "").strip()
@@ -144,12 +191,12 @@ async def delete_shop_finish(message: types.Message):
 
     await message.answer(
         f"✅ Кав’ярню видалено\n"
-        f"🏪 {deleted_shop['name']}\n"
+        f" {deleted_shop['name']}\n"
         f"ID: {deleted_shop['id']}"
     )
 
 
-@router.message(F.text == "🏪 Список кав’ярень")
+@router.message(F.text == " Список кав’ярень")
 async def shops_list_handler(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
@@ -159,7 +206,7 @@ async def shops_list_handler(message: types.Message):
         await message.answer("Список кав’ярень порожній.")
         return
 
-    text = ["🏪 Список кав’ярень:"]
+    text = [" Список кав’ярень:"]
     for shop in shops:
         text.append(f"• ID {shop['id']} — {shop['name']} ({shop['city'] or '-'})")
 
@@ -180,6 +227,7 @@ async def extend_shop_handler(message: types.Message):
     days = int(parts[2])
 
     sub = extend_subscription(shop_id, days)
+
     await message.answer(
         f"✅ Підписку продовжено\n"
         f"SHOP_ID: {shop_id}\n"
@@ -188,7 +236,7 @@ async def extend_shop_handler(message: types.Message):
     )
 
 
-@router.message(F.text == "💳 Продовжити підписку")
+@router.message(F.text == " Продовжити підписку")
 async def extend_hint(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
