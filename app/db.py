@@ -777,3 +777,50 @@ def delete_shop(shop_id: int):
             RETURNING *
             """, (shop_id,))
             return cur.fetchone()
+def get_all_users():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users ORDER BY id")
+            return cur.fetchall()
+
+
+def get_all_shop_admins():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM shop_admins ORDER BY id")
+            return cur.fetchall()
+
+
+def get_all_shop_clients():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM shop_clients ORDER BY id")
+            return cur.fetchall()
+
+
+def get_all_transactions():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM transactions ORDER BY id")
+            return cur.fetchall()
+
+
+def get_all_subscriptions():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM subscriptions ORDER BY id")
+            return cur.fetchall()
+
+
+def get_all_broadcasts():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM broadcasts ORDER BY id")
+            return cur.fetchall()
+
+
+def get_all_reminder_logs():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM reminder_logs ORDER BY id")
+            return cur.fetchall()
