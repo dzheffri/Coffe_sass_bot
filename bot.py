@@ -13,6 +13,7 @@ from app.handlers import (
     owner_router,
     super_admin_router,
 )
+from app.reminders import reminders_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +26,7 @@ async def main():
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
+
     dp = Dispatcher()
 
     dp.include_router(common_router)
@@ -34,8 +36,17 @@ async def main():
     dp.include_router(super_admin_router)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    reminder_task = asyncio.create_task(reminders_loop(bot))
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        reminder_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reminder_task
 
 
 if __name__ == "__main__":
+    import contextlib
     asyncio.run(main())
