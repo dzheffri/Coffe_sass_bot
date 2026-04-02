@@ -10,10 +10,10 @@ from aiogram.types import (
 def user_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=" Мій QR-код")],
-            [KeyboardButton(text=" Мої кав’ярні")],
-            [KeyboardButton(text="☕ Мої чашки"), KeyboardButton(text=" Мої безкоштовні кави")],
-            [KeyboardButton(text=" Змінити кав’ярню")],
+            [KeyboardButton(text="📱 Мій QR-код")],
+            [KeyboardButton(text="🏪 Мої кав’ярні")],
+            [KeyboardButton(text="☕ Мої чашки"), KeyboardButton(text="🎁 Мої безкоштовні кави")],
+            [KeyboardButton(text="🔄 Змінити кав’ярню")],
         ],
         resize_keyboard=True
     )
@@ -28,45 +28,45 @@ def admin_main_keyboard(
 ):
     keyboard = [
         [
-            KeyboardButton(text=" Режим: нарахування"),
+            KeyboardButton(text="📷 Режим: нарахування"),
             KeyboardButton(text="✅ Режим: списання"),
         ],
         [
-            KeyboardButton(text=" Відкрити сканер", web_app=WebAppInfo(url=scanner_url)),
+            KeyboardButton(text="📷 Відкрити сканер", web_app=WebAppInfo(url=scanner_url)),
         ],
     ]
 
     if is_owner:
         keyboard.extend([
-            [KeyboardButton(text=" Статистика кав’ярні")],
+            [KeyboardButton(text="📊 Статистика кав’ярні")],
             [
                 KeyboardButton(text="➕ Додати адміністратора"),
                 KeyboardButton(text="➖ Видалити адміністратора"),
             ],
             [
-                KeyboardButton(text=" Список адміністраторів"),
-                KeyboardButton(text=" Зробити розсилку"),
+                KeyboardButton(text="👤 Список адміністраторів"),
+                KeyboardButton(text="📣 Зробити розсилку"),
             ],
-            [KeyboardButton(text=" Підписка")],
+            [KeyboardButton(text="💳 Підписка")],
         ])
 
     if is_super_admin:
         keyboard.extend([
-            [KeyboardButton(text=" Вся система")],
+            [KeyboardButton(text="📈 Вся система")],
             [
-                KeyboardButton(text=" Додати кав’ярню"),
-                KeyboardButton(text=" Список кав’ярень"),
+                KeyboardButton(text="🏪 Додати кав’ярню"),
+                KeyboardButton(text="📋 Список кав’ярень"),
             ],
-            [KeyboardButton(text=" Видалити кав’ярню")],
-            [KeyboardButton(text=" Продовжити підписку")],
+            [KeyboardButton(text="🗑 Видалити кав’ярню")],
+            [KeyboardButton(text="⏳ Продовжити підписку")],
             [KeyboardButton(text="💾 Backup системи")],
         ])
 
     if can_switch_to_owner:
-        keyboard.append([KeyboardButton(text=" Режим owner")])
+        keyboard.append([KeyboardButton(text="👑 Режим owner")])
 
     if can_switch_to_super_admin:
-        keyboard.append([KeyboardButton(text=" Режим super admin")])
+        keyboard.append([KeyboardButton(text="🛠 Режим super admin")])
 
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
