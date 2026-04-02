@@ -106,6 +106,16 @@ def init_db():
             """)
 
             cur.execute("""
+            CREATE TABLE IF NOT EXISTS reminder_logs (
+                id BIGSERIAL PRIMARY KEY,
+                shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reminder_type TEXT NOT NULL,
+                sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """)
+
+            cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_shop_clients_shop_user
             ON shop_clients(shop_id, user_id)
             """)
@@ -123,6 +133,11 @@ def init_db():
             cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_broadcasts_shop_created
             ON broadcasts(shop_id, created_at)
+            """)
+
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_reminder_logs_lookup
+            ON reminder_logs(shop_id, user_id, reminder_type, sent_at DESC)
             """)
 
             cur.execute("""
@@ -662,7 +677,97 @@ def save_broadcast(shop_id: int, sender_telegram_user_id: int, text: str, recipi
             return cur.fetchone()
 
 
-# 👇 ВАЖНО: без отступа!
+def was_reminder_sent_recently(shop_id: int, user_id: int, reminder_type: str, days: int) -> bool:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1
+                FROM reminder_logs
+                WHERE shop_id = %s
+                  AND user_id = %s
+                  AND reminder_type = %s
+                  AND sent_at >= NOW() - (%s || ' days')::interval
+                LIMIT 1
+            """, (shop_id, user_id, reminder_type, days))
+            return cur.fetchone() is not None
+
+
+def save_reminder_log(shop_id: int, user_id: int, reminder_type: str):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO reminder_logs (shop_id, user_id, reminder_type)
+                VALUES (%s, %s, %s)
+            """, (shop_id, user_id, reminder_type))
+
+
+def get_clients_for_one_left_reminder():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    sc.shop_id,
+                    sc.user_id,
+                    sc.cups,
+                    sc.last_activity_at,
+                    u.telegram_user_id,
+                    u.full_name,
+                    cs.name AS shop_name
+                FROM shop_clients sc
+                JOIN users u ON u.id = sc.user_id
+                JOIN coffee_shops cs ON cs.id = sc.shop_id
+                JOIN subscriptions s ON s.shop_id = sc.shop_id
+                WHERE sc.cups = 6
+                  AND sc.free_coffee_balance = 0
+                  AND s.status = 'active'
+                  AND s.expires_at > NOW()
+            """)
+            return cur.fetchall()
+
+
+def get_clients_for_inactive_reminder(days_from: int, days_to: int | None = None):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if days_to is None:
+                cur.execute("""
+                    SELECT
+                        sc.shop_id,
+                        sc.user_id,
+                        sc.cups,
+                        sc.last_activity_at,
+                        u.telegram_user_id,
+                        u.full_name,
+                        cs.name AS shop_name
+                    FROM shop_clients sc
+                    JOIN users u ON u.id = sc.user_id
+                    JOIN coffee_shops cs ON cs.id = sc.shop_id
+                    JOIN subscriptions s ON s.shop_id = sc.shop_id
+                    WHERE sc.last_activity_at < NOW() - (%s || ' days')::interval
+                      AND s.status = 'active'
+                      AND s.expires_at > NOW()
+                """, (days_from,))
+            else:
+                cur.execute("""
+                    SELECT
+                        sc.shop_id,
+                        sc.user_id,
+                        sc.cups,
+                        sc.last_activity_at,
+                        u.telegram_user_id,
+                        u.full_name,
+                        cs.name AS shop_name
+                    FROM shop_clients sc
+                    JOIN users u ON u.id = sc.user_id
+                    JOIN coffee_shops cs ON cs.id = sc.shop_id
+                    JOIN subscriptions s ON s.shop_id = sc.shop_id
+                    WHERE sc.last_activity_at < NOW() - (%s || ' days')::interval
+                      AND sc.last_activity_at >= NOW() - (%s || ' days')::interval
+                      AND s.status = 'active'
+                      AND s.expires_at > NOW()
+                """, (days_from, days_to))
+            return cur.fetchall()
+
+
 def delete_shop(shop_id: int):
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -672,4 +777,3 @@ def delete_shop(shop_id: int):
             RETURNING *
             """, (shop_id,))
             return cur.fetchone()
-            
