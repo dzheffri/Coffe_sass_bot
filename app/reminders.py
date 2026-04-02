@@ -13,6 +13,8 @@ from app.db import (
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
+TEST_TELEGRAM_ID = 608099511
+
 
 def kyiv_now():
     return datetime.now(KYIV_TZ)
@@ -21,9 +23,12 @@ def kyiv_now():
 async def send_morning_reminders(bot):
     sent_total = 0
 
-    # 1) Осталась 1 чашка до бесплатной
+    # 1) Осталась 1 чашка
     one_left_clients = get_clients_for_one_left_reminder()
     for row in one_left_clients:
+        if row["telegram_user_id"] != TEST_TELEGRAM_ID:
+            continue
+
         already_sent = was_reminder_sent_recently(
             shop_id=row["shop_id"],
             user_id=row["user_id"],
@@ -44,11 +49,14 @@ async def send_morning_reminders(bot):
             save_reminder_log(row["shop_id"], row["user_id"], "one_left")
             sent_total += 1
         except Exception as e:
-            logger.warning(f"[one_left reminder] failed for {row['telegram_user_id']}: {e}")
+            logger.warning(f"[one_left reminder] failed: {e}")
 
     # 2) Не был 7 дней
     inactive_7 = get_clients_for_inactive_reminder(days_from=7, days_to=30)
     for row in inactive_7:
+        if row["telegram_user_id"] != TEST_TELEGRAM_ID:
+            continue
+
         already_sent = was_reminder_sent_recently(
             shop_id=row["shop_id"],
             user_id=row["user_id"],
@@ -68,11 +76,14 @@ async def send_morning_reminders(bot):
             save_reminder_log(row["shop_id"], row["user_id"], "inactive_7d")
             sent_total += 1
         except Exception as e:
-            logger.warning(f"[inactive_7d reminder] failed for {row['telegram_user_id']}: {e}")
+            logger.warning(f"[inactive_7d reminder] failed: {e}")
 
     # 3) Не был 30 дней
     inactive_30 = get_clients_for_inactive_reminder(days_from=30, days_to=None)
     for row in inactive_30:
+        if row["telegram_user_id"] != TEST_TELEGRAM_ID:
+            continue
+
         already_sent = was_reminder_sent_recently(
             shop_id=row["shop_id"],
             user_id=row["user_id"],
@@ -92,7 +103,7 @@ async def send_morning_reminders(bot):
             save_reminder_log(row["shop_id"], row["user_id"], "inactive_30d")
             sent_total += 1
         except Exception as e:
-            logger.warning(f"[inactive_30d reminder] failed for {row['telegram_user_id']}: {e}")
+            logger.warning(f"[inactive_30d reminder] failed: {e}")
 
     return sent_total
 
@@ -106,10 +117,10 @@ async def reminders_loop(bot):
             now = kyiv_now()
             today = now.date()
 
-            # запускаем один раз утром в промежутке 09:00–09:59 по Киеву
-            if now.hour == 9 and last_run_date != today:
+            # ТЕСТ — запускается сразу
+            if last_run_date != today:
                 sent = await send_morning_reminders(bot)
-                logger.info(f"[reminders] morning run complete, sent={sent}")
+                logger.info(f"[reminders] TEST run complete, sent={sent}")
                 last_run_date = today
 
         except Exception as e:
