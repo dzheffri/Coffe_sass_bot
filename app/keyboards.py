@@ -11,9 +11,10 @@ def user_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📱 Мій QR-код")],
+            [KeyboardButton(text="☕ Мої чашки")],
+            [KeyboardButton(text="🎁 Мої безкоштовні кави")],
             [KeyboardButton(text="🏪 Мої кав’ярні")],
-            [KeyboardButton(text="☕ Мої чашки"), KeyboardButton(text="🎁 Мої безкоштовні кави")],
-            [KeyboardButton(text="🔄 Змінити кав’ярню")],
+            [KeyboardButton(text="🏪 Обрати кав’ярню")],
         ],
         resize_keyboard=True
     )
@@ -28,38 +29,32 @@ def admin_main_keyboard(
 ):
     keyboard = [
         [
-            KeyboardButton(text="📷 Режим: нарахування"),
-            KeyboardButton(text="✅ Режим: списання"),
+            KeyboardButton(
+                text="📷 Сканувати QR",
+                web_app=WebAppInfo(url=scanner_url)
+            )
         ],
-        [
-            KeyboardButton(text="📷 Відкрити сканер", web_app=WebAppInfo(url=scanner_url)),
-        ],
+        [KeyboardButton(text="☕ Режим: нарахування")],
+        [KeyboardButton(text="✅ Режим: списання")],
     ]
 
     if is_owner:
         keyboard.extend([
             [KeyboardButton(text="📊 Статистика кав’ярні")],
-            [
-                KeyboardButton(text="➕ Додати адміністратора"),
-                KeyboardButton(text="➖ Видалити адміністратора"),
-            ],
-            [
-                KeyboardButton(text="👤 Список адміністраторів"),
-                KeyboardButton(text="📣 Зробити розсилку"),
-            ],
+            [KeyboardButton(text="📣 Зробити розсилку")],
+            [KeyboardButton(text="👤 Список адміністраторів")],
+            [KeyboardButton(text="➕ Додати адміністратора")],
+            [KeyboardButton(text="➖ Видалити адміністратора")],
             [KeyboardButton(text="💳 Підписка")],
         ])
 
     if is_super_admin:
         keyboard.extend([
-            [KeyboardButton(text="📈 Вся система")],
-            [
-                KeyboardButton(text="🏪 Додати кав’ярню"),
-                KeyboardButton(text="📋 Список кав’ярень"),
-            ],
+            [KeyboardButton(text="📊 Загальна статистика")],
+            [KeyboardButton(text="🏪 Список кав’ярень")],
+            [KeyboardButton(text="➕ Додати кав’ярню")],
             [KeyboardButton(text="🗑 Видалити кав’ярню")],
-            [KeyboardButton(text="⏳ Продовжити підписку")],
-            [KeyboardButton(text="💾 Backup системи")],
+            [KeyboardButton(text="💳 Продовжити підписку")],
         ])
 
     if can_switch_to_owner:
@@ -74,13 +69,18 @@ def admin_main_keyboard(
     )
 
 
-def shops_inline_keyboard(shops: list[dict]):
-    rows = []
+def shops_inline_keyboard(shops):
+    buttons = []
     for shop in shops:
-        rows.append([
+        title = shop["name"]
+        if shop.get("city"):
+            title = f"{shop['name']} ({shop['city']})"
+
+        buttons.append([
             InlineKeyboardButton(
-                text=f"{shop['name']} • ☕ {shop['cups']}/7 • {shop['free_coffee_balance']}",
+                text=title,
                 callback_data=f"select_shop:{shop['id']}"
             )
         ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
