@@ -12,25 +12,25 @@ from app.db import (
 from app.keyboards import user_main_keyboard, admin_main_keyboard
 from app.config import SUPER_ADMIN_IDS, SCANNER_URL
 
+
 router = Router()
 
 
 async def send_correct_panel(message: types.Message):
     user_id = message.from_user.id
-
     admin_flag = is_any_shop_admin(user_id)
     owner_flag = is_owner(user_id)
     super_admin_flag = user_id in SUPER_ADMIN_IDS
 
     if not admin_flag and not super_admin_flag:
         await message.answer(
-            "👋 Вітаємо у програмі лояльності <b>Наші Coffee Club Pass</b> ☕\n\n"
+            "👋 Вітаємо у програмі лояльності Наші Coffee Club Pass ☕\n\n"
             "✨ Ваша кава — тепер ще вигідніша\n\n"
             "☕ За кожну покупку ти отримуєш чашки\n"
             "🎁 Збери 7 — і отримай 8-му каву безкоштовно\n\n"
-            "📱 Просто натисни <b>«Мій QR-код»</b>\n"
-            "і покажи його баристі при замовленні\n\n"
-            "🚀 Один QR-код працює у всіх кав’ярнях,\n"
+            "📱 Просто натисни «Мій QR-код»\n"
+            "та покажи його баристі при замовленні\n\n"
+            "🏪 Один QR-код працює у всіх кав’ярнях,\n"
             "які підключені до програми «Наші»",
             reply_markup=user_main_keyboard()
         )
@@ -41,7 +41,8 @@ async def send_correct_panel(message: types.Message):
     if super_admin_flag and admin_flag:
         if panel_mode == "owner":
             await message.answer(
-                "🏪 Увімкнено режим owner.\nТут ти бачиш інтерфейс власника кав’ярні.",
+                "✅ Увімкнено режим owner.\n"
+                "Тут ти бачиш інтерфейс власника кав’ярні.",
                 reply_markup=admin_main_keyboard(
                     scanner_url=SCANNER_URL,
                     is_owner=owner_flag,
@@ -53,7 +54,8 @@ async def send_correct_panel(message: types.Message):
             return
 
         await message.answer(
-            "👑 Увімкнено режим super admin.\nТут ти керуєш усією системою.",
+            "✅ Увімкнено режим super admin.\n"
+            "Тут ти керуєш усією системою.",
             reply_markup=admin_main_keyboard(
                 scanner_url=SCANNER_URL,
                 is_owner=False,
@@ -66,7 +68,7 @@ async def send_correct_panel(message: types.Message):
 
     if admin_flag:
         await message.answer(
-            "🏪 Адмін-панель кав’ярні активна.",
+            "✅ Адмін-панель кав’ярні активна.",
             reply_markup=admin_main_keyboard(
                 scanner_url=SCANNER_URL,
                 is_owner=owner_flag,
@@ -78,7 +80,7 @@ async def send_correct_panel(message: types.Message):
         return
 
     await message.answer(
-        "👑 Адмін-панель super admin активна.",
+        "✅ Адмін-панель super admin активна.",
         reply_markup=admin_main_keyboard(
             scanner_url=SCANNER_URL,
             is_owner=False,
@@ -98,15 +100,14 @@ async def start_handler(message: types.Message):
     )
 
     assign_pending_owner_if_exists(message.from_user.id)
-
     await send_correct_panel(message)
 
 
-# 🔥 ВОТ ЭТО МЫ ДОБАВИЛИ
 @router.message(Command("id"))
 async def my_id_command_handler(message: types.Message):
     await message.answer(
-        f"Твій Telegram ID:\n<code>{message.from_user.id}</code>"
+        f"Твій Telegram ID:\n`{message.from_user.id}`",
+        parse_mode="Markdown"
     )
 
 
@@ -116,6 +117,7 @@ async def switch_to_owner_mode(message: types.Message):
 
     if user_id not in SUPER_ADMIN_IDS:
         return
+
     if not is_any_shop_admin(user_id):
         return
 
