@@ -18,16 +18,17 @@ from app.db import (
     can_send_broadcast,
     get_broadcast_recipients,
     save_broadcast,
+    log_broadcast_touches,
 )
 from app.states import OwnerStates
 from app.keyboards import admin_main_keyboard
 from app.config import SCANNER_URL, SUPER_ADMIN_IDS
 
+
 router = Router()
 
-# ID твоей кофейни.
-# Поставь сюда ID именно своей кофейни из базы.
-# Для этой кофейни лимита на рассылку не будет.
+# Якщо хочеш для якоїсь конкретної кав'ярні прибрати ліміт розсилок,
+# вкажи її ID. Якщо не потрібно — залиш як є.
 MY_SHOP_ID = 1
 
 
@@ -73,18 +74,30 @@ async def shop_stats_handler(message: types.Message):
 
     stats = get_shop_detailed_stats(admin_shop["id"])
 
-    await message.answer(
+    text = (
+        f"📊 Ефективність за 30 днів\n"
         f"🏪 {admin_shop['name']}\n\n"
-        f"👥 Усього клієнтів: {stats['total_clients']}\n"
-        f"🆕 Нових за 30 днів: {stats['new_clients_30d']}\n"
-        f"🔥 Активних за 30 днів: {stats['active_clients_30d']}\n"
-        f"☕ Всього нарахувань: {stats['total_scans']}\n"
-        f"📅 Сьогодні сканувань: {stats['scans_today']}\n"
-        f"📆 За 30 днів сканувань: {stats['scans_30d']}\n"
+        f"📩 Відправлено повідомлень: {stats['sent_total']}\n"
+        f"├ ⚙️ Автоматичні: {stats['sent_auto']}\n"
+        f"└ 📣 Власні розсилки: {stats['sent_broadcast']}\n\n"
+        f"💰 Клієнти повернулися після повідомлень: {stats['returns_total']}\n"
+        f"├ ⚙️ Автоматичні: {stats['returns_auto']}\n"
+        f"└ 📣 Власні розсилки: {stats['returns_broadcast']}\n\n"
+        f"📈 Ефективність: {stats['efficiency_percent']}%\n"
+        f"🔁 Клієнти повернулися сьогодні: {stats['returned_today']}\n"
+        f"🔁 Клієнти повернулися за 7 днів: {stats['returned_7d']}\n"
+        f"👥 Клієнти не приходили понад 7 днів: {stats['inactive_gt_7d']}\n"
+        f"👥 Активні клієнти (30 днів): {stats['active_clients_30d']}\n"
+        f"📅 Сканувань за 30 днів: {stats['scans_30d']}\n"
+        f"📅 Сьогодні: {stats['scans_today']}\n"
+        f"☕ Нарахувань: {stats['total_scans']}\n"
         f"🎁 Безкоштовних зараз: {stats['free_balance']}\n"
-        f"🎁 Нараховано всього: {stats['total_free_earned']}\n"
-        f"✅ Списано всього: {stats['total_free_redeemed']}"
+        f"✅ Видано безкоштовних: {stats['total_free_redeemed']}\n"
+        f"👤 Всього клієнтів: {stats['total_clients']}\n"
+        f"🆕 Нових за 30 днів: {stats['new_clients_30d']}"
     )
+
+    await message.answer(text)
 
 
 @router.message(F.text == "➕ Додати адміністратора")
@@ -117,7 +130,6 @@ async def add_admin_finish(message: types.Message, state: FSMContext):
         return
 
     result = add_shop_admin(admin_shop["id"], int(text), "admin")
-
     await state.clear()
 
     if not result:
@@ -160,7 +172,6 @@ async def remove_admin_finish(message: types.Message, state: FSMContext):
         return
 
     ok = remove_shop_admin(admin_shop["id"], int(text))
-
     await state.clear()
 
     if not ok:
@@ -183,15 +194,15 @@ async def admins_handler(message: types.Message):
         return
 
     admins = get_shop_admins(admin_shop["id"])
-
     if not admins:
         await message.answer("Список адміністраторів порожній.")
         return
 
-    lines = [f"🏪 {admin_shop['name']}", "", "👤 Адміністратори:"]
+    lines = [f"👤 {admin_shop['name']}", "", "Адміністратори:"]
     for item in admins:
         name = item["full_name"] or item["username"] or "-"
-        lines.append(f"• {item['telegram_user_id']} | {item['role']} | {name}")
+        role_name = "owner" if item["role"] == "owner" else "admin"
+        lines.append(f"• {item['telegram_user_id']} | {role_name} | {name}")
 
     await message.answer("\n".join(lines))
 
@@ -206,10 +217,13 @@ async def subscription_handler(message: types.Message):
         return
 
     sub = get_subscription(admin_shop["id"])
+    if not sub:
+        await message.answer("❌ Підписку не знайдено.")
+        return
 
     await message.answer(
-        f"🏪 {admin_shop['name']}\n"
-        f"💳 План: {sub['plan']}\n"
+        f"💳 {admin_shop['name']}\n"
+        f"📦 План: {sub['plan']}\n"
         f"📌 Статус: {sub['status']}\n"
         f"⏳ Діє до: {sub['expires_at']}\n\n"
         f"Щоб продовжити підписку, напиши адміну сервісу."
@@ -226,12 +240,10 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
         await message.answer("❌ Не вдалося визначити кав’ярню.")
         return
 
-    # Для твоей кофейни лимита нет.
-    # Для остальных кофеен лимит остается.
     if admin_shop["id"] != MY_SHOP_ID and not can_send_broadcast(admin_shop["id"]):
         await message.answer(
             "❌ Ліміт розсилок вичерпано.\n"
-            "Дозволено максимум 7 промо-розсилок за 7 днів на кав’ярню."
+            "Дозволено максимум 4 промо-розсилки за 7 днів на кав’ярню."
         )
         return
 
@@ -243,7 +255,7 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
         "• фото з текстом або без тексту\n"
         "• відео з текстом або без тексту\n\n"
         "Спочатку я покажу передперегляд, і тільки після підтвердження розсилка піде клієнтам.\n\n"
-        "Щоб скасувати, натисни кнопку нижче 👇",
+        "Щоб скасувати, натисни кнопку нижче.",
         reply_markup=broadcast_cancel_keyboard()
     )
 
@@ -290,7 +302,7 @@ async def broadcast_preview_handler(message: types.Message, state: FSMContext):
         broadcast_video=video_id,
     )
 
-    preview_caption = f"👀 Передперегляд розсилки\n\n🏪 {admin_shop['name']}"
+    preview_caption = f"📣 Передперегляд розсилки\n\n🏪 {admin_shop['name']}"
     if text:
         preview_caption += f"\n\n{text}"
 
@@ -337,7 +349,6 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
         return
 
     data = await state.get_data()
-
     text = (data.get("broadcast_text") or "").strip()
     photo_id = data.get("broadcast_photo")
     video_id = data.get("broadcast_video")
@@ -349,9 +360,9 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
         return
 
     recipients = get_broadcast_recipients(admin_shop["id"])
-
     if not recipients:
         await state.clear()
+
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -368,6 +379,7 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
 
     sent = 0
     failed = 0
+    touched_user_ids = []
 
     for row in recipients:
         try:
@@ -394,12 +406,22 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
                 )
 
             sent += 1
+            touched_user_ids.append(row["user_id"])
 
         except Exception as e:
             print(f"[broadcast] failed for {row['telegram_user_id']}: {e}")
             failed += 1
 
-    save_broadcast(admin_shop["id"], callback.from_user.id, text, sent)
+    save_broadcast(
+        admin_shop["id"],
+        callback.from_user.id,
+        text if text else "[media only]",
+        sent
+    )
+
+    if touched_user_ids:
+        log_broadcast_touches(admin_shop["id"], touched_user_ids)
+
     await state.clear()
 
     try:
@@ -409,7 +431,7 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
 
     await callback.message.answer(
         f"✅ Розсилку завершено\n"
-        f"📨 Відправлено: {sent}\n"
+        f"📩 Відправлено: {sent}\n"
         f"❌ Помилок: {failed}",
         reply_markup=owner_main_keyboard_for_user(callback.from_user.id)
     )
