@@ -1,249 +1,260 @@
-import json
-import tempfile
-from datetime import datetime
-
 from aiogram import Router, types, F
-from aiogram.types import FSInputFile
+from aiogram.fsm.context import FSMContext
 
-from app.config import SUPER_ADMIN_IDS, SUBSCRIPTION_PRICE_USD
+from app.config import SUPER_ADMIN_IDS
 from app.db import (
     create_shop,
     get_all_shops,
-    extend_subscription,
-    add_shop_admin,
-    get_user_by_telegram_id,
-    get_global_stats,
     delete_shop,
-    get_all_users,
-    get_all_shop_admins,
-    get_all_shop_clients,
-    get_all_transactions,
-    get_all_subscriptions,
-    get_all_broadcasts,
-    get_all_reminder_logs,
+    extend_subscription,
+    get_global_stats,
+    get_super_admin_clients_stats,
 )
+from app.states import SuperAdminStates
+
 
 router = Router()
 
-pending_shop_data: dict[int, bool] = {}
-pending_delete_shop: dict[int, bool] = {}
 
-
-def is_super_admin(user_id: int):
+def is_super_admin(user_id: int) -> bool:
     return user_id in SUPER_ADMIN_IDS
 
 
-@router.message(F.text == "📈 Вся система")
+@router.message(F.text == "📊 Загальна статистика")
 async def global_stats_handler(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
 
     stats = get_global_stats()
-    revenue = stats["active_subscriptions"] * SUBSCRIPTION_PRICE_USD
+    clients_stats = get_super_admin_clients_stats()
 
-    await message.answer(
-        "📈 Вся система\n\n"
-        f"🏪 Кавʼярень: {stats['shops_count']}\n"
-        f"👤 Користувачів: {stats['users_count']}\n"
+    per_shop_lines = []
+    for item in clients_stats["per_shop"]:
+        per_shop_lines.append(
+            f"• {item['shop_name']} — {item['clients_count']} клієнтів"
+        )
+
+    shops_block = "\n".join(per_shop_lines) if per_shop_lines else "• Немає кав’ярень"
+
+    text = (
+        f"📊 Загальна статистика\n\n"
+        f"🏪 Всього кав’ярень: {stats['shops_count']}\n"
+        f"👤 Всього користувачів у боті: {stats['users_count']}\n"
+        f"👥 Всього клієнтів по всіх кав’ярнях: {clients_stats['total_clients']}\n\n"
         f"☕ Всього нарахувань: {stats['total_scans']}\n"
         f"🎁 Безкоштовних зараз: {stats['free_balance']}\n"
-        f"✅ Списано бонусів: {stats['total_free_redeemed']}\n\n"
+        f"✅ Видано безкоштовних: {stats['total_free_redeemed']}\n\n"
         f"💳 Активних підписок: {stats['active_subscriptions']}\n"
-        f"❌ Прострочених: {stats['expired_subscriptions']}\n"
-        f"💰 Поточний дохід: ${revenue:.2f}"
+        f"⛔ Прострочених / неактивних: {stats['expired_subscriptions']}\n\n"
+        f"👥 Клієнти по кав’ярнях:\n{shops_block}"
     )
 
+    await message.answer(text)
 
-@router.message(F.text == "💾 Backup системи")
-async def backup_system_handler(message: types.Message):
+
+@router.message(F.text == "🏪 Список кав’ярень")
+async def list_shops_handler(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
 
-    await message.answer("⏳ Створюю backup системи...")
+    shops = get_all_shops()
+    if not shops:
+        await message.answer("Список кав’ярень порожній.")
+        return
 
-    backup_data = {
-        "meta": {
-            "created_at": datetime.utcnow().isoformat() + "Z",
-            "type": "full_system_backup",
-            "format": "json",
-        },
-        "users": get_all_users(),
-        "coffee_shops": get_all_shops(),
-        "shop_admins": get_all_shop_admins(),
-        "shop_clients": get_all_shop_clients(),
-        "transactions": get_all_transactions(),
-        "subscriptions": get_all_subscriptions(),
-        "broadcasts": get_all_broadcasts(),
-        "reminder_logs": get_all_reminder_logs(),
-    }
+    lines = ["🏪 Список кав’ярень:", ""]
+    for shop in shops:
+        city = shop["city"] or "-"
+        address = shop["address"] or "-"
+        lines.append(
+            f"ID: {shop['id']}\n"
+            f"Назва: {shop['name']}\n"
+            f"Місто: {city}\n"
+            f"Адреса: {address}\n"
+        )
 
-    filename = f"backup_system_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}.json"
-
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
-        json.dump(backup_data, tmp, ensure_ascii=False, indent=2, default=str)
-        tmp_path = tmp.name
-
-    document = FSInputFile(tmp_path, filename=filename)
-
-    await message.answer_document(
-        document=document,
-        caption="✅ Backup системи готовий"
-    )
+    await message.answer("\n".join(lines))
 
 
-@router.message(F.text == "🏪 Додати кав’ярню")
-async def add_shop_start(message: types.Message):
+@router.message(F.text == "➕ Додати кав’ярню")
+async def add_shop_start(message: types.Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return
 
-    pending_shop_data[message.from_user.id] = True
-    pending_delete_shop.pop(message.from_user.id, None)
+    await state.set_state(SuperAdminStates.waiting_shop_name)
+    await message.answer(
+        "Надішли назву кав’ярні."
+    )
+
+
+@router.message(SuperAdminStates.waiting_shop_name)
+async def add_shop_name(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❌ Назва не може бути порожньою.")
+        return
+
+    await state.update_data(shop_name=text)
+    await state.set_state(SuperAdminStates.waiting_shop_city)
+    await message.answer("Тепер надішли місто.")
+
+
+@router.message(SuperAdminStates.waiting_shop_city)
+async def add_shop_city(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❌ Місто не може бути порожнім.")
+        return
+
+    await state.update_data(shop_city=text)
+    await state.set_state(SuperAdminStates.waiting_shop_address)
+    await message.answer("Тепер надішли адресу.")
+
+
+@router.message(SuperAdminStates.waiting_shop_address)
+async def add_shop_address(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❌ Адреса не може бути порожньою.")
+        return
+
+    await state.update_data(shop_address=text)
+    await state.set_state(SuperAdminStates.waiting_shop_owner_id)
+    await message.answer(
+        "Тепер надішли Telegram ID власника.\n\n"
+        "Важливо: власник має хоча б один раз зайти в бота через /start."
+    )
+
+
+@router.message(SuperAdminStates.waiting_shop_owner_id)
+async def add_shop_finish(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ Telegram ID має бути числом.")
+        return
+
+    data = await state.get_data()
+
+    shop = create_shop(
+        name=data["shop_name"],
+        city=data["shop_city"],
+        address=data["shop_address"],
+        pending_owner_telegram_id=int(text),
+    )
+
+    await state.clear()
 
     await message.answer(
-        "Надішли дані нової кав’ярні одним повідомленням у форматі:\n\n"
-        "Назва | Місто | Адреса | Telegram_ID_власника\n\n"
-        "Приклад:\n"
-        "Coffee A | Київ | Хрещатик 1 | 123456789"
+        f"✅ Кав’ярню створено\n\n"
+        f"ID: {shop['id']}\n"
+        f"Назва: {shop['name']}\n"
+        f"Місто: {shop['city']}\n"
+        f"Адреса: {shop['address']}\n\n"
+        f"Власник буде прив’язаний автоматично, коли зайде в бота."
     )
 
 
 @router.message(F.text == "🗑 Видалити кав’ярню")
-async def delete_shop_start(message: types.Message):
+async def delete_shop_start(message: types.Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return
 
-    pending_delete_shop[message.from_user.id] = True
-    pending_shop_data.pop(message.from_user.id, None)
+    await state.set_state(SuperAdminStates.waiting_delete_shop_id)
+    await message.answer("Надішли ID кав’ярні, яку треба видалити.")
 
-    shops = get_all_shops()
-    if not shops:
-        pending_delete_shop.pop(message.from_user.id, None)
-        await message.answer("Список кав’ярень порожній.")
+
+@router.message(SuperAdminStates.waiting_delete_shop_id)
+async def delete_shop_finish(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
         return
 
-    text = ["🗑 Введи ID кав’ярні, яку треба видалити.", "", "📋 Список кав’ярень:"]
-    for shop in shops:
-        text.append(f"• ID {shop['id']} — {shop['name']} ({shop['city'] or '-'})")
-
-    await message.answer("\n".join(text))
-
-
-@router.message(
-    lambda m: m.from_user.id in SUPER_ADMIN_IDS and m.from_user.id in pending_shop_data and "|" in (m.text or "")
-)
-async def add_shop_finish(message: types.Message):
-    parts = [x.strip() for x in (message.text or "").split("|")]
-    if len(parts) != 4:
-        await message.answer("❌ Формат неправильний.")
-        return
-
-    name, city, address, owner_id = parts
-
-    if not owner_id.isdigit():
-        await message.answer("❌ Telegram ID власника має бути числом.")
-        return
-
-    owner_telegram_id = int(owner_id)
-
-    shop = create_shop(
-        name=name,
-        city=city,
-        address=address,
-        pending_owner_telegram_id=owner_telegram_id
-    )
-
-    owner_user = get_user_by_telegram_id(owner_telegram_id)
-    pending_shop_data.pop(message.from_user.id, None)
-
-    if owner_user:
-        add_shop_admin(shop["id"], owner_telegram_id, "owner")
-        await message.answer(
-            f"✅ Кав’ярню створено\n"
-            f"🏪 {shop['name']}\n"
-            f"👑 Owner призначено одразу"
-        )
-        return
-
-    await message.answer(
-        f"✅ Кав’ярню створено: {shop['name']}\n"
-        f"⏳ Власник ще не заходив у бота.\n"
-        f"Після його /start роль owner буде видано автоматично."
-    )
-
-
-@router.message(
-    lambda m: m.from_user.id in SUPER_ADMIN_IDS and m.from_user.id in pending_delete_shop
-)
-async def delete_shop_finish(message: types.Message):
     text = (message.text or "").strip()
-
     if not text.isdigit():
-        await message.answer("❌ Надішли числовий ID кав’ярні.")
+        await message.answer("❌ ID має бути числом.")
         return
 
-    shop_id = int(text)
-    deleted_shop = delete_shop(shop_id)
-    pending_delete_shop.pop(message.from_user.id, None)
+    deleted = delete_shop(int(text))
+    await state.clear()
 
-    if not deleted_shop:
-        await message.answer("❌ Кав’ярню з таким ID не знайдено.")
+    if not deleted:
+        await message.answer("❌ Кав’ярню не знайдено.")
         return
 
     await message.answer(
-        f"✅ Кав’ярню видалено\n"
-        f"🏪 {deleted_shop['name']}\n"
-        f"ID: {deleted_shop['id']}"
+        f"✅ Кав’ярню видалено:\n{deleted['name']}"
     )
 
 
-@router.message(F.text == "📋 Список кав’ярень")
-async def shops_list_handler(message: types.Message):
+@router.message(F.text == "💳 Продовжити підписку")
+async def extend_sub_start(message: types.Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return
 
-    shops = get_all_shops()
-    if not shops:
-        await message.answer("Список кав’ярень порожній.")
-        return
-
-    text = ["📋 Список кав’ярень:"]
-    for shop in shops:
-        text.append(f"• ID {shop['id']} — {shop['name']} ({shop['city'] or '-'})")
-
-    await message.answer("\n".join(text))
-
-
-@router.message(F.text.startswith("/extend_shop "))
-async def extend_shop_handler(message: types.Message):
-    if not is_super_admin(message.from_user.id):
-        return
-
-    parts = message.text.split()
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-        await message.answer("Формат: /extend_shop SHOP_ID DAYS")
-        return
-
-    shop_id = int(parts[1])
-    days = int(parts[2])
-
-    sub = extend_subscription(shop_id, days)
-
+    await state.set_state(SuperAdminStates.waiting_extend_shop_id)
     await message.answer(
-        f"✅ Підписку продовжено\n"
-        f"SHOP_ID: {shop_id}\n"
-        f"План: {sub['plan']}\n"
-        f"Діє до: {sub['expires_at']}"
+        "Надішли ID кав’ярні, якій потрібно продовжити підписку."
     )
 
 
-@router.message(F.text == "⏳ Продовжити підписку")
-async def extend_hint(message: types.Message):
+@router.message(SuperAdminStates.waiting_extend_shop_id)
+async def extend_sub_shop_id(message: types.Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
+        await state.clear()
         return
 
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ ID має бути числом.")
+        return
+
+    await state.update_data(shop_id=int(text))
+    await state.set_state(SuperAdminStates.waiting_extend_days)
+    await message.answer("На скільки днів продовжити підписку?")
+
+
+@router.message(SuperAdminStates.waiting_extend_days)
+async def extend_sub_days(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ Кількість днів має бути числом.")
+        return
+
+    days = int(text)
+    if days <= 0:
+        await message.answer("❌ Кількість днів має бути більшою за 0.")
+        return
+
+    data = await state.get_data()
+    shop_id = data["shop_id"]
+
+    sub = extend_subscription(shop_id=shop_id, days=days, plan="basic")
+    await state.clear()
+
     await message.answer(
-        "Використай команду:\n"
-        "/extend_shop SHOP_ID DAYS\n\n"
-        "Приклад:\n"
-        "/extend_shop 3 30"
+        f"✅ Підписку продовжено\n\n"
+        f"🏪 shop_id: {shop_id}\n"
+        f"📦 План: {sub['plan']}\n"
+        f"📌 Статус: {sub['status']}\n"
+        f"⏳ Діє до: {sub['expires_at']}"
     )
