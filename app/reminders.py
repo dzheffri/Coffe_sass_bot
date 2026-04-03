@@ -1,5 +1,6 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 
@@ -13,36 +14,16 @@ from app.db import (
 )
 
 
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
 REMINDER_ONE_LEFT = "one_left"
 REMINDER_INACTIVE_5_7 = "inactive_5_7"
 REMINDER_INACTIVE_14_30 = "inactive_14_30"
 REMINDER_FREE_COFFEE = "free_coffee"
 
-CHECK_INTERVAL_SECONDS = 60 * 30  # раз в 30 минут
 
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def _safe_last_activity(row):
-    value = row.get("last_activity_at")
-    if not value:
-        return None
-
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-
-    return value.astimezone(timezone.utc)
-
-
-def _days_since_last_activity(row):
-    last_activity = _safe_last_activity(row)
-    if not last_activity:
-        return None
-
-    delta = utc_now() - last_activity
-    return delta.total_seconds() / 86400
+def kyiv_now():
+    return datetime.now(KYIV_TZ)
 
 
 async def send_one_left_reminders(bot: Bot):
@@ -53,7 +34,7 @@ async def send_one_left_reminders(bot: Bot):
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
-        # чтобы не спамить: не чаще 1 раза в 3 дня
+        # Не чаще 1 раза в 3 дня
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
@@ -85,7 +66,7 @@ async def send_inactive_5_7_reminders(bot: Bot):
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
-        # не чаще 1 раза в 5 дней
+        # Не чаще 1 раза в 5 дней
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
@@ -94,13 +75,10 @@ async def send_inactive_5_7_reminders(bot: Bot):
         ):
             continue
 
-        days_ago = _days_since_last_activity(row)
-        days_text = f"{int(days_ago)}" if days_ago is not None else "декілька"
-
         text = (
             f"👋 Ми скучили за тобою\n\n"
             f"🏪 {row['shop_name']}\n"
-            f"Ти не заходив приблизно {days_text} днів.\n\n"
+            f"Ти давно не заходив до нас.\n\n"
             f"☕ Зараз у тебе: {row['cups']}/7\n"
             f"🎁 Безкоштовних кав: {row['free_coffee_balance']}\n\n"
             f"Заходь на каву найближчим часом 💛"
@@ -122,7 +100,7 @@ async def send_inactive_14_30_reminders(bot: Bot):
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
-        # не чаще 1 раза в 10 дней
+        # Не чаще 1 раза в 10 дней
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
@@ -131,13 +109,10 @@ async def send_inactive_14_30_reminders(bot: Bot):
         ):
             continue
 
-        days_ago = _days_since_last_activity(row)
-        days_text = f"{int(days_ago)}" if days_ago is not None else "деякий час"
-
         text = (
             f"☕ Давно не бачилися\n\n"
             f"🏪 {row['shop_name']}\n"
-            f"Ти не був у нас вже приблизно {days_text} днів.\n\n"
+            f"Ти давно не був у нас.\n\n"
             f"☕ Зараз у тебе: {row['cups']}/7\n"
             f"🎁 Безкоштовних кав: {row['free_coffee_balance']}\n\n"
             f"Будемо раді бачити тебе знову 💛"
@@ -159,7 +134,7 @@ async def send_free_coffee_reminders(bot: Bot):
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
-        # не чаще 1 раза в 3 дня
+        # Не чаще 1 раза в 3 дня
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
@@ -194,11 +169,20 @@ async def run_reminders_once(bot: Bot):
 async def reminders_loop(bot: Bot):
     print("REMINDERS LOOP STARTED 🔁")
 
+    last_run_date = None
+
     while True:
         try:
-            await run_reminders_once(bot)
-            print("REMINDERS: ✅ done")
+            now = kyiv_now()
+            today = now.date()
+
+            # Запуск только утром в 09:00 по Киеву
+            if now.hour == 9 and last_run_date != today:
+                await run_reminders_once(bot)
+                print("REMINDERS: ✅ morning run done")
+                last_run_date = today
+
         except Exception as e:
             print(f"REMINDERS ERROR: {e}")
 
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+        await asyncio.sleep(300)
