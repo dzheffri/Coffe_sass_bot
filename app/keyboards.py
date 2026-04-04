@@ -66,6 +66,7 @@ def admin_main_keyboard(
                 KeyboardButton(text="➕ Додати кав’ярню"),
                 KeyboardButton(text="🗑 Видалити кав’ярню"),
             ],
+            [KeyboardButton(text="💾 Backup системи")],
             [KeyboardButton(text="💳 Продовжити підписку")],
         ])
 
