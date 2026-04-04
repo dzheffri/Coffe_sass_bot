@@ -1,5 +1,10 @@
+import json
+import tempfile
+from datetime import datetime
+
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
+from aiogram.types import FSInputFile
 
 from app.config import SUPER_ADMIN_IDS
 from app.db import (
@@ -9,6 +14,13 @@ from app.db import (
     extend_subscription,
     get_global_stats,
     get_super_admin_clients_stats,
+    get_all_users,
+    get_all_shop_admins,
+    get_all_shop_clients,
+    get_all_transactions,
+    get_all_subscriptions,
+    get_all_broadcasts,
+    get_all_reminder_logs,
 )
 from app.states import SuperAdminStates
 
@@ -52,6 +64,43 @@ async def global_stats_handler(message: types.Message):
     await message.answer(text)
 
 
+@router.message(F.text == "💾 Backup системи")
+async def backup_system_handler(message: types.Message):
+    if not is_super_admin(message.from_user.id):
+        return
+
+    await message.answer("⏳ Створюю backup системи...")
+
+    backup_data = {
+        "meta": {
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "type": "full_system_backup",
+            "format": "json",
+        },
+        "users": get_all_users(),
+        "coffee_shops": get_all_shops(),
+        "shop_admins": get_all_shop_admins(),
+        "shop_clients": get_all_shop_clients(),
+        "transactions": get_all_transactions(),
+        "subscriptions": get_all_subscriptions(),
+        "broadcasts": get_all_broadcasts(),
+        "reminder_logs": get_all_reminder_logs(),
+    }
+
+    filename = f"backup_system_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+        json.dump(backup_data, tmp, ensure_ascii=False, indent=2, default=str)
+        tmp_path = tmp.name
+
+    document = FSInputFile(tmp_path, filename=filename)
+
+    await message.answer_document(
+        document=document,
+        caption="✅ Backup системи готовий"
+    )
+
+
 @router.message(F.text == "🏪 Список кав’ярень")
 async def list_shops_handler(message: types.Message):
     if not is_super_admin(message.from_user.id):
@@ -82,9 +131,7 @@ async def add_shop_start(message: types.Message, state: FSMContext):
         return
 
     await state.set_state(SuperAdminStates.waiting_shop_name)
-    await message.answer(
-        "Надішли назву кав’ярні."
-    )
+    await message.answer("Надішли назву кав’ярні.")
 
 
 @router.message(SuperAdminStates.waiting_shop_name)
