@@ -7,17 +7,27 @@ from aiogram.types import (
 )
 
 
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    WebAppInfo,
+)
+
+
 def user_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📱 Мій QR-код")],
+            [
+                KeyboardButton(text="📱 Мій QR-код"),
+            ],
             [
                 KeyboardButton(text="☕ Мої чашки"),
                 KeyboardButton(text="🎁 Мої безкоштовні кави"),
             ],
             [
                 KeyboardButton(text="🏪 Мої кав’ярні"),
-                KeyboardButton(text="🏪 Обрати кав’ярню"),
             ],
         ],
         resize_keyboard=True
