@@ -122,7 +122,6 @@ def init_db():
                 )
             """)
 
-            # Новая таблица для аналитики касаний / возвратов
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS touch_logs (
                     id BIGSERIAL PRIMARY KEY,
@@ -130,6 +129,19 @@ def init_db():
                     shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
                     type TEXT NOT NULL CHECK (type IN ('auto', 'broadcast', 'service')),
                     sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            # НОВАЯ таблица — фиксированные возвраты, чтобы статистика не прыгала
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS return_logs (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    touch_log_id BIGINT NOT NULL REFERENCES touch_logs(id) ON DELETE CASCADE,
+                    touch_type TEXT NOT NULL CHECK (touch_type IN ('auto', 'broadcast')),
+                    returned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(shop_id, user_id, touch_log_id)
                 )
             """)
 
@@ -166,6 +178,16 @@ def init_db():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_touch_logs_shop_type_sent
                 ON touch_logs(shop_id, type, sent_at DESC)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_return_logs_shop_returned
+                ON return_logs(shop_id, returned_at DESC)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_return_logs_touch_type
+                ON return_logs(shop_id, touch_type, returned_at DESC)
             """)
 
             cur.execute("""
@@ -466,6 +488,21 @@ def get_last_marketing_touch(shop_id: int, user_id: int, days: int = 7):
             return cur.fetchone()
 
 
+def save_return_log(shop_id: int, user_id: int, touch_log_id: int, touch_type: str):
+    if touch_type not in ("auto", "broadcast"):
+        return None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO return_logs (user_id, shop_id, touch_log_id, touch_type)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (shop_id, user_id, touch_log_id) DO NOTHING
+                RETURNING *
+            """, (user_id, shop_id, touch_log_id, touch_type))
+            return cur.fetchone()
+
+
 def add_cups_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: int, count: int):
     if count <= 0:
         raise ValueError("count must be > 0")
@@ -518,17 +555,26 @@ def add_cups_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: i
                 ) VALUES (%s, %s, %s, 'add_cups', %s, 0)
             """, (shop_id, client_user_id, admin_user_id, count))
 
-            # service-сообщение логируем, но НЕ используем в маркетинговой аналитике
             cur.execute("""
                 INSERT INTO touch_logs (user_id, shop_id, type)
                 VALUES (%s, %s, 'service')
             """, (client_user_id, shop_id))
 
+            saved_return = None
+            if last_touch:
+                saved_return = save_return_log(
+                    shop_id=shop_id,
+                    user_id=client_user_id,
+                    touch_log_id=last_touch["id"],
+                    touch_type=last_touch["type"],
+                )
+
             return {
                 "shop_client": updated,
                 "earned_free": earned_free,
                 "last_touch": last_touch,
-                "return_source": last_touch["type"] if last_touch else None,
+                "return_source": last_touch["type"] if saved_return else None,
+                "saved_return": saved_return,
             }
 
 
@@ -611,6 +657,44 @@ def get_shop_detailed_stats(shop_id: int):
             base = cur.fetchone()
 
             cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE type IN ('auto', 'broadcast')) AS sent_total,
+                    COUNT(*) FILTER (WHERE type = 'auto') AS sent_auto,
+                    COUNT(*) FILTER (WHERE type = 'broadcast') AS sent_broadcast
+                FROM touch_logs
+                WHERE shop_id = %s
+                  AND sent_at >= NOW() - INTERVAL '30 days'
+            """, (shop_id,))
+            touches = cur.fetchone()
+
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS returns_total,
+                    COUNT(*) FILTER (WHERE touch_type = 'auto') AS returns_auto,
+                    COUNT(*) FILTER (WHERE touch_type = 'broadcast') AS returns_broadcast
+                FROM return_logs
+                WHERE shop_id = %s
+                  AND returned_at >= NOW() - INTERVAL '30 days'
+            """, (shop_id,))
+            returns_30d = cur.fetchone()
+
+            cur.execute("""
+                SELECT COUNT(*) AS returned_7d
+                FROM return_logs
+                WHERE shop_id = %s
+                  AND returned_at >= NOW() - INTERVAL '7 days'
+            """, (shop_id,))
+            returned_7d = cur.fetchone()
+
+            cur.execute("""
+                SELECT COUNT(*) AS returned_today
+                FROM return_logs
+                WHERE shop_id = %s
+                  AND returned_at >= CURRENT_DATE
+            """, (shop_id,))
+            returned_today = cur.fetchone()
+
+            cur.execute("""
                 SELECT COALESCE(SUM(cups_added), 0) AS scans_today
                 FROM transactions
                 WHERE shop_id = %s
@@ -627,144 +711,6 @@ def get_shop_detailed_stats(shop_id: int):
                   AND created_at >= NOW() - INTERVAL '30 days'
             """, (shop_id,))
             month = cur.fetchone()
-
-            cur.execute("""
-                SELECT
-                    COUNT(*) FILTER (WHERE type IN ('auto', 'broadcast')) AS sent_total,
-                    COUNT(*) FILTER (WHERE type = 'auto') AS sent_auto,
-                    COUNT(*) FILTER (WHERE type = 'broadcast') AS sent_broadcast
-                FROM touch_logs
-                WHERE shop_id = %s
-                  AND sent_at >= NOW() - INTERVAL '30 days'
-            """, (shop_id,))
-            touches = cur.fetchone()
-
-            cur.execute("""
-                WITH ranked_touches AS (
-                    SELECT
-                        t.shop_id,
-                        t.user_id,
-                        t.type,
-                        t.sent_at,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY t.shop_id, t.user_id
-                            ORDER BY t.sent_at DESC
-                        ) AS rn
-                    FROM touch_logs t
-                    WHERE t.shop_id = %s
-                      AND t.type IN ('auto', 'broadcast')
-                      AND t.sent_at >= NOW() - INTERVAL '30 days'
-                ),
-                returned_clients AS (
-                    SELECT DISTINCT ON (tr.shop_id, tr.user_id)
-                        tr.shop_id,
-                        tr.user_id,
-                        tr.created_at
-                    FROM transactions tr
-                    WHERE tr.shop_id = %s
-                      AND tr.type = 'add_cups'
-                      AND tr.created_at >= NOW() - INTERVAL '30 days'
-                    ORDER BY tr.shop_id, tr.user_id, tr.created_at DESC
-                )
-                SELECT
-                    COUNT(*) FILTER (
-                        WHERE rt.type IN ('auto', 'broadcast')
-                          AND rc.created_at >= rt.sent_at
-                          AND rc.created_at <= rt.sent_at + INTERVAL '7 days'
-                    ) AS returns_total,
-                    COUNT(*) FILTER (
-                        WHERE rt.type = 'auto'
-                          AND rc.created_at >= rt.sent_at
-                          AND rc.created_at <= rt.sent_at + INTERVAL '7 days'
-                    ) AS returns_auto,
-                    COUNT(*) FILTER (
-                        WHERE rt.type = 'broadcast'
-                          AND rc.created_at >= rt.sent_at
-                          AND rc.created_at <= rt.sent_at + INTERVAL '7 days'
-                    ) AS returns_broadcast
-                FROM returned_clients rc
-                JOIN ranked_touches rt
-                  ON rt.shop_id = rc.shop_id
-                 AND rt.user_id = rc.user_id
-                 AND rt.rn = 1
-            """, (shop_id, shop_id))
-            returns_30d = cur.fetchone()
-
-            cur.execute("""
-                WITH ranked_touches AS (
-                    SELECT
-                        t.shop_id,
-                        t.user_id,
-                        t.type,
-                        t.sent_at,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY t.shop_id, t.user_id
-                            ORDER BY t.sent_at DESC
-                        ) AS rn
-                    FROM touch_logs t
-                    WHERE t.shop_id = %s
-                      AND t.type IN ('auto', 'broadcast')
-                      AND t.sent_at >= NOW() - INTERVAL '7 days'
-                ),
-                returned_clients AS (
-                    SELECT DISTINCT ON (tr.shop_id, tr.user_id)
-                        tr.shop_id,
-                        tr.user_id,
-                        tr.created_at
-                    FROM transactions tr
-                    WHERE tr.shop_id = %s
-                      AND tr.type = 'add_cups'
-                      AND tr.created_at >= NOW() - INTERVAL '7 days'
-                    ORDER BY tr.shop_id, tr.user_id, tr.created_at DESC
-                )
-                SELECT COUNT(*) AS returned_7d
-                FROM returned_clients rc
-                JOIN ranked_touches rt
-                  ON rt.shop_id = rc.shop_id
-                 AND rt.user_id = rc.user_id
-                 AND rt.rn = 1
-                WHERE rc.created_at >= rt.sent_at
-                  AND rc.created_at <= rt.sent_at + INTERVAL '7 days'
-            """, (shop_id, shop_id))
-            returned_7d = cur.fetchone()
-
-            cur.execute("""
-                WITH ranked_touches AS (
-                    SELECT
-                        t.shop_id,
-                        t.user_id,
-                        t.type,
-                        t.sent_at,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY t.shop_id, t.user_id
-                            ORDER BY t.sent_at DESC
-                        ) AS rn
-                    FROM touch_logs t
-                    WHERE t.shop_id = %s
-                      AND t.type IN ('auto', 'broadcast')
-                      AND t.sent_at >= NOW() - INTERVAL '7 days'
-                ),
-                returned_today AS (
-                    SELECT DISTINCT ON (tr.shop_id, tr.user_id)
-                        tr.shop_id,
-                        tr.user_id,
-                        tr.created_at
-                    FROM transactions tr
-                    WHERE tr.shop_id = %s
-                      AND tr.type = 'add_cups'
-                      AND tr.created_at >= CURRENT_DATE
-                    ORDER BY tr.shop_id, tr.user_id, tr.created_at DESC
-                )
-                SELECT COUNT(*) AS returned_today
-                FROM returned_today rc
-                JOIN ranked_touches rt
-                  ON rt.shop_id = rc.shop_id
-                 AND rt.user_id = rc.user_id
-                 AND rt.rn = 1
-                WHERE rc.created_at >= rt.sent_at
-                  AND rc.created_at <= rt.sent_at + INTERVAL '7 days'
-            """, (shop_id, shop_id))
-            returned_today = cur.fetchone()
 
     sent_total = touches["sent_total"] or 0
     returns_total = returns_30d["returns_total"] or 0
@@ -1162,4 +1108,11 @@ def get_all_touch_logs():
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM touch_logs ORDER BY id")
+            return cur.fetchall()
+
+
+def get_all_return_logs():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM return_logs ORDER BY id")
             return cur.fetchall()
