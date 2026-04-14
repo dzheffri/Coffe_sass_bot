@@ -243,7 +243,7 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
     if admin_shop["id"] != MY_SHOP_ID and not can_send_broadcast(admin_shop["id"]):
         await message.answer(
             "❌ Ліміт розсилок вичерпано.\n"
-            "Дозволено максимум 4 промо-розсилки за 7 днів на кав’ярню."
+            "Дозволено максимум 8 промо-розсилки за 7 днів на кав’ярню."
         )
         return
 
