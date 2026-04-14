@@ -868,7 +868,7 @@ def can_send_broadcast(shop_id: int):
                   AND created_at >= NOW() - INTERVAL '7 days'
             """, (shop_id,))
             row = cur.fetchone()
-            return row["cnt"] < 4
+            return row["cnt"] < 8
 
 
 def get_broadcast_recipients(shop_id: int):
