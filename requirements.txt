@@ -5,3 +5,5 @@ qrcode
 Pillow
 aiohttp
 opencv-python-headless
+fastapi
+uvicorn
