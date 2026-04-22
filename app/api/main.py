@@ -13,8 +13,6 @@ class SendCodeRequest(BaseModel):
     telegram_id: str
 
 
-# временно храним коды в памяти
-# потом перенесем в БД
 codes_storage: dict[str, str] = {}
 
 
@@ -48,7 +46,8 @@ async def send_code(data: SendCodeRequest):
             chat_id=int(telegram_id),
             text=f"Ваш код входу: {code}"
         )
-    except Exception:
+    except Exception as e:
+        print("SEND CODE ERROR:", e)
         return {
             "ok": False,
             "message": "Не вдалося надіслати код. Напишіть боту /start і спробуйте ще раз."
