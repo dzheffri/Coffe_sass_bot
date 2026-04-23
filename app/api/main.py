@@ -1,14 +1,42 @@
+import os
+import uuid
 import random
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from aiogram import Bot
 
 from app.profile_logic import get_user_cups_data
 from app.config import BOT_TOKEN
+from app.web_panel_logic import get_shop_profile, update_shop_profile
+from app.web_panel_db import init_web_panel_db
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 app = FastAPI(title="Coffee Club API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "*",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
+
+init_web_panel_db()
 
 
 class SendCodeRequest(BaseModel):
@@ -20,12 +48,25 @@ class VerifyCodeRequest(BaseModel):
     code: str
 
 
-# {
-#   "telegram_id": {
-#       "code": "1234",
-#       "expires_at": datetime(...)
-#   }
-# }
+class ShopNewsItem(BaseModel):
+    title: str = ""
+    price: str = ""
+    image_url: str = ""
+
+
+class UpdateShopRequest(BaseModel):
+    name: str = ""
+    subtitle: str = ""
+    address: str = ""
+    work_from: str = ""
+    work_to: str = ""
+    instagram: str = ""
+    description: str = ""
+    logo_url: str = ""
+    cover_url: str = ""
+    news: list[ShopNewsItem] = []
+
+
 codes_storage: dict[str, dict] = {}
 
 
@@ -50,8 +91,6 @@ async def send_code(data: SendCodeRequest):
         }
 
     code = str(random.randint(1000, 9999))
-
-    # код живет 15 минут
     expires_at = datetime.utcnow() + timedelta(minutes=15)
 
     codes_storage[telegram_id] = {
@@ -127,4 +166,56 @@ async def verify_code(data: VerifyCodeRequest):
     return {
         "ok": True,
         "message": "Успішний вхід"
+    }
+
+
+@app.get("/owner/shop/{owner_telegram_id}")
+def owner_get_shop(owner_telegram_id: int):
+    return get_shop_profile(owner_telegram_id)
+
+
+@app.put("/owner/shop/{owner_telegram_id}")
+def owner_update_shop(owner_telegram_id: int, data: UpdateShopRequest):
+    return update_shop_profile(
+        owner_telegram_id=owner_telegram_id,
+        name=data.name,
+        subtitle=data.subtitle,
+        address=data.address,
+        work_from=data.work_from,
+        work_to=data.work_to,
+        instagram=data.instagram,
+        description=data.description,
+        logo_url=data.logo_url,
+        cover_url=data.cover_url,
+        news=[item.dict() for item in data.news],
+    )
+
+
+@app.post("/upload/image")
+async def upload_image(file: UploadFile = File(...)):
+    if not file.filename:
+        return {
+            "ok": False,
+            "message": "Файл не вибрано"
+        }
+
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
+    extension = os.path.splitext(file.filename)[1].lower()
+
+    if extension not in allowed_extensions:
+        return {
+            "ok": False,
+            "message": "Дозволені тільки JPG, JPEG, PNG, WEBP"
+        }
+
+    filename = f"{uuid.uuid4().hex}{extension}"
+    file_path = os.path.join(UPLOADS_DIR, filename)
+
+    contents = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    return {
+        "ok": True,
+        "url": f"/uploads/{filename}"
     }
