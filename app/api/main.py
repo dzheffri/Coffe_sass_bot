@@ -67,6 +67,12 @@ class UpdateShopRequest(BaseModel):
     news: list[ShopNewsItem] = []
 
 
+# {
+#   "telegram_id": {
+#       "code": "1234",
+#       "expires_at": datetime(...)
+#   }
+# }
 codes_storage: dict[str, dict] = {}
 
 
