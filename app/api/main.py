@@ -13,7 +13,7 @@ from app.profile_logic import get_user_cups_data
 from app.config import BOT_TOKEN
 from app.web_panel_logic import get_shop_profile, update_shop_profile
 from app.web_panel_db import init_web_panel_db
-from app.db import get_connection  # ✅ ВАЖНО
+from app.db import get_connection
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
@@ -34,10 +34,6 @@ app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 init_web_panel_db()
 
-
-# =====================
-# MODELS
-# =====================
 
 class SendCodeRequest(BaseModel):
     telegram_id: str
@@ -67,16 +63,8 @@ class UpdateShopRequest(BaseModel):
     news: list[ShopNewsItem] = []
 
 
-# =====================
-# TEMP STORAGE
-# =====================
-
 codes_storage: dict[str, dict] = {}
 
-
-# =====================
-# BASIC
-# =====================
 
 @app.get("/health")
 def health():
@@ -87,10 +75,6 @@ def health():
 def user_cups(telegram_user_id: int):
     return get_user_cups_data(telegram_user_id)
 
-
-# =====================
-# 🔥 QR ENDPOINT (ГЛАВНОЕ)
-# =====================
 
 @app.get("/users/{telegram_user_id}/qr")
 def user_qr(telegram_user_id: int):
@@ -104,7 +88,6 @@ def user_qr(telegram_user_id: int):
                 """,
                 (telegram_user_id,)
             )
-
             row = cur.fetchone()
 
     if not row:
@@ -119,9 +102,65 @@ def user_qr(telegram_user_id: int):
     }
 
 
-# =====================
-# AUTH
-# =====================
+@app.get("/users/{telegram_user_id}/shops")
+def user_shops(telegram_user_id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    cs.id AS shop_id,
+                    cs.name AS db_shop_name,
+                    sc.cups,
+                    sc.free_coffee_balance,
+                    owner.telegram_user_id AS owner_telegram_id
+                FROM shop_clients sc
+                JOIN users client ON client.id = sc.user_id
+                JOIN coffee_shops cs ON cs.id = sc.shop_id
+                LEFT JOIN shop_admins sa
+                    ON sa.shop_id = cs.id AND sa.role = 'owner'
+                LEFT JOIN users owner
+                    ON owner.id = sa.user_id
+                WHERE client.telegram_user_id = %s
+                ORDER BY cs.name
+                """,
+                (telegram_user_id,)
+            )
+            rows = cur.fetchall()
+
+    shops = []
+
+    for row in rows:
+        owner_id = row["owner_telegram_id"]
+
+        profile = {}
+        if owner_id:
+            profile_data = get_shop_profile(owner_id)
+            if profile_data and profile_data.get("ok"):
+                profile = profile_data.get("shop") or {}
+
+        shops.append({
+            "shop_id": row["shop_id"],
+            "owner_telegram_id": owner_id,
+            "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
+            "subtitle": profile.get("subtitle") or "",
+            "address": profile.get("address") or "",
+            "work_from": profile.get("work_from") or "",
+            "work_to": profile.get("work_to") or "",
+            "instagram": profile.get("instagram") or "",
+            "description": profile.get("description") or "",
+            "logo_url": profile.get("logo_url") or "",
+            "cover_url": profile.get("cover_url") or "",
+            "news": profile.get("news") or [],
+            "cups": row["cups"] or 0,
+            "free_coffee_balance": row["free_coffee_balance"] or 0,
+        })
+
+    return {
+        "ok": True,
+        "shops": shops
+    }
+
 
 @app.post("/auth/send-code")
 async def send_code(data: SendCodeRequest):
@@ -178,10 +217,6 @@ async def verify_code(data: VerifyCodeRequest):
     return {"ok": True}
 
 
-# =====================
-# SHOP
-# =====================
-
 @app.get("/owner/shop/{owner_telegram_id}")
 def owner_get_shop(owner_telegram_id: int):
     return get_shop_profile(owner_telegram_id)
@@ -203,10 +238,6 @@ def owner_update_shop(owner_telegram_id: int, data: UpdateShopRequest):
         news=[item.dict() for item in data.news],
     )
 
-
-# =====================
-# UPLOAD
-# =====================
 
 @app.post("/upload/image")
 async def upload_image(file: UploadFile = File(...)):
