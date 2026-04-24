@@ -1,6 +1,7 @@
 import os
 import uuid
 import random
+import sqlite3
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, UploadFile, File
@@ -16,6 +17,8 @@ from app.web_panel_db import init_web_panel_db
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+DB_PATH = os.path.join(BASE_DIR, "users.db")
+
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 app = FastAPI(title="Coffee Club API")
@@ -67,12 +70,6 @@ class UpdateShopRequest(BaseModel):
     news: list[ShopNewsItem] = []
 
 
-# {
-#   "telegram_id": {
-#       "code": "1234",
-#       "expires_at": datetime(...)
-#   }
-# }
 codes_storage: dict[str, dict] = {}
 
 
@@ -84,6 +81,40 @@ def health():
 @app.get("/users/{telegram_user_id}/cups")
 def user_cups(telegram_user_id: int):
     return get_user_cups_data(telegram_user_id)
+
+
+@app.get("/users/{telegram_user_id}/qr")
+def user_qr(telegram_user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT qr_token FROM users WHERE user_id = ?",
+        (telegram_user_id,)
+    )
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return {
+            "ok": False,
+            "message": "Користувача не знайдено"
+        }
+
+    qr_token = row["qr_token"]
+
+    if not qr_token:
+        return {
+            "ok": False,
+            "message": "QR токен не знайдено"
+        }
+
+    return {
+        "ok": True,
+        "qr_token": qr_token
+    }
 
 
 @app.post("/auth/send-code")
