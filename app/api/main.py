@@ -1,7 +1,6 @@
 import os
 import uuid
 import random
-import sqlite3
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, UploadFile, File
@@ -14,10 +13,10 @@ from app.profile_logic import get_user_cups_data
 from app.config import BOT_TOKEN
 from app.web_panel_logic import get_shop_profile, update_shop_profile
 from app.web_panel_db import init_web_panel_db
+from app.db import get_connection  # ✅ ВАЖНО
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
-DB_PATH = os.path.join(BASE_DIR, "users.db")
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
@@ -25,13 +24,7 @@ app = FastAPI(title="Coffee Club API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-        "*",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,6 +34,10 @@ app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 init_web_panel_db()
 
+
+# =====================
+# MODELS
+# =====================
 
 class SendCodeRequest(BaseModel):
     telegram_id: str
@@ -70,8 +67,16 @@ class UpdateShopRequest(BaseModel):
     news: list[ShopNewsItem] = []
 
 
+# =====================
+# TEMP STORAGE
+# =====================
+
 codes_storage: dict[str, dict] = {}
 
+
+# =====================
+# BASIC
+# =====================
 
 @app.get("/health")
 def health():
@@ -83,19 +88,24 @@ def user_cups(telegram_user_id: int):
     return get_user_cups_data(telegram_user_id)
 
 
+# =====================
+# 🔥 QR ENDPOINT (ГЛАВНОЕ)
+# =====================
+
 @app.get("/users/{telegram_user_id}/qr")
 def user_qr(telegram_user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT personal_qr_token
+                FROM users
+                WHERE telegram_user_id = %s
+                """,
+                (telegram_user_id,)
+            )
 
-    cursor.execute(
-        "SELECT qr_token FROM users WHERE user_id = ?",
-        (telegram_user_id,)
-    )
-
-    row = cursor.fetchone()
-    conn.close()
+            row = cur.fetchone()
 
     if not row:
         return {
@@ -103,29 +113,22 @@ def user_qr(telegram_user_id: int):
             "message": "Користувача не знайдено"
         }
 
-    qr_token = row["qr_token"]
-
-    if not qr_token:
-        return {
-            "ok": False,
-            "message": "QR токен не знайдено"
-        }
-
     return {
         "ok": True,
-        "qr_token": qr_token
+        "qr_token": row["personal_qr_token"]
     }
 
+
+# =====================
+# AUTH
+# =====================
 
 @app.post("/auth/send-code")
 async def send_code(data: SendCodeRequest):
     telegram_id = data.telegram_id.strip()
 
     if not telegram_id.isdigit():
-        return {
-            "ok": False,
-            "message": "Некоректний Telegram ID"
-        }
+        return {"ok": False, "message": "Некоректний Telegram ID"}
 
     code = str(random.randint(1000, 9999))
     expires_at = datetime.utcnow() + timedelta(minutes=15)
@@ -146,15 +149,12 @@ async def send_code(data: SendCodeRequest):
         print("SEND CODE ERROR:", e)
         return {
             "ok": False,
-            "message": "Не вдалося надіслати код. Напишіть боту /start і спробуйте ще раз."
+            "message": "Напишіть боту /start і спробуйте ще раз"
         }
     finally:
         await bot.session.close()
 
-    return {
-        "ok": True,
-        "message": "Код надіслано в Telegram"
-    }
+    return {"ok": True}
 
 
 @app.post("/auth/verify-code")
@@ -162,49 +162,25 @@ async def verify_code(data: VerifyCodeRequest):
     telegram_id = data.telegram_id.strip()
     code = data.code.strip()
 
-    if not telegram_id.isdigit():
-        return {
-            "ok": False,
-            "message": "Некоректний Telegram ID"
-        }
+    saved = codes_storage.get(telegram_id)
 
-    if not code.isdigit() or len(code) != 4:
-        return {
-            "ok": False,
-            "message": "Некоректний код"
-        }
+    if not saved:
+        return {"ok": False, "message": "Код не знайдено"}
 
-    saved_data = codes_storage.get(telegram_id)
+    if datetime.utcnow() > saved["expires_at"]:
+        return {"ok": False, "message": "Код протух"}
 
-    if not saved_data:
-        return {
-            "ok": False,
-            "message": "Код не знайдено. Запросіть новий код."
-        }
-
-    saved_code = saved_data["code"]
-    expires_at = saved_data["expires_at"]
-
-    if datetime.utcnow() > expires_at:
-        del codes_storage[telegram_id]
-        return {
-            "ok": False,
-            "message": "Термін дії коду закінчився. Запросіть новий код."
-        }
-
-    if code != saved_code:
-        return {
-            "ok": False,
-            "message": "Невірний код"
-        }
+    if code != saved["code"]:
+        return {"ok": False, "message": "Невірний код"}
 
     del codes_storage[telegram_id]
 
-    return {
-        "ok": True,
-        "message": "Успішний вхід"
-    }
+    return {"ok": True}
 
+
+# =====================
+# SHOP
+# =====================
 
 @app.get("/owner/shop/{owner_telegram_id}")
 def owner_get_shop(owner_telegram_id: int):
@@ -228,28 +204,22 @@ def owner_update_shop(owner_telegram_id: int, data: UpdateShopRequest):
     )
 
 
+# =====================
+# UPLOAD
+# =====================
+
 @app.post("/upload/image")
 async def upload_image(file: UploadFile = File(...)):
     if not file.filename:
-        return {
-            "ok": False,
-            "message": "Файл не вибрано"
-        }
+        return {"ok": False}
 
-    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
-    extension = os.path.splitext(file.filename)[1].lower()
+    ext = os.path.splitext(file.filename)[1].lower()
+    filename = f"{uuid.uuid4().hex}{ext}"
 
-    if extension not in allowed_extensions:
-        return {
-            "ok": False,
-            "message": "Дозволені тільки JPG, JPEG, PNG, WEBP"
-        }
-
-    filename = f"{uuid.uuid4().hex}{extension}"
-    file_path = os.path.join(UPLOADS_DIR, filename)
+    path = os.path.join(UPLOADS_DIR, filename)
 
     contents = await file.read()
-    with open(file_path, "wb") as f:
+    with open(path, "wb") as f:
         f.write(contents)
 
     return {
