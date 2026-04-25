@@ -162,6 +162,33 @@ def user_shops(telegram_user_id: int):
     }
 
 
+@app.get("/users/{telegram_user_id}/stats")
+def user_stats(telegram_user_id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(SUM(sc.total_scans), 0) AS total_cups,
+                    COALESCE(SUM(sc.free_coffee_balance), 0) AS total_free,
+                    COUNT(sc.id) AS shops_count
+                FROM shop_clients sc
+                JOIN users u ON u.id = sc.user_id
+                WHERE u.telegram_user_id = %s
+                """,
+                (telegram_user_id,)
+            )
+
+            row = cur.fetchone()
+
+    return {
+        "ok": True,
+        "total_cups": row["total_cups"] or 0,
+        "total_free": row["total_free"] or 0,
+        "shops_count": row["shops_count"] or 0
+    }
+
+
 @app.post("/auth/send-code")
 async def send_code(data: SendCodeRequest):
     telegram_id = data.telegram_id.strip()
