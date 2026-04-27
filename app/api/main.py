@@ -111,6 +111,7 @@ def user_shops(telegram_user_id: int):
                 SELECT
                     cs.id AS shop_id,
                     cs.name AS db_shop_name,
+                    cs.city AS city,
                     sc.cups,
                     sc.free_coffee_balance,
                     owner.telegram_user_id AS owner_telegram_id
@@ -143,6 +144,10 @@ def user_shops(telegram_user_id: int):
             "shop_id": row["shop_id"],
             "owner_telegram_id": owner_id,
             "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
+
+            # 🔥 ВОТ ОНО — ГОРОД
+            "city": row["city"] or "",
+
             "subtitle": profile.get("subtitle") or "",
             "address": profile.get("address") or "",
             "work_from": profile.get("work_from") or "",
@@ -160,7 +165,6 @@ def user_shops(telegram_user_id: int):
         "ok": True,
         "shops": shops
     }
-
 
 @app.get("/users/{telegram_user_id}/stats")
 def user_stats(telegram_user_id: int):
