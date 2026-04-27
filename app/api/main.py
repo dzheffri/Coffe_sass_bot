@@ -200,6 +200,7 @@ def all_shops():
                 SELECT
                     cs.id AS shop_id,
                     cs.name AS db_shop_name,
+                    cs.city AS city,
                     owner.telegram_user_id AS owner_telegram_id
                 FROM coffee_shops cs
                 LEFT JOIN shop_admins sa
@@ -226,6 +227,7 @@ def all_shops():
             "shop_id": row["shop_id"],
             "owner_telegram_id": owner_id,
             "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
+            "city": row["city"] or "",
             "subtitle": profile.get("subtitle") or "",
             "address": profile.get("address") or "",
             "work_from": profile.get("work_from") or "",
