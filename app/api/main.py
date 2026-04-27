@@ -187,7 +187,58 @@ def user_stats(telegram_user_id: int):
         "total_free": row["total_free"] or 0,
         "shops_count": row["shops_count"] or 0
     }
+@app.get("/shops")
+def all_shops():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    cs.id AS shop_id,
+                    cs.name AS db_shop_name,
+                    owner.telegram_user_id AS owner_telegram_id
+                FROM coffee_shops cs
+                LEFT JOIN shop_admins sa
+                    ON sa.shop_id = cs.id AND sa.role = 'owner'
+                LEFT JOIN users owner
+                    ON owner.id = sa.user_id
+                ORDER BY cs.name
+                """
+            )
+            rows = cur.fetchall()
 
+    shops = []
+
+    for row in rows:
+        owner_id = row["owner_telegram_id"]
+
+        profile = {}
+        if owner_id:
+            profile_data = get_shop_profile(owner_id)
+            if profile_data and profile_data.get("ok"):
+                profile = profile_data.get("shop") or {}
+
+        shops.append({
+            "shop_id": row["shop_id"],
+            "owner_telegram_id": owner_id,
+            "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
+            "subtitle": profile.get("subtitle") or "",
+            "address": profile.get("address") or "",
+            "work_from": profile.get("work_from") or "",
+            "work_to": profile.get("work_to") or "",
+            "instagram": profile.get("instagram") or "",
+            "description": profile.get("description") or "",
+            "logo_url": profile.get("logo_url") or "",
+            "cover_url": profile.get("cover_url") or "",
+            "news": profile.get("news") or [],
+            "cups": 0,
+            "free_coffee_balance": 0,
+        })
+
+    return {
+        "ok": True,
+        "shops": shops
+    }
 
 @app.post("/auth/send-code")
 async def send_code(data: SendCodeRequest):
