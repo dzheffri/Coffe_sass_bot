@@ -114,6 +114,7 @@ def user_shops(telegram_user_id: int):
                     cs.city AS city,
                     sc.cups,
                     sc.free_coffee_balance,
+                    sc.last_activity_at,
                     owner.telegram_user_id AS owner_telegram_id
                 FROM shop_clients sc
                 JOIN users client ON client.id = sc.user_id
@@ -123,7 +124,7 @@ def user_shops(telegram_user_id: int):
                 LEFT JOIN users owner
                     ON owner.id = sa.user_id
                 WHERE client.telegram_user_id = %s
-                ORDER BY cs.name
+                ORDER BY sc.last_activity_at DESC NULLS LAST, cs.name
                 """,
                 (telegram_user_id,)
             )
@@ -144,10 +145,8 @@ def user_shops(telegram_user_id: int):
             "shop_id": row["shop_id"],
             "owner_telegram_id": owner_id,
             "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
-
-            # 🔥 ВОТ ОНО — ГОРОД
             "city": row["city"] or "",
-
+            "last_activity_at": row["last_activity_at"].isoformat() if row["last_activity_at"] else None,
             "subtitle": profile.get("subtitle") or "",
             "address": profile.get("address") or "",
             "work_from": profile.get("work_from") or "",
@@ -165,7 +164,6 @@ def user_shops(telegram_user_id: int):
         "ok": True,
         "shops": shops
     }
-
 @app.get("/users/{telegram_user_id}/stats")
 def user_stats(telegram_user_id: int):
     with get_connection() as conn:
