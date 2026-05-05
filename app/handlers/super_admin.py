@@ -2,7 +2,7 @@ import json
 import tempfile
 from datetime import datetime
 
-from aiogram import Router, types, F
+from aiogram import Router, types, 
 from aiogram.fsm.context import FSMContext
 from aiogram.types import FSInputFile
 
@@ -10,6 +10,7 @@ from app.config import SUPER_ADMIN_IDS
 from app.db import (
     create_shop,
     get_all_shops,
+    get_all_shops_with_subscriptions,
     delete_shop,
     extend_subscription,
     get_global_stats,
@@ -101,25 +102,46 @@ async def backup_system_handler(message: types.Message):
     )
 
 
-@router.message(F.text == "🏪 Список кав’ярень")
+@router.message(F.text == " Список кав’ярень")
 async def list_shops_handler(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
 
-    shops = get_all_shops()
+    shops = get_all_shops_with_subscriptions()
+
     if not shops:
         await message.answer("Список кав’ярень порожній.")
         return
 
-    lines = ["🏪 Список кав’ярень:", ""]
+    lines = [" Список кав’ярень:", ""]
+
     for shop in shops:
         city = shop["city"] or "-"
         address = shop["address"] or "-"
+
+        plan = shop["plan"] or "-"
+        status = shop["subscription_status"] or "немає"
+        expires_at = shop["expires_at"]
+
+        if shop["days_left"] is None:
+            days_text = "підписку не знайдено"
+        elif shop["days_left"] < 0:
+            days_text = f"прострочено на {abs(shop['days_left'])} дн."
+        elif shop["days_left"] == 0:
+            days_text = "закінчується сьогодні"
+        elif shop["days_left"] == 1:
+            days_text = "залишився 1 день"
+        else:
+            days_text = f"залишилось {shop['days_left']} дн."
+
         lines.append(
             f"ID: {shop['id']}\n"
             f"Назва: {shop['name']}\n"
             f"Місто: {city}\n"
             f"Адреса: {address}\n"
+            f"Підписка: {plan} | {status}\n"
+            f"До кінця: {days_text}\n"
+            f"Діє до: {expires_at}\n"
         )
 
     await message.answer("\n".join(lines))
