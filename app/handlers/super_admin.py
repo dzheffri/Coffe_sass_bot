@@ -2,7 +2,7 @@ import json
 import tempfile
 from datetime import datetime
 
-from aiogram import Router, types, 
+from aiogram import Router, types 
 from aiogram.fsm.context import FSMContext
 from aiogram.types import FSInputFile
 
