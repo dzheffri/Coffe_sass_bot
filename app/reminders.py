@@ -8,6 +8,7 @@ from app.db import (
     get_clients_for_one_left_reminder,
     get_clients_for_inactive_reminder,
     get_clients_with_free_coffee,
+    get_owners_for_subscription_last_day,
     was_reminder_sent_recently,
     save_reminder_log,
     save_auto_touch,
@@ -20,10 +21,33 @@ REMINDER_ONE_LEFT = "one_left"
 REMINDER_INACTIVE_5_7 = "inactive_5_7"
 REMINDER_INACTIVE_14_30 = "inactive_14_30"
 REMINDER_FREE_COFFEE = "free_coffee"
+REMINDER_SUBSCRIPTION_LAST_DAY = "subscription_last_day"
 
 
 def kyiv_now():
     return datetime.now(KYIV_TZ)
+
+
+async def send_subscription_last_day_reminders(bot: Bot):
+    owners = get_owners_for_subscription_last_day()
+
+    for row in owners:
+        shop_id = row["shop_id"]
+        user_id = row["user_id"]
+        telegram_user_id = row["telegram_user_id"]
+
+        text = (
+            f"⚠️ У вас залишився останній день підписки\n\n"
+            f"🏪 Кав’ярня: {row['shop_name']}\n\n"
+            f"Після завершення підписки доступ до системи буде заблоковано.\n\n"
+            f"Щоб продовжити роботу, зв’яжіться з адміністратором сервісу."
+        )
+
+        try:
+            await bot.send_message(telegram_user_id, text)
+            save_reminder_log(shop_id, user_id, REMINDER_SUBSCRIPTION_LAST_DAY)
+        except Exception as e:
+            print(f"[reminders][subscription_last_day] failed for owner {telegram_user_id}: {e}")
 
 
 async def send_one_left_reminders(bot: Bot):
@@ -34,7 +58,6 @@ async def send_one_left_reminders(bot: Bot):
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
-        # Не чаще 1 раза в 3 дня
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
@@ -66,7 +89,6 @@ async def send_inactive_5_7_reminders(bot: Bot):
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
-        # Не чаще 1 раза в 5 дней
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
@@ -100,7 +122,6 @@ async def send_inactive_14_30_reminders(bot: Bot):
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
-        # Не чаще 1 раза в 10 дней
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
@@ -134,7 +155,6 @@ async def send_free_coffee_reminders(bot: Bot):
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
-        # Не чаще 1 раза в 3 дня
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
@@ -160,6 +180,8 @@ async def send_free_coffee_reminders(bot: Bot):
 
 
 async def run_reminders_once(bot: Bot):
+    await send_subscription_last_day_reminders(bot)
+
     await send_one_left_reminders(bot)
     await send_inactive_5_7_reminders(bot)
     await send_inactive_14_30_reminders(bot)
@@ -176,7 +198,6 @@ async def reminders_loop(bot: Bot):
             now = kyiv_now()
             today = now.date()
 
-            # Запуск только утром в 09:00 по Киеву
             if now.hour == 9 and last_run_date != today:
                 await run_reminders_once(bot)
                 print("REMINDERS: ✅ morning run done")
