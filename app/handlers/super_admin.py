@@ -102,7 +102,7 @@ async def backup_system_handler(message: types.Message):
     )
 
 
-@router.message(F.text == " Список кав’ярень")
+@router.message(F.text.in_(["🏪 Список кав’ярень", " Список кав’ярень", "Список кав’ярень"]))
 async def list_shops_handler(message: types.Message):
     if not is_super_admin(message.from_user.id):
         return
