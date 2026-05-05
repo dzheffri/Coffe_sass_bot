@@ -337,8 +337,6 @@ async def global_broadcast_start(message: types.Message, state: FSMContext):
         "📢 Надішли текст розсилки для всіх користувачів бота.\n\n"
         "Щоб скасувати — напиши: скасувати"
     )
-
-
 @router.message(SuperAdminStates.waiting_global_broadcast_text)
 async def global_broadcast_send(message: types.Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
