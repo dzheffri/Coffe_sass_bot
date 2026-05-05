@@ -1,4 +1,5 @@
 import uuid
+from math import ceil
 from datetime import datetime, timezone
 
 from psycopg import connect
@@ -323,7 +324,51 @@ def get_all_shops():
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM coffee_shops ORDER BY id")
             return cur.fetchall()
+def get_all_shops_with_subscriptions():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    cs.*,
+                    s.plan,
+                    s.status AS subscription_status,
+                    s.expires_at,
+                    CEIL(EXTRACT(EPOCH FROM (s.expires_at - NOW())) / 86400.0)::int AS days_left
+                FROM coffee_shops cs
+                LEFT JOIN subscriptions s ON s.shop_id = cs.id
+                ORDER BY cs.id
+            """)
+            return cur.fetchall()
 
+
+def get_owners_for_subscription_last_day():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    cs.id AS shop_id,
+                    cs.name AS shop_name,
+                    s.expires_at,
+                    u.id AS user_id,
+                    u.telegram_user_id
+                FROM subscriptions s
+                JOIN coffee_shops cs ON cs.id = s.shop_id
+                JOIN shop_admins sa ON sa.shop_id = cs.id AND sa.role = 'owner'
+                JOIN users u ON u.id = sa.user_id
+                WHERE s.status = 'active'
+                  AND s.expires_at > NOW()
+                  AND s.expires_at <= NOW() + INTERVAL '1 day'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM reminder_logs rl
+                      WHERE rl.shop_id = cs.id
+                        AND rl.user_id = u.id
+                        AND rl.reminder_type = 'subscription_last_day'
+                        AND rl.sent_at >= NOW() - INTERVAL '2 days'
+                  )
+                ORDER BY s.expires_at
+            """)
+            return cur.fetchall()
 
 def get_user_shops(telegram_user_id: int):
     with get_connection() as conn:
