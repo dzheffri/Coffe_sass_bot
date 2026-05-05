@@ -327,7 +327,7 @@ async def extend_sub_days(message: types.Message, state: FSMContext):
         f"📌 Статус: {sub['status']}\n"
         f"⏳ Діє до: {sub['expires_at']}"
     )
-    @router.message(F.text == "📢 Розсилка всім користувачам")
+@router.message(F.text == "📢 Розсилка всім користувачам")
 async def global_broadcast_start(message: types.Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return
