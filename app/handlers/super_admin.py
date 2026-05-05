@@ -359,7 +359,7 @@ async def global_broadcast_send(message: types.Message, state: FSMContext):
     await message.answer(f"⏳ Починаю розсилку для {len(users)} користувачів...")
 
     for user in users:
-        telegram_id = user.get("telegram_id")
+        telegram_id = user.get("telegram_id") or user.get("id")
 
         if not telegram_id:
             failed += 1
