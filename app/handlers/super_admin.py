@@ -351,13 +351,18 @@ async def global_broadcast_send(message: types.Message, state: FSMContext):
         await message.answer("❌ Розсилку скасовано.")
         return
 
-    clients = get_all_shop_clients()
+    users = get_all_users()
 
     telegram_ids = []
     seen = set()
 
-    for row in clients:
-        telegram_id = row.get("telegram_user_id")
+    for user in users:
+        telegram_id = (
+            user.get("telegram_id")
+            or user.get("telegram_user_id")
+            or user.get("user_id")
+            or user.get("id")
+        )
 
         if not telegram_id:
             continue
