@@ -12,6 +12,7 @@ from app.handlers import (
     admin_router,
     owner_router,
     super_admin_router,
+    support_router,
 )
 from app.reminders import reminders_loop
 
@@ -34,6 +35,7 @@ async def main():
     dp.include_router(admin_router)
     dp.include_router(owner_router)
     dp.include_router(super_admin_router)
+    dp.include_router(support_router)
 
     await bot.delete_webhook(drop_pending_updates=True)
 
