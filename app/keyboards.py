@@ -80,6 +80,7 @@ def admin_main_keyboard(
                 KeyboardButton(text="🗑 Видалити кав’ярню"),
             ],
             [KeyboardButton(text="💾 Backup системи")],
+            [KeyboardButton(text="📢 Розсилка всім користувачам")],
             [KeyboardButton(text="💳 Продовжити підписку")],
         ])
 
