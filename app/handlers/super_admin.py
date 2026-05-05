@@ -351,28 +351,42 @@ async def global_broadcast_send(message: types.Message, state: FSMContext):
         await message.answer("❌ Розсилку скасовано.")
         return
 
-    users = get_all_users()
+    clients = get_all_shop_clients()
+
+    telegram_ids = []
+    seen = set()
+
+    for row in clients:
+        telegram_id = row.get("telegram_user_id")
+
+        if not telegram_id:
+            continue
+
+        if telegram_id in seen:
+            continue
+
+        seen.add(telegram_id)
+        telegram_ids.append(telegram_id)
 
     sent = 0
     failed = 0
 
-    await message.answer(f"⏳ Починаю розсилку для {len(users)} користувачів...")
+    await message.answer(
+        f"⏳ Починаю розсилку для {len(telegram_ids)} користувачів..."
+    )
 
-    for user in users:
-        telegram_id = user.get("telegram_id") or user.get("id")
-
-        if not telegram_id:
-            failed += 1
-            continue
-
+    for telegram_id in telegram_ids:
         try:
             await message.bot.send_message(
                 chat_id=int(telegram_id),
                 text=text
             )
             sent += 1
-        except Exception:
+        except Exception as e:
+            print(f"[global_broadcast] failed for {telegram_id}: {e}")
             failed += 1
+
+        await asyncio.sleep(0.05)
 
     await state.clear()
 
