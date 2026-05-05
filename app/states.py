@@ -19,3 +19,4 @@ class SuperAdminStates(StatesGroup):
     waiting_delete_shop_id = State()
     waiting_extend_shop_id = State()
     waiting_extend_days = State()
+    waiting_global_broadcast_text = State()
