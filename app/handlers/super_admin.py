@@ -327,3 +327,58 @@ async def extend_sub_days(message: types.Message, state: FSMContext):
         f"📌 Статус: {sub['status']}\n"
         f"⏳ Діє до: {sub['expires_at']}"
     )
+    @router.message(F.text == "📢 Розсилка всім користувачам")
+async def global_broadcast_start(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        return
+
+    await state.set_state(SuperAdminStates.waiting_global_broadcast_text)
+    await message.answer(
+        "📢 Надішли текст розсилки для всіх користувачів бота.\n\n"
+        "Щоб скасувати — напиши: скасувати"
+    )
+
+
+@router.message(SuperAdminStates.waiting_global_broadcast_text)
+async def global_broadcast_send(message: types.Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+
+    if text.lower() in ["скасувати", "отмена", "cancel"]:
+        await state.clear()
+        await message.answer("❌ Розсилку скасовано.")
+        return
+
+    users = get_all_users()
+
+    sent = 0
+    failed = 0
+
+    await message.answer(f"⏳ Починаю розсилку для {len(users)} користувачів...")
+
+    for user in users:
+        telegram_id = user.get("telegram_id")
+
+        if not telegram_id:
+            failed += 1
+            continue
+
+        try:
+            await message.bot.send_message(
+                chat_id=int(telegram_id),
+                text=text
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Розсилку завершено\n\n"
+        f"Надіслано: {sent}\n"
+        f"Не вдалося: {failed}"
+    )
