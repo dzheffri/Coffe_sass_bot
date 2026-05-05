@@ -20,14 +20,14 @@ def user_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text=" Мій QR-код"),
+                KeyboardButton(text="📱 Мій QR-код"),
             ],
             [
                 KeyboardButton(text="☕ Мої чашки"),
-                KeyboardButton(text=" Мої безкоштовні кави"),
+                KeyboardButton(text="🎁 Мої безкоштовні кави"),
             ],
             [
-                KeyboardButton(text=" Мої кав’ярні"),
+                KeyboardButton(text="🏪 Мої кав’ярні"),
             ],
             [
                 KeyboardButton(text="🛟 Служба підтримки"),
