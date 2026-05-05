@@ -1,5 +1,6 @@
 import json
 import tempfile
+import asyncio
 from datetime import datetime
 
 from aiogram import Router, types, F
@@ -357,12 +358,7 @@ async def global_broadcast_send(message: types.Message, state: FSMContext):
     seen = set()
 
     for user in users:
-        telegram_id = (
-            user.get("telegram_id")
-            or user.get("telegram_user_id")
-            or user.get("user_id")
-            or user.get("id")
-        )
+        telegram_id = user.get("telegram_user_id")
 
         if not telegram_id:
             continue
