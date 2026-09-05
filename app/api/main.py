@@ -15,6 +15,7 @@ from app.web_panel_logic import (
     get_shop_profile,
     update_shop_profile,
     get_owner_overview_stats,
+    get_owner_activity_stats,
 )
 from app.web_panel_db import init_web_panel_db
 from app.db import get_connection
@@ -355,6 +356,11 @@ def owner_update_shop(
 @app.get("/owner/analytics/{owner_telegram_id}/overview")
 def owner_analytics_overview(owner_telegram_id: int):
     return get_owner_overview_stats(owner_telegram_id)
+
+
+@app.get("/owner/analytics/{owner_telegram_id}/activity")
+def owner_analytics_activity(owner_telegram_id: int):
+    return get_owner_activity_stats(owner_telegram_id)
 
 
 @app.post("/upload/image")
