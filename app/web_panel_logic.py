@@ -18,8 +18,16 @@ def ensure_shop_profile_exists(owner_telegram_id: int):
     if not row:
         cur.execute("""
         INSERT INTO shop_profiles (
-            owner_telegram_id, name, subtitle, address, work_from, work_to,
-            instagram, description, logo_url, cover_url
+            owner_telegram_id,
+            name,
+            subtitle,
+            address,
+            work_from,
+            work_to,
+            instagram,
+            description,
+            logo_url,
+            cover_url
         )
         VALUES (?, '', '', '', '', '', '', '', '', '')
         """, (owner_telegram_id,))
@@ -33,10 +41,20 @@ def ensure_shop_profile_exists(owner_telegram_id: int):
         for title, price, image_url, sort_order in default_news:
             cur.execute("""
             INSERT INTO shop_news (
-                owner_telegram_id, title, price, image_url, sort_order
+                owner_telegram_id,
+                title,
+                price,
+                image_url,
+                sort_order
             )
             VALUES (?, ?, ?, ?, ?)
-            """, (owner_telegram_id, title, price, image_url, sort_order))
+            """, (
+                owner_telegram_id,
+                title,
+                price,
+                image_url,
+                sort_order
+            ))
 
         conn.commit()
 
@@ -54,6 +72,7 @@ def get_shop_profile(owner_telegram_id: int):
     FROM shop_profiles
     WHERE owner_telegram_id = ?
     """, (owner_telegram_id,))
+
     profile = cur.fetchone()
 
     cur.execute("""
@@ -62,6 +81,7 @@ def get_shop_profile(owner_telegram_id: int):
     WHERE owner_telegram_id = ?
     ORDER BY sort_order ASC, id ASC
     """, (owner_telegram_id,))
+
     news = cur.fetchall()
 
     conn.close()
@@ -91,6 +111,8 @@ def get_shop_profile(owner_telegram_id: int):
             ]
         }
     }
+
+
 def update_shop_profile(
     owner_telegram_id: int,
     name: str,
@@ -144,7 +166,12 @@ def update_shop_profile(
     for index, item in enumerate(news):
         cur.execute("""
         INSERT INTO shop_news (
-            owner_telegram_id, title, price, image_url, sort_order, updated_at
+            owner_telegram_id,
+            title,
+            price,
+            image_url,
+            sort_order,
+            updated_at
         )
         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
@@ -157,7 +184,14 @@ def update_shop_profile(
 
     conn.commit()
     conn.close()
-    def get_owner_overview_stats(owner_telegram_id: int):
+
+    return {
+        "ok": True,
+        "message": "Профіль кав’ярні оновлено"
+    }
+
+
+def get_owner_overview_stats(owner_telegram_id: int):
     shop = get_admin_shop_and_role(owner_telegram_id)
 
     if not shop:
@@ -182,7 +216,10 @@ def update_shop_profile(
                         WHERE created_at >= NOW() - INTERVAL '30 days'
                     ) AS new_30_days,
 
-                    COALESCE(SUM(free_coffee_balance), 0) AS free_coffees_now
+                    COALESCE(
+                        SUM(free_coffee_balance),
+                        0
+                    ) AS free_coffees_now
 
                 FROM shop_clients
                 WHERE shop_id = %s
@@ -199,9 +236,4 @@ def update_shop_profile(
             "new_30_days": int(stats["new_30_days"] or 0),
             "free_coffees_now": int(stats["free_coffees_now"] or 0),
         }
-    }
-
-    return {
-        "ok": True,
-        "message": "Профіль кав’ярні оновлено"
     }
