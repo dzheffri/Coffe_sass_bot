@@ -237,3 +237,122 @@ def get_owner_overview_stats(owner_telegram_id: int):
             "free_coffees_now": int(stats["free_coffees_now"] or 0),
         }
     }
+    def get_owner_activity_stats(owner_telegram_id: int):
+    shop = get_admin_shop_and_role(owner_telegram_id)
+
+    if not shop:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    shop_id = shop["id"]
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            # Загальні цифри: сьогодні + останні 30 календарних днів
+            cur.execute("""
+                SELECT
+                    COALESCE(
+                        SUM(cups_added) FILTER (
+                            WHERE
+                                (created_at AT TIME ZONE 'Europe/Kyiv')::date
+                                =
+                                (NOW() AT TIME ZONE 'Europe/Kyiv')::date
+                        ),
+                        0
+                    ) AS scans_today,
+
+                    COALESCE(
+                        SUM(cups_added) FILTER (
+                            WHERE
+                                (created_at AT TIME ZONE 'Europe/Kyiv')::date
+                                >=
+                                (NOW() AT TIME ZONE 'Europe/Kyiv')::date - 29
+                        ),
+                        0
+                    ) AS scans_30d
+
+                FROM transactions
+
+                WHERE shop_id = %s
+                  AND type = 'add_cups'
+                  AND created_at >= NOW() - INTERVAL '31 days'
+            """, (shop_id,))
+
+            totals = cur.fetchone()
+
+            # Графік за останні 12 календарних днів.
+            # generate_series потрібен, щоб дні без сканувань теж повернулися як 0.
+            cur.execute("""
+                WITH days AS (
+                    SELECT generate_series(
+                        (NOW() AT TIME ZONE 'Europe/Kyiv')::date - 11,
+                        (NOW() AT TIME ZONE 'Europe/Kyiv')::date,
+                        INTERVAL '1 day'
+                    )::date AS day
+                ),
+
+                scans AS (
+                    SELECT
+                        (created_at AT TIME ZONE 'Europe/Kyiv')::date AS day,
+                        COALESCE(SUM(cups_added), 0) AS scans
+
+                    FROM transactions
+
+                    WHERE shop_id = %s
+                      AND type = 'add_cups'
+                      AND
+                        (created_at AT TIME ZONE 'Europe/Kyiv')::date
+                        >=
+                        (NOW() AT TIME ZONE 'Europe/Kyiv')::date - 11
+
+                    GROUP BY
+                        (created_at AT TIME ZONE 'Europe/Kyiv')::date
+                )
+
+                SELECT
+                    days.day,
+                    COALESCE(scans.scans, 0) AS scans
+
+                FROM days
+
+                LEFT JOIN scans
+                    ON scans.day = days.day
+
+                ORDER BY days.day ASC
+            """, (shop_id,))
+
+            rows = cur.fetchall()
+
+    weekdays = [
+        "Пн",
+        "Вт",
+        "Ср",
+        "Чт",
+        "Пт",
+        "Сб",
+        "Нд",
+    ]
+
+    chart = []
+
+    for row in rows:
+        day = row["day"]
+
+        chart.append({
+            "date": day.isoformat(),
+            "day": day.day,
+            "weekday": weekdays[day.weekday()],
+            "label": f"{weekdays[day.weekday()]} {day.day}",
+            "scans": int(row["scans"] or 0),
+        })
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+        "scans_today": int(totals["scans_today"] or 0),
+        "scans_30d": int(totals["scans_30d"] or 0),
+        "chart": chart,
+    }
