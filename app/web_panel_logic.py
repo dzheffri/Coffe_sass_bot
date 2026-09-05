@@ -91,8 +91,6 @@ def get_shop_profile(owner_telegram_id: int):
             ]
         }
     }
-
-
 def update_shop_profile(
     owner_telegram_id: int,
     name: str,
