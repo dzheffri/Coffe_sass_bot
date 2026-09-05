@@ -11,9 +11,14 @@ from aiogram import Bot
 
 from app.profile_logic import get_user_cups_data
 from app.config import BOT_TOKEN
-from app.web_panel_logic import get_shop_profile, update_shop_profile
+from app.web_panel_logic import (
+    get_shop_profile,
+    update_shop_profile,
+    get_owner_overview_stats,
+)
 from app.web_panel_db import init_web_panel_db
 from app.db import get_connection
+
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
@@ -146,7 +151,11 @@ def user_shops(telegram_user_id: int):
             "owner_telegram_id": owner_id,
             "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
             "city": row["city"] or "",
-            "last_activity_at": row["last_activity_at"].isoformat() if row["last_activity_at"] else None,
+            "last_activity_at": (
+                row["last_activity_at"].isoformat()
+                if row["last_activity_at"]
+                else None
+            ),
             "subtitle": profile.get("subtitle") or "",
             "address": profile.get("address") or "",
             "work_from": profile.get("work_from") or "",
@@ -164,6 +173,8 @@ def user_shops(telegram_user_id: int):
         "ok": True,
         "shops": shops
     }
+
+
 @app.get("/users/{telegram_user_id}/stats")
 def user_stats(telegram_user_id: int):
     with get_connection() as conn:
@@ -189,6 +200,8 @@ def user_stats(telegram_user_id: int):
         "total_free": row["total_free"] or 0,
         "shops_count": row["shops_count"] or 0
     }
+
+
 @app.get("/shops")
 def all_shops():
     with get_connection() as conn:
@@ -244,12 +257,16 @@ def all_shops():
         "shops": shops
     }
 
+
 @app.post("/auth/send-code")
 async def send_code(data: SendCodeRequest):
     telegram_id = data.telegram_id.strip()
 
     if not telegram_id.isdigit():
-        return {"ok": False, "message": "Некоректний Telegram ID"}
+        return {
+            "ok": False,
+            "message": "Некоректний Telegram ID"
+        }
 
     code = str(random.randint(1000, 9999))
     expires_at = datetime.utcnow() + timedelta(minutes=15)
@@ -268,10 +285,12 @@ async def send_code(data: SendCodeRequest):
         )
     except Exception as e:
         print("SEND CODE ERROR:", e)
+
         return {
             "ok": False,
             "message": "Напишіть боту /start і спробуйте ще раз"
         }
+
     finally:
         await bot.session.close()
 
@@ -286,13 +305,22 @@ async def verify_code(data: VerifyCodeRequest):
     saved = codes_storage.get(telegram_id)
 
     if not saved:
-        return {"ok": False, "message": "Код не знайдено"}
+        return {
+            "ok": False,
+            "message": "Код не знайдено"
+        }
 
     if datetime.utcnow() > saved["expires_at"]:
-        return {"ok": False, "message": "Код протух"}
+        return {
+            "ok": False,
+            "message": "Код протух"
+        }
 
     if code != saved["code"]:
-        return {"ok": False, "message": "Невірний код"}
+        return {
+            "ok": False,
+            "message": "Невірний код"
+        }
 
     del codes_storage[telegram_id]
 
@@ -305,7 +333,10 @@ def owner_get_shop(owner_telegram_id: int):
 
 
 @app.put("/owner/shop/{owner_telegram_id}")
-def owner_update_shop(owner_telegram_id: int, data: UpdateShopRequest):
+def owner_update_shop(
+    owner_telegram_id: int,
+    data: UpdateShopRequest
+):
     return update_shop_profile(
         owner_telegram_id=owner_telegram_id,
         name=data.name,
@@ -321,6 +352,11 @@ def owner_update_shop(owner_telegram_id: int, data: UpdateShopRequest):
     )
 
 
+@app.get("/owner/analytics/{owner_telegram_id}/overview")
+def owner_analytics_overview(owner_telegram_id: int):
+    return get_owner_overview_stats(owner_telegram_id)
+
+
 @app.post("/upload/image")
 async def upload_image(file: UploadFile = File(...)):
     if not file.filename:
@@ -332,6 +368,7 @@ async def upload_image(file: UploadFile = File(...)):
     path = os.path.join(UPLOADS_DIR, filename)
 
     contents = await file.read()
+
     with open(path, "wb") as f:
         f.write(contents)
 
