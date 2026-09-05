@@ -1,4 +1,5 @@
 from app.web_panel_db import get_web_connection, init_web_panel_db
+from app.db import get_connection, get_admin_shop_and_role
 
 
 init_web_panel_db()
@@ -158,6 +159,49 @@ def update_shop_profile(
 
     conn.commit()
     conn.close()
+    def get_owner_overview_stats(owner_telegram_id: int):
+    shop = get_admin_shop_and_role(owner_telegram_id)
+
+    if not shop:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    shop_id = shop["id"]
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total_clients,
+
+                    COUNT(*) FILTER (
+                        WHERE last_activity_at >= NOW() - INTERVAL '30 days'
+                    ) AS active_30_days,
+
+                    COUNT(*) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '30 days'
+                    ) AS new_30_days,
+
+                    COALESCE(SUM(free_coffee_balance), 0) AS free_coffees_now
+
+                FROM shop_clients
+                WHERE shop_id = %s
+            """, (shop_id,))
+
+            stats = cur.fetchone()
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+        "stats": {
+            "total_clients": int(stats["total_clients"] or 0),
+            "active_30_days": int(stats["active_30_days"] or 0),
+            "new_30_days": int(stats["new_30_days"] or 0),
+            "free_coffees_now": int(stats["free_coffees_now"] or 0),
+        }
+    }
 
     return {
         "ok": True,
