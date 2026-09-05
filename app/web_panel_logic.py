@@ -350,7 +350,9 @@ def get_owner_activity_stats(owner_telegram_id: int):
         "scans_30d": int(totals["scans_30d"] or 0),
         "chart": chart,
     }
-    def get_owner_clients(owner_telegram_id: int):
+
+
+def get_owner_clients(owner_telegram_id: int):
     shop = get_admin_shop_and_role(owner_telegram_id)
 
     if not shop:
@@ -365,14 +367,22 @@ def get_owner_activity_stats(owner_telegram_id: int):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT
-                    COALESCE(NULLIF(u.full_name, ''), NULLIF(u.username, ''), 'Клієнт') AS name,
+                    COALESCE(
+                        NULLIF(u.full_name, ''),
+                        NULLIF(u.username, ''),
+                        'Клієнт'
+                    ) AS name,
                     sc.cups,
                     sc.free_coffee_balance,
                     sc.last_activity_at
+
                 FROM shop_clients sc
+
                 JOIN users u
                     ON u.id = sc.user_id
+
                 WHERE sc.shop_id = %s
+
                 ORDER BY sc.last_activity_at DESC NULLS LAST
             """, (shop_id,))
 
