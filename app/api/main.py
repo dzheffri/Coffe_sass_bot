@@ -16,6 +16,7 @@ from app.web_panel_logic import (
     update_shop_profile,
     get_owner_overview_stats,
     get_owner_activity_stats,
+    get_owner_clients,
 )
 from app.web_panel_db import init_web_panel_db
 from app.db import get_connection
@@ -144,6 +145,7 @@ def user_shops(telegram_user_id: int):
         profile = {}
         if owner_id:
             profile_data = get_shop_profile(owner_id)
+
             if profile_data and profile_data.get("ok"):
                 profile = profile_data.get("shop") or {}
 
@@ -222,6 +224,7 @@ def all_shops():
                 ORDER BY cs.name
                 """
             )
+
             rows = cur.fetchall()
 
     shops = []
@@ -230,8 +233,10 @@ def all_shops():
         owner_id = row["owner_telegram_id"]
 
         profile = {}
+
         if owner_id:
             profile_data = get_shop_profile(owner_id)
+
             if profile_data and profile_data.get("ok"):
                 profile = profile_data.get("shop") or {}
 
@@ -284,6 +289,7 @@ async def send_code(data: SendCodeRequest):
             chat_id=int(telegram_id),
             text=f"Ваш код входу: {code}\n\nКод дійсний 15 хвилин."
         )
+
     except Exception as e:
         print("SEND CODE ERROR:", e)
 
@@ -361,6 +367,11 @@ def owner_analytics_overview(owner_telegram_id: int):
 @app.get("/owner/analytics/{owner_telegram_id}/activity")
 def owner_analytics_activity(owner_telegram_id: int):
     return get_owner_activity_stats(owner_telegram_id)
+
+
+@app.get("/owner/analytics/{owner_telegram_id}/clients")
+def owner_analytics_clients(owner_telegram_id: int):
+    return get_owner_clients(owner_telegram_id)
 
 
 @app.post("/upload/image")
