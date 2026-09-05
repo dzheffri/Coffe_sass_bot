@@ -237,7 +237,9 @@ def get_owner_overview_stats(owner_telegram_id: int):
             "free_coffees_now": int(stats["free_coffees_now"] or 0),
         }
     }
-    def get_owner_activity_stats(owner_telegram_id: int):
+
+
+def get_owner_activity_stats(owner_telegram_id: int):
     shop = get_admin_shop_and_role(owner_telegram_id)
 
     if not shop:
@@ -250,8 +252,6 @@ def get_owner_overview_stats(owner_telegram_id: int):
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-
-            # Загальні цифри: сьогодні + останні 30 календарних днів
             cur.execute("""
                 SELECT
                     COALESCE(
@@ -275,7 +275,6 @@ def get_owner_overview_stats(owner_telegram_id: int):
                     ) AS scans_30d
 
                 FROM transactions
-
                 WHERE shop_id = %s
                   AND type = 'add_cups'
                   AND created_at >= NOW() - INTERVAL '31 days'
@@ -283,8 +282,6 @@ def get_owner_overview_stats(owner_telegram_id: int):
 
             totals = cur.fetchone()
 
-            # Графік за останні 12 календарних днів.
-            # generate_series потрібен, щоб дні без сканувань теж повернулися як 0.
             cur.execute("""
                 WITH days AS (
                     SELECT generate_series(
@@ -293,14 +290,12 @@ def get_owner_overview_stats(owner_telegram_id: int):
                         INTERVAL '1 day'
                     )::date AS day
                 ),
-
                 scans AS (
                     SELECT
                         (created_at AT TIME ZONE 'Europe/Kyiv')::date AS day,
                         COALESCE(SUM(cups_added), 0) AS scans
 
                     FROM transactions
-
                     WHERE shop_id = %s
                       AND type = 'add_cups'
                       AND
@@ -317,7 +312,6 @@ def get_owner_overview_stats(owner_telegram_id: int):
                     COALESCE(scans.scans, 0) AS scans
 
                 FROM days
-
                 LEFT JOIN scans
                     ON scans.day = days.day
 
