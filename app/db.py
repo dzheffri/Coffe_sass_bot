@@ -39,7 +39,7 @@ def init_db():
                 )
             """)
 
-            cur.execute("""
+                       cur.execute("""
                 CREATE TABLE IF NOT EXISTS coffee_shops (
                     id BIGSERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -48,6 +48,32 @@ def init_db():
                     is_active BOOLEAN NOT NULL DEFAULT TRUE,
                     pending_owner_telegram_id BIGINT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS shop_reminder_settings (
+                    shop_id BIGINT PRIMARY KEY
+                        REFERENCES coffee_shops(id)
+                        ON DELETE CASCADE,
+
+                    one_left_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    one_left_days INTEGER NOT NULL DEFAULT 3
+                        CHECK (one_left_days BETWEEN 1 AND 7),
+
+                    free_coffee_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    free_coffee_days INTEGER NOT NULL DEFAULT 3
+                        CHECK (free_coffee_days BETWEEN 1 AND 7),
+
+                    inactive_5_7_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    inactive_5_7_days INTEGER NOT NULL DEFAULT 5
+                        CHECK (inactive_5_7_days BETWEEN 1 AND 7),
+
+                    inactive_14_30_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    inactive_14_30_days INTEGER NOT NULL DEFAULT 7
+                        CHECK (inactive_14_30_days BETWEEN 1 AND 7),
+
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
 
