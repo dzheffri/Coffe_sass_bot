@@ -17,6 +17,7 @@ from app.web_panel_logic import (
     get_owner_overview_stats,
     get_owner_activity_stats,
     get_owner_clients,
+    get_owner_details_stats,
 )
 from app.web_panel_db import init_web_panel_db
 from app.db import get_connection, is_owner
@@ -141,7 +142,6 @@ def user_shops(telegram_user_id: int):
 
     for row in rows:
         owner_id = row["owner_telegram_id"]
-
         profile = {}
 
         if owner_id:
@@ -232,7 +232,6 @@ def all_shops():
 
     for row in rows:
         owner_id = row["owner_telegram_id"]
-
         profile = {}
 
         if owner_id:
@@ -275,7 +274,6 @@ async def send_code(data: SendCodeRequest):
             "message": "Некоректний Telegram ID"
         }
 
-    # Сначала проверяем, что пользователь — владелец кофейни
     if not is_owner(int(telegram_id)):
         return {
             "ok": False,
@@ -383,6 +381,11 @@ def owner_analytics_activity(owner_telegram_id: int):
 @app.get("/owner/analytics/{owner_telegram_id}/clients")
 def owner_analytics_clients(owner_telegram_id: int):
     return get_owner_clients(owner_telegram_id)
+
+
+@app.get("/owner/analytics/{owner_telegram_id}/details")
+def owner_analytics_details(owner_telegram_id: int):
+    return get_owner_details_stats(owner_telegram_id)
 
 
 @app.post("/upload/image")
