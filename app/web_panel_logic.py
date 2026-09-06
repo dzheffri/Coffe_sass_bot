@@ -13,6 +13,7 @@ def ensure_shop_profile_exists(owner_telegram_id: int):
         "SELECT id FROM shop_profiles WHERE owner_telegram_id = ?",
         (owner_telegram_id,)
     )
+
     row = cur.fetchone()
 
     if not row:
@@ -409,4 +410,169 @@ def get_owner_clients(owner_telegram_id: int):
         "shop_id": shop_id,
         "clients_count": len(clients),
         "clients": clients,
+    }
+
+
+def get_owner_details_stats(owner_telegram_id: int):
+    shop = get_admin_shop_and_role(owner_telegram_id)
+
+    if not shop:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    shop_id = shop["id"]
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            # ==========================================
+            # ПОВЕРНЕННЯ КЛІЄНТІВ
+            # ==========================================
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE
+                            (returned_at AT TIME ZONE 'Europe/Kyiv')::date
+                            =
+                            (NOW() AT TIME ZONE 'Europe/Kyiv')::date
+                    ) AS returned_today,
+
+                    COUNT(*) FILTER (
+                        WHERE returned_at >= NOW() - INTERVAL '7 days'
+                    ) AS returned_7d,
+
+                    COUNT(*) FILTER (
+                        WHERE returned_at >= NOW() - INTERVAL '30 days'
+                    ) AS returned_30d
+
+                FROM return_logs
+                WHERE shop_id = %s
+            """, (shop_id,))
+
+            returns = cur.fetchone()
+
+            cur.execute("""
+                SELECT COUNT(*) AS inactive_gt_7d
+                FROM shop_clients
+                WHERE shop_id = %s
+                  AND last_activity_at < NOW() - INTERVAL '7 days'
+            """, (shop_id,))
+
+            inactive = cur.fetchone()
+
+            # ==========================================
+            # РОЗСИЛКИ / ПОВІДОМЛЕННЯ
+            # ==========================================
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE type = 'auto'
+                    ) AS auto_sent,
+
+                    COUNT(*) FILTER (
+                        WHERE type = 'broadcast'
+                    ) AS own_sent,
+
+                    COUNT(*) FILTER (
+                        WHERE type IN ('auto', 'broadcast')
+                    ) AS total_sent
+
+                FROM touch_logs
+
+                WHERE shop_id = %s
+                  AND sent_at >= NOW() - INTERVAL '30 days'
+            """, (shop_id,))
+
+            mailings = cur.fetchone()
+
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE touch_type = 'auto'
+                    ) AS auto_returns,
+
+                    COUNT(*) FILTER (
+                        WHERE touch_type = 'broadcast'
+                    ) AS own_returns,
+
+                    COUNT(*) AS total_returns
+
+                FROM return_logs
+
+                WHERE shop_id = %s
+                  AND returned_at >= NOW() - INTERVAL '30 days'
+            """, (shop_id,))
+
+            mailing_returns = cur.fetchone()
+
+            # ==========================================
+            # ПРОГРАМА ЛОЯЛЬНОСТІ
+            # ==========================================
+            cur.execute("""
+                SELECT
+                    COALESCE(SUM(total_scans), 0) AS total_scans,
+                    COALESCE(SUM(free_coffee_balance), 0) AS free_now,
+                    COALESCE(SUM(total_free_coffee_earned), 0) AS free_earned,
+                    COALESCE(SUM(total_free_coffee_redeemed), 0) AS free_redeemed
+
+                FROM shop_clients
+
+                WHERE shop_id = %s
+            """, (shop_id,))
+
+            loyalty = cur.fetchone()
+
+    returned_today = int(returns["returned_today"] or 0)
+    returned_7d = int(returns["returned_7d"] or 0)
+    returned_30d = int(returns["returned_30d"] or 0)
+    inactive_gt_7d = int(inactive["inactive_gt_7d"] or 0)
+
+    auto_sent = int(mailings["auto_sent"] or 0)
+    own_sent = int(mailings["own_sent"] or 0)
+    total_sent = int(mailings["total_sent"] or 0)
+
+    auto_returns = int(mailing_returns["auto_returns"] or 0)
+    own_returns = int(mailing_returns["own_returns"] or 0)
+    total_returns = int(mailing_returns["total_returns"] or 0)
+
+    # Эффективность = сколько возвратов получили
+    # относительно количества маркетинговых сообщений за 30 дней.
+    efficiency_percent = (
+        round((total_returns / total_sent) * 100, 2)
+        if total_sent > 0
+        else 0.0
+    )
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+
+        "returns": {
+            "today": returned_today,
+            "days_7": returned_7d,
+            "days_30": returned_30d,
+            "inactive_gt_7d": inactive_gt_7d,
+        },
+
+        "efficiency": {
+            "percent": efficiency_percent,
+            "returned_clients": total_returns,
+        },
+
+        "mailings": {
+            "auto_sent": auto_sent,
+            "auto_returns": auto_returns,
+            "own_sent": own_sent,
+            "own_returns": own_returns,
+            "total_sent": total_sent,
+        },
+
+        "loyalty": {
+            "total_scans": int(loyalty["total_scans"] or 0),
+            "free_now": int(loyalty["free_now"] or 0),
+            "free_earned": int(loyalty["free_earned"] or 0),
+            "free_redeemed": int(loyalty["free_redeemed"] or 0),
+        },
     }
