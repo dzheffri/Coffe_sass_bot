@@ -26,7 +26,7 @@ def get_connection():
 def init_db():
     with get_connection() as conn:
         with conn.cursor() as cur:
-                        cur.execute("""
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id BIGSERIAL PRIMARY KEY,
                     telegram_user_id BIGINT UNIQUE NOT NULL,
@@ -1233,3 +1233,88 @@ def get_all_return_logs():
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM return_logs ORDER BY id")
             return cur.fetchall()
+
+def get_shop_reminder_settings(shop_id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO shop_reminder_settings (shop_id)
+                VALUES (%s)
+                ON CONFLICT (shop_id) DO NOTHING
+            """, (shop_id,))
+
+            cur.execute("""
+                SELECT *
+                FROM shop_reminder_settings
+                WHERE shop_id = %s
+            """, (shop_id,))
+
+            return cur.fetchone()
+
+
+def update_shop_reminder_settings(
+    shop_id: int,
+    one_left_enabled: bool,
+    one_left_days: int,
+    free_coffee_enabled: bool,
+    free_coffee_days: int,
+    inactive_5_7_enabled: bool,
+    inactive_5_7_days: int,
+    inactive_14_30_enabled: bool,
+    inactive_14_30_days: int,
+):
+    values = [
+        one_left_days,
+        free_coffee_days,
+        inactive_5_7_days,
+        inactive_14_30_days,
+    ]
+
+    if any(value < 1 or value > 7 for value in values):
+        raise ValueError("Reminder days must be between 1 and 7")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO shop_reminder_settings (
+                    shop_id,
+                    one_left_enabled,
+                    one_left_days,
+                    free_coffee_enabled,
+                    free_coffee_days,
+                    inactive_5_7_enabled,
+                    inactive_5_7_days,
+                    inactive_14_30_enabled,
+                    inactive_14_30_days,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (shop_id)
+                DO UPDATE SET
+                    one_left_enabled = EXCLUDED.one_left_enabled,
+                    one_left_days = EXCLUDED.one_left_days,
+                    free_coffee_enabled = EXCLUDED.free_coffee_enabled,
+                    free_coffee_days = EXCLUDED.free_coffee_days,
+                    inactive_5_7_enabled = EXCLUDED.inactive_5_7_enabled,
+                    inactive_5_7_days = EXCLUDED.inactive_5_7_days,
+                    inactive_14_30_enabled = EXCLUDED.inactive_14_30_enabled,
+                    inactive_14_30_days = EXCLUDED.inactive_14_30_days,
+                    updated_at = NOW()
+                RETURNING *
+            """, (
+                shop_id,
+                one_left_enabled,
+                one_left_days,
+                free_coffee_enabled,
+                free_coffee_days,
+                inactive_5_7_enabled,
+                inactive_5_7_days,
+                inactive_14_30_enabled,
+                inactive_14_30_days,
+            ))
+
+            return cur.fetchone()
+
