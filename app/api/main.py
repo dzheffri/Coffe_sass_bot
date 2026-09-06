@@ -19,7 +19,7 @@ from app.web_panel_logic import (
     get_owner_clients,
 )
 from app.web_panel_db import init_web_panel_db
-from app.db import get_connection
+from app.db import get_connection, is_owner
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -143,6 +143,7 @@ def user_shops(telegram_user_id: int):
         owner_id = row["owner_telegram_id"]
 
         profile = {}
+
         if owner_id:
             profile_data = get_shop_profile(owner_id)
 
@@ -274,6 +275,13 @@ async def send_code(data: SendCodeRequest):
             "message": "Некоректний Telegram ID"
         }
 
+    # Сначала проверяем, что пользователь — владелец кофейни
+    if not is_owner(int(telegram_id)):
+        return {
+            "ok": False,
+            "message": "У вас немає доступу до панелі кав’ярні"
+        }
+
     code = str(random.randint(1000, 9999))
     expires_at = datetime.utcnow() + timedelta(minutes=15)
 
@@ -301,7 +309,10 @@ async def send_code(data: SendCodeRequest):
     finally:
         await bot.session.close()
 
-    return {"ok": True}
+    return {
+        "ok": True,
+        "message": "Код відправлено"
+    }
 
 
 @app.post("/auth/verify-code")
