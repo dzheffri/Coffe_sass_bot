@@ -12,6 +12,7 @@ from app.db import (
     was_reminder_sent_recently,
     save_reminder_log,
     save_auto_touch,
+    get_shop_reminder_settings,
 )
 
 
@@ -45,24 +46,45 @@ async def send_subscription_last_day_reminders(bot: Bot):
 
         try:
             await bot.send_message(telegram_user_id, text)
-            save_reminder_log(shop_id, user_id, REMINDER_SUBSCRIPTION_LAST_DAY)
+
+            save_reminder_log(
+                shop_id,
+                user_id,
+                REMINDER_SUBSCRIPTION_LAST_DAY
+            )
+
         except Exception as e:
-            print(f"[reminders][subscription_last_day] failed for owner {telegram_user_id}: {e}")
+            print(
+                f"[reminders][subscription_last_day] "
+                f"failed for owner {telegram_user_id}: {e}"
+            )
 
 
 async def send_one_left_reminders(bot: Bot):
     clients = get_clients_for_one_left_reminder()
+
+    settings_cache = {}
 
     for row in clients:
         shop_id = row["shop_id"]
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
+        if shop_id not in settings_cache:
+            settings_cache[shop_id] = get_shop_reminder_settings(shop_id)
+
+        settings = settings_cache[shop_id]
+
+        if not settings["one_left_enabled"]:
+            continue
+
+        repeat_days = settings["one_left_days"]
+
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
             reminder_type=REMINDER_ONE_LEFT,
-            days=3,
+            days=repeat_days,
         ):
             continue
 
@@ -75,25 +97,50 @@ async def send_one_left_reminders(bot: Bot):
 
         try:
             await bot.send_message(telegram_user_id, text)
-            save_reminder_log(shop_id, user_id, REMINDER_ONE_LEFT)
+
+            save_reminder_log(
+                shop_id,
+                user_id,
+                REMINDER_ONE_LEFT
+            )
+
             save_auto_touch(shop_id, user_id)
+
         except Exception as e:
-            print(f"[reminders][one_left] failed for {telegram_user_id}: {e}")
+            print(
+                f"[reminders][one_left] "
+                f"failed for {telegram_user_id}: {e}"
+            )
 
 
 async def send_inactive_5_7_reminders(bot: Bot):
-    clients = get_clients_for_inactive_reminder(days_from=5, days_to=7)
+    clients = get_clients_for_inactive_reminder(
+        days_from=5,
+        days_to=7
+    )
+
+    settings_cache = {}
 
     for row in clients:
         shop_id = row["shop_id"]
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
+        if shop_id not in settings_cache:
+            settings_cache[shop_id] = get_shop_reminder_settings(shop_id)
+
+        settings = settings_cache[shop_id]
+
+        if not settings["inactive_5_7_enabled"]:
+            continue
+
+        repeat_days = settings["inactive_5_7_days"]
+
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
             reminder_type=REMINDER_INACTIVE_5_7,
-            days=5,
+            days=repeat_days,
         ):
             continue
 
@@ -108,25 +155,50 @@ async def send_inactive_5_7_reminders(bot: Bot):
 
         try:
             await bot.send_message(telegram_user_id, text)
-            save_reminder_log(shop_id, user_id, REMINDER_INACTIVE_5_7)
+
+            save_reminder_log(
+                shop_id,
+                user_id,
+                REMINDER_INACTIVE_5_7
+            )
+
             save_auto_touch(shop_id, user_id)
+
         except Exception as e:
-            print(f"[reminders][inactive_5_7] failed for {telegram_user_id}: {e}")
+            print(
+                f"[reminders][inactive_5_7] "
+                f"failed for {telegram_user_id}: {e}"
+            )
 
 
 async def send_inactive_14_30_reminders(bot: Bot):
-    clients = get_clients_for_inactive_reminder(days_from=14, days_to=30)
+    clients = get_clients_for_inactive_reminder(
+        days_from=14,
+        days_to=30
+    )
+
+    settings_cache = {}
 
     for row in clients:
         shop_id = row["shop_id"]
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
+        if shop_id not in settings_cache:
+            settings_cache[shop_id] = get_shop_reminder_settings(shop_id)
+
+        settings = settings_cache[shop_id]
+
+        if not settings["inactive_14_30_enabled"]:
+            continue
+
+        repeat_days = settings["inactive_14_30_days"]
+
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
             reminder_type=REMINDER_INACTIVE_14_30,
-            days=10,
+            days=repeat_days,
         ):
             continue
 
@@ -141,25 +213,47 @@ async def send_inactive_14_30_reminders(bot: Bot):
 
         try:
             await bot.send_message(telegram_user_id, text)
-            save_reminder_log(shop_id, user_id, REMINDER_INACTIVE_14_30)
+
+            save_reminder_log(
+                shop_id,
+                user_id,
+                REMINDER_INACTIVE_14_30
+            )
+
             save_auto_touch(shop_id, user_id)
+
         except Exception as e:
-            print(f"[reminders][inactive_14_30] failed for {telegram_user_id}: {e}")
+            print(
+                f"[reminders][inactive_14_30] "
+                f"failed for {telegram_user_id}: {e}"
+            )
 
 
 async def send_free_coffee_reminders(bot: Bot):
     clients = get_clients_with_free_coffee()
+
+    settings_cache = {}
 
     for row in clients:
         shop_id = row["shop_id"]
         user_id = row["user_id"]
         telegram_user_id = row["telegram_user_id"]
 
+        if shop_id not in settings_cache:
+            settings_cache[shop_id] = get_shop_reminder_settings(shop_id)
+
+        settings = settings_cache[shop_id]
+
+        if not settings["free_coffee_enabled"]:
+            continue
+
+        repeat_days = settings["free_coffee_days"]
+
         if was_reminder_sent_recently(
             shop_id=shop_id,
             user_id=user_id,
             reminder_type=REMINDER_FREE_COFFEE,
-            days=3,
+            days=repeat_days,
         ):
             continue
 
@@ -173,10 +267,20 @@ async def send_free_coffee_reminders(bot: Bot):
 
         try:
             await bot.send_message(telegram_user_id, text)
-            save_reminder_log(shop_id, user_id, REMINDER_FREE_COFFEE)
+
+            save_reminder_log(
+                shop_id,
+                user_id,
+                REMINDER_FREE_COFFEE
+            )
+
             save_auto_touch(shop_id, user_id)
+
         except Exception as e:
-            print(f"[reminders][free_coffee] failed for {telegram_user_id}: {e}")
+            print(
+                f"[reminders][free_coffee] "
+                f"failed for {telegram_user_id}: {e}"
+            )
 
 
 async def run_reminders_once(bot: Bot):
@@ -200,7 +304,9 @@ async def reminders_loop(bot: Bot):
 
             if now.hour == 9 and last_run_date != today:
                 await run_reminders_once(bot)
+
                 print("REMINDERS: ✅ morning run done")
+
                 last_run_date = today
 
         except Exception as e:
