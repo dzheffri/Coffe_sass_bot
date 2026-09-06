@@ -1,7 +1,7 @@
 import os
 import uuid
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +25,10 @@ from app.db import (
     is_owner,
     get_shop_reminder_settings,
     update_shop_reminder_settings,
+    get_shop_admins,
+    add_shop_admin,
+    remove_shop_admin,
+    get_subscription,
 )
 
 
@@ -88,6 +92,10 @@ class ReminderSettingsRequest(BaseModel):
 
     inactive_14_30_enabled: bool
     inactive_14_30_days: int
+
+
+class AddAdminRequest(BaseModel):
+    telegram_id: int
 
 
 codes_storage: dict[str, dict] = {}
@@ -434,6 +442,10 @@ def owner_analytics_details(owner_telegram_id: int):
     return get_owner_details_stats(owner_telegram_id)
 
 
+# =========================================================
+# REMINDER SETTINGS
+# =========================================================
+
 @app.get("/owner/settings/{owner_telegram_id}/reminders")
 def owner_get_reminder_settings(owner_telegram_id: int):
     shop_id = get_owner_shop_id(owner_telegram_id)
@@ -534,6 +546,229 @@ def owner_update_reminder_settings(
         }
     }
 
+
+# =========================================================
+# SHOP ADMINS
+# =========================================================
+
+@app.get("/owner/settings/{owner_telegram_id}/admins")
+def owner_get_admins(owner_telegram_id: int):
+    shop_id = get_owner_shop_id(owner_telegram_id)
+
+    if not shop_id:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    rows = get_shop_admins(shop_id)
+
+    admins = []
+
+    for row in rows:
+        admins.append({
+            "telegram_id": row["telegram_user_id"],
+            "full_name": row["full_name"] or "",
+            "username": row["username"] or "",
+            "role": row["role"],
+        })
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+        "admins": admins,
+    }
+
+
+@app.post("/owner/settings/{owner_telegram_id}/admins")
+def owner_add_admin(
+    owner_telegram_id: int,
+    data: AddAdminRequest
+):
+    shop_id = get_owner_shop_id(owner_telegram_id)
+
+    if not shop_id:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    if data.telegram_id == owner_telegram_id:
+        return {
+            "ok": False,
+            "message": "Власник вже має повний доступ"
+        }
+
+    existing_admins = get_shop_admins(shop_id)
+
+    existing = next(
+        (
+            row
+            for row in existing_admins
+            if row["telegram_user_id"] == data.telegram_id
+        ),
+        None,
+    )
+
+    if existing and existing["role"] == "owner":
+        return {
+            "ok": False,
+            "message": "Цей користувач є власником кав’ярні"
+        }
+
+    if existing and existing["role"] == "admin":
+        return {
+            "ok": True,
+            "message": "Цей адміністратор вже доданий"
+        }
+
+    result = add_shop_admin(
+        shop_id=shop_id,
+        admin_telegram_user_id=data.telegram_id,
+        role="admin",
+    )
+
+    if not result:
+        return {
+            "ok": False,
+            "message": (
+                "Користувача не знайдено. "
+                "Нехай співробітник спочатку напише боту /start."
+            )
+        }
+
+    return {
+        "ok": True,
+        "message": "Адміністратора додано"
+    }
+
+
+@app.delete(
+    "/owner/settings/{owner_telegram_id}/admins/{admin_telegram_id}"
+)
+def owner_delete_admin(
+    owner_telegram_id: int,
+    admin_telegram_id: int
+):
+    shop_id = get_owner_shop_id(owner_telegram_id)
+
+    if not shop_id:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    if admin_telegram_id == owner_telegram_id:
+        return {
+            "ok": False,
+            "message": "Власника кав’ярні видалити не можна"
+        }
+
+    admins = get_shop_admins(shop_id)
+
+    target = next(
+        (
+            row
+            for row in admins
+            if row["telegram_user_id"] == admin_telegram_id
+        ),
+        None,
+    )
+
+    if not target:
+        return {
+            "ok": False,
+            "message": "Адміністратора не знайдено"
+        }
+
+    if target["role"] == "owner":
+        return {
+            "ok": False,
+            "message": "Власника кав’ярні видалити не можна"
+        }
+
+    deleted = remove_shop_admin(
+        shop_id=shop_id,
+        admin_telegram_user_id=admin_telegram_id,
+    )
+
+    if not deleted:
+        return {
+            "ok": False,
+            "message": "Не вдалося видалити адміністратора"
+        }
+
+    return {
+        "ok": True,
+        "message": "Адміністратора видалено"
+    }
+
+
+# =========================================================
+# SUBSCRIPTION
+# =========================================================
+
+@app.get("/owner/settings/{owner_telegram_id}/subscription")
+def owner_get_subscription(owner_telegram_id: int):
+    shop_id = get_owner_shop_id(owner_telegram_id)
+
+    if not shop_id:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    subscription = get_subscription(shop_id)
+
+    if not subscription:
+        return {
+            "ok": True,
+            "shop_id": shop_id,
+            "subscription": None,
+        }
+
+    expires_at = subscription["expires_at"]
+
+    now = datetime.now(timezone.utc)
+
+    if expires_at.tzinfo is None:
+        expires_at_for_calc = expires_at.replace(
+            tzinfo=timezone.utc
+        )
+    else:
+        expires_at_for_calc = expires_at.astimezone(
+            timezone.utc
+        )
+
+    seconds_left = (
+        expires_at_for_calc - now
+    ).total_seconds()
+
+    days_left = max(
+        0,
+        int((seconds_left + 86399) // 86400)
+    )
+
+    actual_status = subscription["status"]
+
+    if expires_at_for_calc <= now:
+        actual_status = "expired"
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+        "subscription": {
+            "plan": subscription["plan"],
+            "status": actual_status,
+            "expires_at": expires_at.isoformat(),
+            "days_left": days_left,
+        }
+    }
+
+
+# =========================================================
+# IMAGE UPLOAD
+# =========================================================
 
 @app.post("/upload/image")
 async def upload_image(file: UploadFile = File(...)):
