@@ -631,6 +631,7 @@ def redeem_free_for_shop_client(shop_id: int, client_user_id: int, admin_user_id
                 FROM shop_clients
                 WHERE shop_id = %s AND user_id = %s
             """, (shop_id, client_user_id))
+
             row = cur.fetchone()
 
             if not row:
@@ -639,6 +640,15 @@ def redeem_free_for_shop_client(shop_id: int, client_user_id: int, admin_user_id
             if row["free_coffee_balance"] <= 0:
                 return "EMPTY"
 
+            # Ищем последнее маркетинговое сообщение клиенту
+            # за последние 7 дней.
+            last_touch = get_last_marketing_touch(
+                shop_id=shop_id,
+                user_id=client_user_id,
+                days=7
+            )
+
+            # Списываем бесплатный кофе
             cur.execute("""
                 UPDATE shop_clients
                 SET free_coffee_balance = free_coffee_balance - 1,
@@ -647,13 +657,49 @@ def redeem_free_for_shop_client(shop_id: int, client_user_id: int, admin_user_id
                 WHERE shop_id = %s AND user_id = %s
                 RETURNING *
             """, (shop_id, client_user_id))
+
             updated = cur.fetchone()
 
+            # Сохраняем операцию списания
             cur.execute("""
                 INSERT INTO transactions (
-                    shop_id, user_id, admin_user_id, type, cups_added, free_redeemed
-                ) VALUES (%s, %s, %s, 'redeem_free', 0, 1)
-            """, (shop_id, client_user_id, admin_user_id))
+                    shop_id,
+                    user_id,
+                    admin_user_id,
+                    type,
+                    cups_added,
+                    free_redeemed
+                )
+                VALUES (%s, %s, %s, 'redeem_free', 0, 1)
+            """, (
+                shop_id,
+                client_user_id,
+                admin_user_id
+            ))
+
+            # Сам визит тоже фиксируем как service-touch
+            cur.execute("""
+                INSERT INTO touch_logs (
+                    user_id,
+                    shop_id,
+                    type
+                )
+                VALUES (%s, %s, 'service')
+            """, (
+                client_user_id,
+                shop_id
+            ))
+
+            # Если перед визитом была авто-рассылка
+            # или собственная рассылка владельца,
+            # считаем этот визит возвратом.
+            if last_touch:
+                save_return_log(
+                    shop_id=shop_id,
+                    user_id=client_user_id,
+                    touch_log_id=last_touch["id"],
+                    touch_type=last_touch["type"],
+                )
 
             return updated
 
