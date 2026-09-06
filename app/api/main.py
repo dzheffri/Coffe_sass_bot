@@ -20,7 +20,12 @@ from app.web_panel_logic import (
     get_owner_details_stats,
 )
 from app.web_panel_db import init_web_panel_db
-from app.db import get_connection, is_owner
+from app.db import (
+    get_connection,
+    is_owner,
+    get_shop_reminder_settings,
+    update_shop_reminder_settings,
+)
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -71,7 +76,48 @@ class UpdateShopRequest(BaseModel):
     news: list[ShopNewsItem] = []
 
 
+class ReminderSettingsRequest(BaseModel):
+    one_left_enabled: bool
+    one_left_days: int
+
+    free_coffee_enabled: bool
+    free_coffee_days: int
+
+    inactive_5_7_enabled: bool
+    inactive_5_7_days: int
+
+    inactive_14_30_enabled: bool
+    inactive_14_30_days: int
+
+
 codes_storage: dict[str, dict] = {}
+
+
+def get_owner_shop_id(owner_telegram_id: int):
+    if not is_owner(owner_telegram_id):
+        return None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT sa.shop_id
+                FROM shop_admins sa
+                JOIN users u ON u.id = sa.user_id
+                WHERE u.telegram_user_id = %s
+                  AND sa.role = 'owner'
+                ORDER BY sa.shop_id
+                LIMIT 1
+                """,
+                (owner_telegram_id,)
+            )
+
+            row = cur.fetchone()
+
+    if not row:
+        return None
+
+    return row["shop_id"]
 
 
 @app.get("/health")
@@ -386,6 +432,107 @@ def owner_analytics_clients(owner_telegram_id: int):
 @app.get("/owner/analytics/{owner_telegram_id}/details")
 def owner_analytics_details(owner_telegram_id: int):
     return get_owner_details_stats(owner_telegram_id)
+
+
+@app.get("/owner/settings/{owner_telegram_id}/reminders")
+def owner_get_reminder_settings(owner_telegram_id: int):
+    shop_id = get_owner_shop_id(owner_telegram_id)
+
+    if not shop_id:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    settings = get_shop_reminder_settings(shop_id)
+
+    if not settings:
+        return {
+            "ok": False,
+            "message": "Налаштування не знайдено"
+        }
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+        "settings": {
+            "one_left_enabled": settings["one_left_enabled"],
+            "one_left_days": settings["one_left_days"],
+
+            "free_coffee_enabled": settings["free_coffee_enabled"],
+            "free_coffee_days": settings["free_coffee_days"],
+
+            "inactive_5_7_enabled": settings["inactive_5_7_enabled"],
+            "inactive_5_7_days": settings["inactive_5_7_days"],
+
+            "inactive_14_30_enabled": settings["inactive_14_30_enabled"],
+            "inactive_14_30_days": settings["inactive_14_30_days"],
+        }
+    }
+
+
+@app.put("/owner/settings/{owner_telegram_id}/reminders")
+def owner_update_reminder_settings(
+    owner_telegram_id: int,
+    data: ReminderSettingsRequest
+):
+    shop_id = get_owner_shop_id(owner_telegram_id)
+
+    if not shop_id:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
+
+    days_values = [
+        data.one_left_days,
+        data.free_coffee_days,
+        data.inactive_5_7_days,
+        data.inactive_14_30_days,
+    ]
+
+    if any(value < 1 or value > 7 for value in days_values):
+        return {
+            "ok": False,
+            "message": "Кількість днів має бути від 1 до 7"
+        }
+
+    try:
+        settings = update_shop_reminder_settings(
+            shop_id=shop_id,
+            one_left_enabled=data.one_left_enabled,
+            one_left_days=data.one_left_days,
+            free_coffee_enabled=data.free_coffee_enabled,
+            free_coffee_days=data.free_coffee_days,
+            inactive_5_7_enabled=data.inactive_5_7_enabled,
+            inactive_5_7_days=data.inactive_5_7_days,
+            inactive_14_30_enabled=data.inactive_14_30_enabled,
+            inactive_14_30_days=data.inactive_14_30_days,
+        )
+
+    except ValueError as e:
+        return {
+            "ok": False,
+            "message": str(e)
+        }
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+        "settings": {
+            "one_left_enabled": settings["one_left_enabled"],
+            "one_left_days": settings["one_left_days"],
+
+            "free_coffee_enabled": settings["free_coffee_enabled"],
+            "free_coffee_days": settings["free_coffee_days"],
+
+            "inactive_5_7_enabled": settings["inactive_5_7_enabled"],
+            "inactive_5_7_days": settings["inactive_5_7_days"],
+
+            "inactive_14_30_enabled": settings["inactive_14_30_enabled"],
+            "inactive_14_30_days": settings["inactive_14_30_days"],
+        }
+    }
 
 
 @app.post("/upload/image")
