@@ -26,7 +26,7 @@ def get_connection():
 def init_db():
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+                        cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id BIGSERIAL PRIMARY KEY,
                     telegram_user_id BIGINT UNIQUE NOT NULL,
@@ -39,7 +39,7 @@ def init_db():
                 )
             """)
 
-                       cur.execute("""
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS coffee_shops (
                     id BIGSERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
