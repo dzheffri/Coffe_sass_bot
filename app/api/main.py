@@ -888,3 +888,4 @@ async def upload_image(file: UploadFile = File(...)):
         "url": f"/uploads/{filename}"
     }
 # persistence test
+# postgres persistence test 2026-09-07
