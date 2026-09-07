@@ -227,6 +227,22 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS panel_mode TEXT NOT NULL DEFAULT 'auto'
             """)
 
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_login_tickets (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket TEXT UNIQUE NOT NULL,
+                    telegram_user_id BIGINT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    used_at TIMESTAMPTZ NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_admin_login_tickets_ticket
+                ON admin_login_tickets(ticket)
+            """)
+
 
 init_db()
 
@@ -1315,6 +1331,60 @@ def update_shop_reminder_settings(
                 inactive_14_30_enabled,
                 inactive_14_30_days,
             ))
+
+            return cur.fetchone()
+
+def create_admin_login_ticket(telegram_user_id: int, ttl_minutes: int = 5) -> str:
+    ticket = str(uuid.uuid4())
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM admin_login_tickets
+                WHERE telegram_user_id = %s
+                   OR expires_at <= NOW()
+                   OR used_at IS NOT NULL
+            """, (telegram_user_id,))
+
+            cur.execute("""
+                INSERT INTO admin_login_tickets (
+                    ticket,
+                    telegram_user_id,
+                    expires_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    NOW() + (%s || ' minutes')::interval
+                )
+            """, (
+                ticket,
+                telegram_user_id,
+                ttl_minutes,
+            ))
+
+    return ticket
+
+
+def consume_admin_login_ticket(ticket: str):
+    clean_ticket = (ticket or "").strip()
+
+    if not clean_ticket:
+        return None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE admin_login_tickets
+                SET used_at = NOW()
+                WHERE ticket = %s
+                  AND used_at IS NULL
+                  AND expires_at > NOW()
+                RETURNING
+                    telegram_user_id,
+                    expires_at,
+                    used_at
+            """, (clean_ticket,))
 
             return cur.fetchone()
 
