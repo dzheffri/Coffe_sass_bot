@@ -33,6 +33,7 @@ from app.db import (
     add_shop_admin,
     remove_shop_admin,
     get_subscription,
+    consume_admin_login_ticket,
 )
 
 
@@ -67,6 +68,10 @@ class VerifyCodeRequest(BaseModel):
 
 class TelegramMiniAppAuthRequest(BaseModel):
     init_data: str
+
+
+class AdminTicketAuthRequest(BaseModel):
+    ticket: str
 
 
 class ShopNewsItem(BaseModel):
@@ -403,6 +408,30 @@ def telegram_miniapp_auth(data: TelegramMiniAppAuthRequest):
         }
 
     telegram_id = validated["telegram_id"]
+
+    if not is_owner(telegram_id):
+        return {
+            "ok": False,
+            "message": "У вас немає доступу до панелі кав’ярні"
+        }
+
+    return {
+        "ok": True,
+        "telegram_id": telegram_id
+    }
+
+
+@app.post("/auth/admin-ticket")
+def admin_ticket_auth(data: AdminTicketAuthRequest):
+    ticket_row = consume_admin_login_ticket(data.ticket)
+
+    if not ticket_row:
+        return {
+            "ok": False,
+            "message": "Посилання для входу недійсне або вже використане"
+        }
+
+    telegram_id = ticket_row["telegram_user_id"]
 
     if not is_owner(telegram_id):
         return {
