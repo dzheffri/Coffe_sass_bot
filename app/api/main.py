@@ -1,6 +1,10 @@
 import os
 import uuid
 import random
+import json
+import hmac
+import hashlib
+from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, UploadFile, File
@@ -61,6 +65,10 @@ class VerifyCodeRequest(BaseModel):
     code: str
 
 
+class TelegramMiniAppAuthRequest(BaseModel):
+    init_data: str
+
+
 class ShopNewsItem(BaseModel):
     title: str = ""
     price: str = ""
@@ -99,6 +107,72 @@ class AddAdminRequest(BaseModel):
 
 
 codes_storage: dict[str, dict] = {}
+
+
+def validate_telegram_init_data(init_data: str, max_age_seconds: int = 86400):
+    if not init_data:
+        return None
+
+    try:
+        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
+    except Exception:
+        return None
+
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+
+    auth_date_raw = parsed.get("auth_date")
+    if not auth_date_raw or not auth_date_raw.isdigit():
+        return None
+
+    auth_date = int(auth_date_raw)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    if auth_date > now_ts + 60:
+        return None
+
+    if now_ts - auth_date > max_age_seconds:
+        return None
+
+    data_check_string = "\n".join(
+        f"{key}={value}"
+        for key, value in sorted(parsed.items())
+    )
+
+    secret_key = hmac.new(
+        b"WebAppData",
+        BOT_TOKEN.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+    calculated_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        return None
+
+    user_raw = parsed.get("user")
+    if not user_raw:
+        return None
+
+    try:
+        user = json.loads(user_raw)
+    except Exception:
+        return None
+
+    telegram_id = user.get("id")
+    if not isinstance(telegram_id, int):
+        return None
+
+    return {
+        "telegram_id": telegram_id,
+        "user": user,
+        "auth_date": auth_date,
+    }
 
 
 def get_owner_shop_id(owner_telegram_id: int):
@@ -315,6 +389,30 @@ def all_shops():
     return {
         "ok": True,
         "shops": shops
+    }
+
+
+@app.post("/auth/telegram-miniapp")
+def telegram_miniapp_auth(data: TelegramMiniAppAuthRequest):
+    validated = validate_telegram_init_data(data.init_data)
+
+    if not validated:
+        return {
+            "ok": False,
+            "message": "Не вдалося підтвердити Telegram"
+        }
+
+    telegram_id = validated["telegram_id"]
+
+    if not is_owner(telegram_id):
+        return {
+            "ok": False,
+            "message": "У вас немає доступу до панелі кав’ярні"
+        }
+
+    return {
+        "ok": True,
+        "telegram_id": telegram_id
     }
 
 
