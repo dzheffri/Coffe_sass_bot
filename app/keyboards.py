@@ -7,31 +7,16 @@ from aiogram.types import (
 )
 
 
-from aiogram.types import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    WebAppInfo,
-)
-
-
 def user_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text="📱 Мій QR-код"),
-            ],
+            [KeyboardButton(text="📱 Мій QR-код")],
             [
                 KeyboardButton(text="☕ Мої чашки"),
                 KeyboardButton(text="🎁 Мої безкоштовні кави"),
             ],
-            [
-                KeyboardButton(text="🏪 Мої кав’ярні"),
-            ],
-            [
-                KeyboardButton(text="🛟 Служба підтримки"),
-            ],
+            [KeyboardButton(text="🏪 Мої кав’ярні")],
+            [KeyboardButton(text="🛟 Служба підтримки")],
         ],
         resize_keyboard=True
     )
@@ -43,6 +28,7 @@ def admin_main_keyboard(
     is_super_admin: bool = False,
     can_switch_to_owner: bool = False,
     can_switch_to_super_admin: bool = False,
+    admin_panel_url: str = "",
 ):
     keyboard = [
         [
@@ -70,6 +56,14 @@ def admin_main_keyboard(
             ],
             [KeyboardButton(text="💳 Підписка")],
         ])
+
+        if admin_panel_url:
+            keyboard.append([
+                KeyboardButton(
+                    text="🌐 Відкрити адмін-панель",
+                    web_app=WebAppInfo(url=admin_panel_url)
+                )
+            ])
 
     if is_super_admin:
         keyboard.extend([
