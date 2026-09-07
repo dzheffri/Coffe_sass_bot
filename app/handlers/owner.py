@@ -19,6 +19,7 @@ from app.db import (
     get_broadcast_recipients,
     save_broadcast,
     log_broadcast_touches,
+    create_admin_login_ticket,
 )
 from app.states import OwnerStates
 from app.keyboards import admin_main_keyboard
@@ -54,13 +55,19 @@ def broadcast_preview_keyboard():
 
 def owner_main_keyboard_for_user(user_id: int):
     is_super_admin = user_id in SUPER_ADMIN_IDS
+
+    ticket = create_admin_login_ticket(user_id)
+
+    base_url = ADMIN_PANEL_URL.rstrip("/")
+    personal_admin_url = f"{base_url}/?ticket={ticket}"
+
     return admin_main_keyboard(
         scanner_url=SCANNER_URL,
         is_owner=True,
         is_super_admin=False,
         can_switch_to_owner=False,
         can_switch_to_super_admin=is_super_admin,
-        admin_panel_url=ADMIN_PANEL_URL,
+        admin_panel_url=personal_admin_url,
     )
 
 
