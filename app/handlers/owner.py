@@ -22,7 +22,7 @@ from app.db import (
 )
 from app.states import OwnerStates
 from app.keyboards import admin_main_keyboard
-from app.config import SCANNER_URL, SUPER_ADMIN_IDS
+from app.config import SCANNER_URL, SUPER_ADMIN_IDS, ADMIN_PANEL_URL
 
 
 router = Router()
@@ -60,6 +60,7 @@ def owner_main_keyboard_for_user(user_id: int):
         is_super_admin=False,
         can_switch_to_owner=False,
         can_switch_to_super_admin=is_super_admin,
+        admin_panel_url=ADMIN_PANEL_URL,
     )
 
 
