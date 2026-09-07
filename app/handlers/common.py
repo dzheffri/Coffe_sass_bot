@@ -10,7 +10,7 @@ from app.db import (
     set_panel_mode,
 )
 from app.keyboards import user_main_keyboard, admin_main_keyboard
-from app.config import SUPER_ADMIN_IDS, SCANNER_URL
+from app.config import SUPER_ADMIN_IDS, SCANNER_URL, ADMIN_PANEL_URL
 
 
 router = Router()
@@ -49,6 +49,7 @@ async def send_correct_panel(message: types.Message):
                     is_super_admin=False,
                     can_switch_to_owner=False,
                     can_switch_to_super_admin=True,
+                    admin_panel_url=ADMIN_PANEL_URL,
                 )
             )
             return
@@ -62,6 +63,7 @@ async def send_correct_panel(message: types.Message):
                 is_super_admin=True,
                 can_switch_to_owner=True,
                 can_switch_to_super_admin=False,
+                admin_panel_url="",
             )
         )
         return
@@ -75,6 +77,7 @@ async def send_correct_panel(message: types.Message):
                 is_super_admin=False,
                 can_switch_to_owner=False,
                 can_switch_to_super_admin=False,
+                admin_panel_url=ADMIN_PANEL_URL if owner_flag else "",
             )
         )
         return
@@ -87,6 +90,7 @@ async def send_correct_panel(message: types.Message):
             is_super_admin=True,
             can_switch_to_owner=False,
             can_switch_to_super_admin=False,
+            admin_panel_url="",
         )
     )
 
