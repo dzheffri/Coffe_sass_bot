@@ -8,12 +8,19 @@ from app.db import (
     assign_pending_owner_if_exists,
     get_panel_mode,
     set_panel_mode,
+    create_admin_login_ticket,
 )
 from app.keyboards import user_main_keyboard, admin_main_keyboard
 from app.config import SUPER_ADMIN_IDS, SCANNER_URL, ADMIN_PANEL_URL
 
 
 router = Router()
+
+
+def get_personal_admin_panel_url(user_id: int) -> str:
+    ticket = create_admin_login_ticket(user_id)
+    base_url = ADMIN_PANEL_URL.rstrip("/")
+    return f"{base_url}/?ticket={ticket}"
 
 
 async def send_correct_panel(message: types.Message):
@@ -49,7 +56,11 @@ async def send_correct_panel(message: types.Message):
                     is_super_admin=False,
                     can_switch_to_owner=False,
                     can_switch_to_super_admin=True,
-                    admin_panel_url=ADMIN_PANEL_URL,
+                    admin_panel_url=(
+                        get_personal_admin_panel_url(user_id)
+                        if owner_flag
+                        else ""
+                    ),
                 )
             )
             return
@@ -77,7 +88,11 @@ async def send_correct_panel(message: types.Message):
                 is_super_admin=False,
                 can_switch_to_owner=False,
                 can_switch_to_super_admin=False,
-                admin_panel_url=ADMIN_PANEL_URL if owner_flag else "",
+                admin_panel_url=(
+                    get_personal_admin_panel_url(user_id)
+                    if owner_flag
+                    else ""
+                ),
             )
         )
         return
