@@ -1,97 +1,81 @@
-from app.web_panel_db import get_web_connection, init_web_panel_db
 from app.db import get_connection, get_admin_shop_and_role
 
 
-init_web_panel_db()
-
-
 def ensure_shop_profile_exists(owner_telegram_id: int):
-    conn = get_web_connection()
-    cur = conn.cursor()
+    shop = get_admin_shop_and_role(owner_telegram_id)
 
-    cur.execute(
-        "SELECT id FROM shop_profiles WHERE owner_telegram_id = ?",
-        (owner_telegram_id,)
-    )
+    if not shop or shop.get("role") != "owner":
+        return None
 
-    row = cur.fetchone()
-
-    if not row:
-        cur.execute("""
-        INSERT INTO shop_profiles (
-            owner_telegram_id,
-            name,
-            subtitle,
-            address,
-            work_from,
-            work_to,
-            instagram,
-            description,
-            logo_url,
-            cover_url
-        )
-        VALUES (?, '', '', '', '', '', '', '', '', '')
-        """, (owner_telegram_id,))
-
-        default_news = [
-            ("", "", "", 0),
-            ("", "", "", 1),
-            ("", "", "", 2),
-        ]
-
-        for title, price, image_url, sort_order in default_news:
-            cur.execute("""
-            INSERT INTO shop_news (
-                owner_telegram_id,
-                title,
-                price,
-                image_url,
-                sort_order
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """, (
-                owner_telegram_id,
-                title,
-                price,
-                image_url,
-                sort_order
-            ))
-
-        conn.commit()
-
-    conn.close()
+    return shop
 
 
 def get_shop_profile(owner_telegram_id: int):
-    ensure_shop_profile_exists(owner_telegram_id)
+    shop = ensure_shop_profile_exists(owner_telegram_id)
 
-    conn = get_web_connection()
-    cur = conn.cursor()
+    if not shop:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
 
-    cur.execute("""
-    SELECT *
-    FROM shop_profiles
-    WHERE owner_telegram_id = ?
-    """, (owner_telegram_id,))
+    shop_id = shop["id"]
 
-    profile = cur.fetchone()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    name,
+                    city,
+                    address,
+                    subtitle,
+                    work_from,
+                    work_to,
+                    instagram,
+                    description,
+                    logo_url,
+                    cover_url
+                FROM coffee_shops
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (shop_id,)
+            )
 
-    cur.execute("""
-    SELECT id, title, price, image_url, sort_order
-    FROM shop_news
-    WHERE owner_telegram_id = ?
-    ORDER BY sort_order ASC, id ASC
-    """, (owner_telegram_id,))
+            profile = cur.fetchone()
 
-    news = cur.fetchall()
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    title,
+                    price,
+                    image_url,
+                    sort_order
+                FROM shop_news
+                WHERE shop_id = %s
+                ORDER BY sort_order ASC, id ASC
+                """,
+                (shop_id,)
+            )
 
-    conn.close()
+            news = cur.fetchall()
+
+    if not profile:
+        return {
+            "ok": False,
+            "message": "Кав’ярню не знайдено"
+        }
 
     return {
         "ok": True,
         "shop": {
+            "shop_id": shop_id,
             "owner_telegram_id": owner_telegram_id,
             "name": profile["name"] or "",
+            "city": profile["city"] or "",
             "subtitle": profile["subtitle"] or "",
             "address": profile["address"] or "",
             "work_from": profile["work_from"] or "",
@@ -127,64 +111,75 @@ def update_shop_profile(
     cover_url: str,
     news: list[dict],
 ):
-    ensure_shop_profile_exists(owner_telegram_id)
+    shop = ensure_shop_profile_exists(owner_telegram_id)
 
-    conn = get_web_connection()
-    cur = conn.cursor()
+    if not shop:
+        return {
+            "ok": False,
+            "message": "Кав’ярню власника не знайдено"
+        }
 
-    cur.execute("""
-    UPDATE shop_profiles
-    SET
-        name = ?,
-        subtitle = ?,
-        address = ?,
-        work_from = ?,
-        work_to = ?,
-        instagram = ?,
-        description = ?,
-        logo_url = ?,
-        cover_url = ?,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE owner_telegram_id = ?
-    """, (
-        name,
-        subtitle,
-        address,
-        work_from,
-        work_to,
-        instagram,
-        description,
-        logo_url,
-        cover_url,
-        owner_telegram_id,
-    ))
+    shop_id = shop["id"]
 
-    cur.execute(
-        "DELETE FROM shop_news WHERE owner_telegram_id = ?",
-        (owner_telegram_id,)
-    )
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE coffee_shops
+                SET
+                    name = %s,
+                    subtitle = %s,
+                    address = %s,
+                    work_from = %s,
+                    work_to = %s,
+                    instagram = %s,
+                    description = %s,
+                    logo_url = %s,
+                    cover_url = %s
+                WHERE id = %s
+                """,
+                (
+                    name,
+                    subtitle,
+                    address,
+                    work_from,
+                    work_to,
+                    instagram,
+                    description,
+                    logo_url,
+                    cover_url,
+                    shop_id,
+                )
+            )
 
-    for index, item in enumerate(news):
-        cur.execute("""
-        INSERT INTO shop_news (
-            owner_telegram_id,
-            title,
-            price,
-            image_url,
-            sort_order,
-            updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, (
-            owner_telegram_id,
-            item.get("title", ""),
-            item.get("price", ""),
-            item.get("image_url", ""),
-            index,
-        ))
+            cur.execute(
+                "DELETE FROM shop_news WHERE shop_id = %s",
+                (shop_id,)
+            )
 
-    conn.commit()
-    conn.close()
+            for index, item in enumerate(news):
+                cur.execute(
+                    """
+                    INSERT INTO shop_news (
+                        shop_id,
+                        title,
+                        price,
+                        image_url,
+                        sort_order,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        shop_id,
+                        item.get("title", ""),
+                        item.get("price", ""),
+                        item.get("image_url", ""),
+                        index,
+                    )
+                )
+
+        conn.commit()
 
     return {
         "ok": True,
