@@ -887,3 +887,4 @@ async def upload_image(file: UploadFile = File(...)):
         "ok": True,
         "url": f"/uploads/{filename}"
     }
+# persistence test
