@@ -695,6 +695,20 @@ async def link_telegram_send_code(data: LinkTelegramSendCodeRequest):
 def link_telegram_verify(data: LinkTelegramVerifyRequest):
     telegram_id = data.telegram_id.strip()
     code = data.code.strip()
+    provider = data.provider.strip().lower()
+    provider_user_id = data.provider_user_id.strip()
+
+    if provider not in {"apple", "google"}:
+        return {
+            "ok": False,
+            "message": "Некоректний спосіб входу",
+        }
+
+    if not provider_user_id:
+        return {
+            "ok": False,
+            "message": "provider_user_id is required",
+        }
 
     storage_key = f"link:{telegram_id}"
     saved = codes_storage.get(storage_key)
@@ -719,11 +733,42 @@ def link_telegram_verify(data: LinkTelegramVerifyRequest):
             "message": "Невірний код",
         }
 
+    telegram_user = get_user_by_identity(
+        "telegram",
+        telegram_id,
+    )
+
+    if not telegram_user:
+        return {
+            "ok": False,
+            "message": "Профіль Telegram не знайдено",
+        }
+
+    link_result = link_user_identity(
+        telegram_user["id"],
+        provider,
+        provider_user_id,
+    )
+
+    if link_result["status"] not in {
+        "linked",
+        "already_linked",
+    }:
+        return {
+            "ok": False,
+            "status": link_result["status"],
+            "message": "Не вдалося прив’язати профіль",
+        }
+
     del codes_storage[storage_key]
 
     return {
         "ok": True,
-        "message": "Telegram підтверджено",
+        "status": "linked",
+        "message": "Профіль успішно прив’язано",
+        "user_id": telegram_user["id"],
+        "telegram_user_id": telegram_user["telegram_user_id"],
+        "personal_qr_token": telegram_user["personal_qr_token"],
     }
 @app.post("/auth/send-code")
 async def send_code(data: SendCodeRequest):
