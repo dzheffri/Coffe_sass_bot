@@ -426,6 +426,7 @@ def telegram_miniapp_auth(data: TelegramMiniAppAuthRequest):
 class TestIdentityAuthRequest(BaseModel):
     provider: str
     provider_user_id: str
+    action: str = "check"
     telegram_id: int | None = None
 
 
@@ -433,20 +434,24 @@ class TestIdentityAuthRequest(BaseModel):
 def test_identity_auth(data: TestIdentityAuthRequest):
     provider = data.provider.strip().lower()
     provider_user_id = data.provider_user_id.strip()
+    action = data.action.strip().lower()
 
     if provider not in {"apple", "google"}:
-        raise HTTPException(
-            status_code=400,
-            detail="Підтримуються тільки apple або google",
-        )
+        return {
+            "ok": False,
+            "message": "Підтримуються тільки apple або google",
+        }
 
     if not provider_user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="provider_user_id is required",
-        )
+        return {
+            "ok": False,
+            "message": "provider_user_id is required",
+        }
 
-    # 1. Такой Apple/Google аккаунт уже привязан.
+    # -------------------------------------------------
+    # 1. Проверяем, существует ли уже Apple/Google login
+    # -------------------------------------------------
+
     existing_user = get_user_by_identity(
         provider,
         provider_user_id,
@@ -461,25 +466,56 @@ def test_identity_auth(data: TestIdentityAuthRequest):
             "personal_qr_token": existing_user["personal_qr_token"],
         }
 
-    # 2. Пользователь уже вошёл через Telegram —
-    # привязываем Apple/Google к его существующему users.id.
-    if data.telegram_id is not None:
+    # -------------------------------------------------
+    # 2. Только проверка.
+    # НИКОГО пока не создаём.
+    # -------------------------------------------------
+
+    if action == "check":
+        return {
+            "ok": True,
+            "status": "needs_onboarding",
+            "message": "Потрібно вибрати: прив'язати Telegram або почати з нуля",
+        }
+
+    # -------------------------------------------------
+    # 3. Пользователь выбрал "Привязать Telegram"
+    # -------------------------------------------------
+
+    if action == "link_telegram":
+
+        if data.telegram_id is None:
+            return {
+                "ok": False,
+                "message": "Telegram ID is required",
+            }
+
         telegram_user = get_user_by_identity(
             "telegram",
             str(data.telegram_id),
         )
 
         if not telegram_user:
-            raise HTTPException(
-                status_code=404,
-                detail="Telegram користувача не знайдено",
-            )
+            return {
+                "ok": False,
+                "message": "Telegram користувача не знайдено",
+            }
 
-        link_user_identity(
+        link_result = link_user_identity(
             telegram_user["id"],
             provider,
             provider_user_id,
         )
+
+        if link_result["status"] not in {
+            "linked",
+            "already_linked",
+        }:
+            return {
+                "ok": False,
+                "message": "Не вдалося прив'язати акаунт",
+                "status": link_result["status"],
+            }
 
         return {
             "ok": True,
@@ -489,43 +525,34 @@ def test_identity_auth(data: TestIdentityAuthRequest):
             "personal_qr_token": telegram_user["personal_qr_token"],
         }
 
-    # 3. Совершенно новый пользователь без Telegram.
-    result = create_user_with_identity(
-        provider=provider,
-        provider_user_id=provider_user_id,
-    )
+    # -------------------------------------------------
+    # 4. Пользователь выбрал "Начать с нуля"
+    # -------------------------------------------------
 
-    user = result["user"]
+    if action == "create":
 
-    return {
-        "ok": True,
-        "status": "created",
-        "user_id": user["id"],
-        "telegram_user_id": user["telegram_user_id"],
-        "personal_qr_token": user["personal_qr_token"],
-    }
-@app.post("/auth/admin-ticket")
-def admin_ticket_auth(data: AdminTicketAuthRequest):
-    ticket_row = consume_admin_login_ticket(data.ticket)
+        result = create_user_with_identity(
+            provider=provider,
+            provider_user_id=provider_user_id,
+        )
 
-    if not ticket_row:
+        user = result["user"]
+
         return {
-            "ok": False,
-            "message": "Посилання для входу недійсне або вже використане"
-        }
-
-    telegram_id = ticket_row["telegram_user_id"]
-
-    if not is_owner(telegram_id):
-        return {
-            "ok": False,
-            "message": "У вас немає доступу до панелі кав’ярні"
+            "ok": True,
+            "status": result["status"],
+            "user_id": user["id"],
+            "telegram_user_id": user["telegram_user_id"],
+            "personal_qr_token": user["personal_qr_token"],
         }
 
     return {
-        "ok": True,
-        "telegram_id": telegram_id
+        "ok": False,
+        "message": "Unknown action",
     }
+
+
+
 
 
 @app.post("/auth/send-code")
