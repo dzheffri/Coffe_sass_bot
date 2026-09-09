@@ -621,7 +621,108 @@ def test_identity_auth(data: TestIdentityAuthRequest):
 
 
 
+class LinkTelegramSendCodeRequest(BaseModel):
+    telegram_id: str
 
+
+class LinkTelegramVerifyRequest(BaseModel):
+    telegram_id: str
+    code: str
+
+
+@app.post("/auth/link-telegram/send-code")
+async def link_telegram_send_code(data: LinkTelegramSendCodeRequest):
+    telegram_id = data.telegram_id.strip()
+
+    if not telegram_id.isdigit():
+        return {
+            "ok": False,
+            "message": "Некоректний Telegram ID",
+        }
+
+    telegram_user = get_user_by_identity(
+        "telegram",
+        telegram_id,
+    )
+
+    if not telegram_user:
+        return {
+            "ok": False,
+            "message": "Профіль з таким Telegram ID не знайдено",
+        }
+
+    code = str(random.randint(1000, 9999))
+    expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+    storage_key = f"link:{telegram_id}"
+
+    codes_storage[storage_key] = {
+        "code": code,
+        "expires_at": expires_at,
+    }
+
+    bot = Bot(token=BOT_TOKEN)
+
+    try:
+        await bot.send_message(
+            chat_id=int(telegram_id),
+            text=(
+                f"Код для прив’язки профілю «Наші»: {code}\n\n"
+                "Код дійсний 15 хвилин."
+            ),
+        )
+
+    except Exception as e:
+        print("LINK TELEGRAM SEND ERROR:", e)
+
+        return {
+            "ok": False,
+            "message": "Напишіть боту /start і спробуйте ще раз",
+        }
+
+    finally:
+        await bot.session.close()
+
+    return {
+        "ok": True,
+        "message": "Код надіслано у Telegram",
+    }
+
+
+@app.post("/auth/link-telegram/verify")
+def link_telegram_verify(data: LinkTelegramVerifyRequest):
+    telegram_id = data.telegram_id.strip()
+    code = data.code.strip()
+
+    storage_key = f"link:{telegram_id}"
+    saved = codes_storage.get(storage_key)
+
+    if not saved:
+        return {
+            "ok": False,
+            "message": "Код не знайдено",
+        }
+
+    if datetime.utcnow() > saved["expires_at"]:
+        del codes_storage[storage_key]
+
+        return {
+            "ok": False,
+            "message": "Термін дії коду завершився",
+        }
+
+    if code != saved["code"]:
+        return {
+            "ok": False,
+            "message": "Невірний код",
+        }
+
+    del codes_storage[storage_key]
+
+    return {
+        "ok": True,
+        "message": "Telegram підтверджено",
+    }
 @app.post("/auth/send-code")
 async def send_code(data: SendCodeRequest):
     telegram_id = data.telegram_id.strip()
