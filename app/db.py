@@ -307,6 +307,20 @@ def get_user_by_telegram_id(telegram_user_id: int):
             )
             return cur.fetchone()
 
+def get_user_by_identity(provider: str, provider_user_id: str):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT u.*
+                FROM user_identities ui
+                JOIN users u ON u.id = ui.user_id
+                WHERE ui.provider = %s
+                  AND ui.provider_user_id = %s
+                LIMIT 1
+            """, (provider, str(provider_user_id)))
+
+            return cur.fetchone()
+
 
 def get_user_by_qr_token(token: str):
     with get_connection() as conn:
