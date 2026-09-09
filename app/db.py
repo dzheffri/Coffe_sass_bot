@@ -337,39 +337,155 @@ def link_user_identity(user_id: int, provider: str, provider_user_id: str):
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            # Проверяем: не привязан ли этот Apple/Telegram/Google ID
-            # уже к другому внутреннему пользователю.
+
+            # -------------------------------------------------
+            # 1. Проверяем, привязан ли этот Apple/Google/Telegram ID
+            # -------------------------------------------------
+
             cur.execute("""
                 SELECT *
                 FROM user_identities
                 WHERE provider = %s
                   AND provider_user_id = %s
                 LIMIT 1
-            """, (clean_provider, clean_provider_user_id))
+            """, (
+                clean_provider,
+                clean_provider_user_id,
+            ))
 
             existing_identity = cur.fetchone()
 
             if existing_identity:
-                if existing_identity["user_id"] == user_id:
+
+                existing_user_id = existing_identity["user_id"]
+
+                # Уже принадлежит именно этому users.id
+                if existing_user_id == user_id:
                     return {
                         "status": "already_linked",
                         "identity": existing_identity,
                     }
 
+                # -------------------------------------------------
+                # 2. Apple / Google уже находится на другом users.id
+                #
+                # Разрешаем перенос ТОЛЬКО если тот аккаунт пустой.
+                # Это как раз наш сценарий:
+                #
+                # пустой Apple users.id = 31257
+                #            ↓
+                # старый Telegram users.id с чашками
+                # -------------------------------------------------
+
+                if clean_provider in {"apple", "google"}:
+
+                    # Есть ли у старого Apple/Google users.id
+                    # данные программы лояльности?
+                    cur.execute("""
+                        SELECT COUNT(*) AS count
+                        FROM shop_clients
+                        WHERE user_id = %s
+                    """, (existing_user_id,))
+
+                    shop_clients_row = cur.fetchone()
+                    shop_clients_count = (
+                        shop_clients_row["count"]
+                        if shop_clients_row
+                        else 0
+                    )
+
+                    # Является ли этот users.id владельцем/админом кофейни?
+                    cur.execute("""
+                        SELECT COUNT(*) AS count
+                        FROM shop_admins
+                        WHERE user_id = %s
+                    """, (existing_user_id,))
+
+                    shop_admins_row = cur.fetchone()
+                    shop_admins_count = (
+                        shop_admins_row["count"]
+                        if shop_admins_row
+                        else 0
+                    )
+
+                    # Если на исходном аккаунте уже есть реальные данные —
+                    # автоматически объединять его нельзя.
+                    if (
+                        shop_clients_count > 0
+                        or shop_admins_count > 0
+                    ):
+                        return {
+                            "status": "identity_in_use",
+                            "identity": existing_identity,
+                        }
+
+                    # Проверяем, нет ли уже Apple/Google
+                    # такого же типа на целевом Telegram users.id.
+                    cur.execute("""
+                        SELECT *
+                        FROM user_identities
+                        WHERE user_id = %s
+                          AND provider = %s
+                        LIMIT 1
+                    """, (
+                        user_id,
+                        clean_provider,
+                    ))
+
+                    target_provider = cur.fetchone()
+
+                    if target_provider:
+                        return {
+                            "status": "provider_already_linked",
+                            "identity": target_provider,
+                        }
+
+                    # -------------------------------------------------
+                    # Переносим Apple / Google identity
+                    # с пустого users.id на существующий Telegram users.id.
+                    #
+                    # Сам Telegram-профиль, QR, чашки и подарки
+                    # вообще не трогаем.
+                    # -------------------------------------------------
+
+                    cur.execute("""
+                        UPDATE user_identities
+                        SET user_id = %s
+                        WHERE id = %s
+                        RETURNING *
+                    """, (
+                        user_id,
+                        existing_identity["id"],
+                    ))
+
+                    moved_identity = cur.fetchone()
+
+                    return {
+                        "status": "linked",
+                        "identity": moved_identity,
+                    }
+
+                # Telegram identity автоматически переносить нельзя.
                 return {
                     "status": "identity_in_use",
                     "identity": existing_identity,
                 }
 
-            # У одного внутреннего аккаунта может быть только
-            # одна identity каждого типа.
+            # -------------------------------------------------
+            # 3. Проверяем:
+            # у одного внутреннего аккаунта одна identity каждого типа
+            # -------------------------------------------------
+
             cur.execute("""
                 SELECT *
                 FROM user_identities
                 WHERE user_id = %s
                   AND provider = %s
                 LIMIT 1
-            """, (user_id, clean_provider))
+            """, (
+                user_id,
+                clean_provider,
+            ))
 
             existing_provider = cur.fetchone()
 
@@ -378,6 +494,10 @@ def link_user_identity(user_id: int, provider: str, provider_user_id: str):
                     "status": "provider_already_linked",
                     "identity": existing_provider,
                 }
+
+            # -------------------------------------------------
+            # 4. Обычная новая привязка
+            # -------------------------------------------------
 
             cur.execute("""
                 INSERT INTO user_identities (
