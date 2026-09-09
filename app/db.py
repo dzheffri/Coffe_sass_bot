@@ -320,7 +320,78 @@ def get_user_by_identity(provider: str, provider_user_id: str):
             """, (provider, str(provider_user_id)))
 
             return cur.fetchone()
+def link_user_identity(user_id: int, provider: str, provider_user_id: str):
+    clean_provider = (provider or "").strip().lower()
+    clean_provider_user_id = str(provider_user_id or "").strip()
 
+    if not clean_provider:
+        raise ValueError("provider is required")
+
+    if not clean_provider_user_id:
+        raise ValueError("provider_user_id is required")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # Проверяем: не привязан ли этот Apple/Telegram/Google ID
+            # уже к другому внутреннему пользователю.
+            cur.execute("""
+                SELECT *
+                FROM user_identities
+                WHERE provider = %s
+                  AND provider_user_id = %s
+                LIMIT 1
+            """, (clean_provider, clean_provider_user_id))
+
+            existing_identity = cur.fetchone()
+
+            if existing_identity:
+                if existing_identity["user_id"] == user_id:
+                    return {
+                        "status": "already_linked",
+                        "identity": existing_identity,
+                    }
+
+                return {
+                    "status": "identity_in_use",
+                    "identity": existing_identity,
+                }
+
+            # У одного внутреннего аккаунта может быть только
+            # одна identity каждого типа.
+            cur.execute("""
+                SELECT *
+                FROM user_identities
+                WHERE user_id = %s
+                  AND provider = %s
+                LIMIT 1
+            """, (user_id, clean_provider))
+
+            existing_provider = cur.fetchone()
+
+            if existing_provider:
+                return {
+                    "status": "provider_already_linked",
+                    "identity": existing_provider,
+                }
+
+            cur.execute("""
+                INSERT INTO user_identities (
+                    user_id,
+                    provider,
+                    provider_user_id
+                )
+                VALUES (%s, %s, %s)
+                RETURNING *
+            """, (
+                user_id,
+                clean_provider,
+                clean_provider_user_id,
+            ))
+
+            return {
+                "status": "linked",
+                "identity": cur.fetchone(),
+            }
 
 def get_user_by_qr_token(token: str):
     with get_connection() as conn:
