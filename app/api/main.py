@@ -628,6 +628,8 @@ class LinkTelegramSendCodeRequest(BaseModel):
 class LinkTelegramVerifyRequest(BaseModel):
     telegram_id: str
     code: str
+    provider: str
+    provider_user_id: str
 
 
 @app.post("/auth/link-telegram/send-code")
