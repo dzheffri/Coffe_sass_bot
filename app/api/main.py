@@ -314,7 +314,74 @@ def user_shops(telegram_user_id: int):
         "shops": shops
     }
 
+@app.get("/account/{user_id}/shops")
+def account_shops(user_id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    cs.id AS shop_id,
+                    cs.name AS db_shop_name,
+                    cs.city AS city,
+                    sc.cups,
+                    sc.free_coffee_balance,
+                    sc.last_activity_at,
+                    owner.telegram_user_id AS owner_telegram_id
+                FROM shop_clients sc
+                JOIN users client ON client.id = sc.user_id
+                JOIN coffee_shops cs ON cs.id = sc.shop_id
+                LEFT JOIN shop_admins sa
+                    ON sa.shop_id = cs.id AND sa.role = 'owner'
+                LEFT JOIN users owner
+                    ON owner.id = sa.user_id
+                WHERE client.id = %s
+                ORDER BY sc.last_activity_at DESC NULLS LAST, cs.name
+                """,
+                (user_id,)
+            )
 
+            rows = cur.fetchall()
+
+    shops = []
+
+    for row in rows:
+        owner_id = row["owner_telegram_id"]
+        profile = {}
+
+        if owner_id:
+            profile_data = get_shop_profile(owner_id)
+
+            if profile_data and profile_data.get("ok"):
+                profile = profile_data.get("shop") or {}
+
+        shops.append({
+            "shop_id": row["shop_id"],
+            "owner_telegram_id": owner_id,
+            "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
+            "city": row["city"] or "",
+            "last_activity_at": (
+                row["last_activity_at"].isoformat()
+                if row["last_activity_at"]
+                else None
+            ),
+            "subtitle": profile.get("subtitle") or "",
+            "address": profile.get("address") or "",
+            "work_from": profile.get("work_from") or "",
+            "work_to": profile.get("work_to") or "",
+            "instagram": profile.get("instagram") or "",
+            "description": profile.get("description") or "",
+            "logo_url": profile.get("logo_url") or "",
+            "cover_url": profile.get("cover_url") or "",
+            "news": profile.get("news") or [],
+            "cups": row["cups"] or 0,
+            "free_coffee_balance": row["free_coffee_balance"] or 0,
+        })
+
+    return {
+        "ok": True,
+        "shops": shops,
+    }
 @app.get("/users/{telegram_user_id}/stats")
 def user_stats(telegram_user_id: int):
     with get_connection() as conn:
