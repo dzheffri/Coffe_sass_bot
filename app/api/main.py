@@ -423,7 +423,87 @@ def telegram_miniapp_auth(data: TelegramMiniAppAuthRequest):
         "telegram_id": telegram_id
     }
 
+class TestIdentityAuthRequest(BaseModel):
+    provider: str
+    provider_user_id: str
+    telegram_id: int | None = None
 
+
+@app.post("/auth/test-identity")
+def test_identity_auth(data: TestIdentityAuthRequest):
+    provider = data.provider.strip().lower()
+    provider_user_id = data.provider_user_id.strip()
+
+    if provider not in {"apple", "google"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Підтримуються тільки apple або google",
+        )
+
+    if not provider_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="provider_user_id is required",
+        )
+
+    # 1. Такой Apple/Google аккаунт уже привязан.
+    existing_user = get_user_by_identity(
+        provider,
+        provider_user_id,
+    )
+
+    if existing_user:
+        return {
+            "ok": True,
+            "status": "existing",
+            "user_id": existing_user["id"],
+            "telegram_user_id": existing_user["telegram_user_id"],
+            "personal_qr_token": existing_user["personal_qr_token"],
+        }
+
+    # 2. Пользователь уже вошёл через Telegram —
+    # привязываем Apple/Google к его существующему users.id.
+    if data.telegram_id is not None:
+        telegram_user = get_user_by_identity(
+            "telegram",
+            str(data.telegram_id),
+        )
+
+        if not telegram_user:
+            raise HTTPException(
+                status_code=404,
+                detail="Telegram користувача не знайдено",
+            )
+
+        link_user_identity(
+            telegram_user["id"],
+            provider,
+            provider_user_id,
+        )
+
+        return {
+            "ok": True,
+            "status": "linked",
+            "user_id": telegram_user["id"],
+            "telegram_user_id": telegram_user["telegram_user_id"],
+            "personal_qr_token": telegram_user["personal_qr_token"],
+        }
+
+    # 3. Совершенно новый пользователь без Telegram.
+    result = create_user_with_identity(
+        provider=provider,
+        provider_user_id=provider_user_id,
+    )
+
+    user = result["user"]
+
+    return {
+        "ok": True,
+        "status": "created",
+        "user_id": user["id"],
+        "telegram_user_id": user["telegram_user_id"],
+        "personal_qr_token": user["personal_qr_token"],
+    }
 @app.post("/auth/admin-ticket")
 def admin_ticket_auth(data: AdminTicketAuthRequest):
     ticket_row = consume_admin_login_ticket(data.ticket)
