@@ -226,6 +226,10 @@ def init_db():
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS panel_mode TEXT NOT NULL DEFAULT 'auto'
             """)
+            cur.execute("""
+                ALTER TABLE users
+                ALTER COLUMN telegram_user_id DROP NOT NULL
+            """)            
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS admin_login_tickets (
