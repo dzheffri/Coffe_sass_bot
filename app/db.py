@@ -242,7 +242,44 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_admin_login_tickets_ticket
                 ON admin_login_tickets(ticket)
             """)
+            # Способы авторизации пользователя:
+            # Telegram, Apple и другие в будущем.
+            # Все они привязываются к внутреннему users.id.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_identities (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id)
+                        ON DELETE CASCADE,
+                    provider TEXT NOT NULL,
+                    provider_user_id TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+                    UNIQUE(provider, provider_user_id),
+                    UNIQUE(user_id, provider)
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_identities_user_id
+                ON user_identities(user_id)
+            """)
+
+            # Безопасно переносим существующие Telegram ID.
+            # Пользователи, QR, чашки и подарки не изменяются.
+            cur.execute("""
+                INSERT INTO user_identities (
+                    user_id,
+                    provider,
+                    provider_user_id
+                )
+                SELECT
+                    id,
+                    'telegram',
+                    telegram_user_id::TEXT
+                FROM users
+                ON CONFLICT (provider, provider_user_id) DO NOTHING
+            """)
 
 init_db()
 
