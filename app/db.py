@@ -272,18 +272,19 @@ def init_db():
             # Безопасно переносим существующие Telegram ID.
             # Пользователи, QR, чашки и подарки не изменяются.
             cur.execute("""
-                INSERT INTO user_identities (
-                    user_id,
-                    provider,
-                    provider_user_id
-                )
-                SELECT
-                    id,
-                    'telegram',
-                    telegram_user_id::TEXT
-                FROM users
-                ON CONFLICT (provider, provider_user_id) DO NOTHING
-            """)
+    INSERT INTO user_identities (
+        user_id,
+        provider,
+        provider_user_id
+    )
+    SELECT
+        id,
+        'telegram',
+        telegram_user_id::TEXT
+    FROM users
+    WHERE telegram_user_id IS NOT NULL
+    ON CONFLICT (provider, provider_user_id) DO NOTHING
+""")
 
 init_db()
 
