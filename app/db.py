@@ -396,7 +396,72 @@ def link_user_identity(user_id: int, provider: str, provider_user_id: str):
                 "status": "linked",
                 "identity": cur.fetchone(),
             }
+def create_user_with_identity(
+    provider: str,
+    provider_user_id: str,
+    username: str | None = None,
+    full_name: str | None = None,
+):
+    clean_provider = (provider or "").strip().lower()
+    clean_provider_user_id = str(provider_user_id or "").strip()
 
+    if not clean_provider:
+        raise ValueError("provider is required")
+
+    if not clean_provider_user_id:
+        raise ValueError("provider_user_id is required")
+
+    existing_user = get_user_by_identity(
+        clean_provider,
+        clean_provider_user_id,
+    )
+
+    if existing_user:
+        return {
+            "status": "existing",
+            "user": existing_user,
+        }
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (
+                    telegram_user_id,
+                    username,
+                    full_name,
+                    personal_qr_token
+                )
+                VALUES (NULL, %s, %s, %s)
+                RETURNING *
+            """, (
+                username,
+                full_name,
+                str(uuid.uuid4()),
+            ))
+
+            user = cur.fetchone()
+
+            cur.execute("""
+                INSERT INTO user_identities (
+                    user_id,
+                    provider,
+                    provider_user_id
+                )
+                VALUES (%s, %s, %s)
+                RETURNING *
+            """, (
+                user["id"],
+                clean_provider,
+                clean_provider_user_id,
+            ))
+
+            identity = cur.fetchone()
+
+            return {
+                "status": "created",
+                "user": user,
+                "identity": identity,
+            }
 def get_user_by_qr_token(token: str):
     with get_connection() as conn:
         with conn.cursor() as cur:
