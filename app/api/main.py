@@ -34,6 +34,9 @@ from app.db import (
     remove_shop_admin,
     get_subscription,
     consume_admin_login_ticket,
+    get_user_by_identity,
+    link_user_identity,
+    create_user_with_identity,
 )
 
 
