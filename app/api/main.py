@@ -36,6 +36,7 @@ from app.db import (
     consume_admin_login_ticket,
     get_user_by_identity,
     link_user_identity,
+    unlink_user_identity,
     create_user_with_identity,
 )
 
@@ -641,7 +642,62 @@ def test_identity_auth(data: TestIdentityAuthRequest):
         "message": "Unknown action",
     }
 
+class UnlinkIdentityRequest(BaseModel):
+    user_id: int
+    provider: str
 
+
+@app.post("/auth/unlink-identity")
+def unlink_identity(data: UnlinkIdentityRequest):
+    provider = data.provider.strip().lower()
+
+    if provider not in {"apple", "google"}:
+        return {
+            "ok": False,
+            "status": "invalid_provider",
+            "message": "Можна відв'язати тільки Apple або Google",
+        }
+
+    result = unlink_user_identity(
+        user_id=data.user_id,
+        provider=provider,
+    )
+
+    status = result["status"]
+
+    if status == "unlinked":
+        return {
+            "ok": True,
+            "status": "unlinked",
+            "message": "Спосіб входу успішно відв'язано",
+        }
+
+    if status == "not_linked":
+        return {
+            "ok": True,
+            "status": "not_linked",
+            "message": "Цей спосіб входу вже не прив'язаний",
+        }
+
+    if status == "last_identity":
+        return {
+            "ok": False,
+            "status": "last_identity",
+            "message": "Неможливо відв'язати єдиний спосіб входу",
+        }
+
+    if status == "user_not_found":
+        return {
+            "ok": False,
+            "status": "user_not_found",
+            "message": "Користувача не знайдено",
+        }
+
+    return {
+        "ok": False,
+        "status": status,
+        "message": "Не вдалося відв'язати спосіб входу",
+    }
 
 
 class LinkTelegramSendCodeRequest(BaseModel):
