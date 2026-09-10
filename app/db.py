@@ -517,6 +517,88 @@ def link_user_identity(user_id: int, provider: str, provider_user_id: str):
                 "status": "linked",
                 "identity": cur.fetchone(),
             }
+ def unlink_user_identity(user_id: int, provider: str):
+    clean_provider = (provider or "").strip().lower()
+
+    if clean_provider not in {"apple", "google"}:
+        return {
+            "status": "invalid_provider"
+        }
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            # Проверяем, существует ли пользователь.
+            cur.execute("""
+                SELECT *
+                FROM users
+                WHERE id = %s
+                LIMIT 1
+            """, (user_id,))
+
+            user = cur.fetchone()
+
+            if not user:
+                return {
+                    "status": "user_not_found"
+                }
+
+            # Ищем конкретную Apple / Google привязку.
+            cur.execute("""
+                SELECT *
+                FROM user_identities
+                WHERE user_id = %s
+                  AND provider = %s
+                LIMIT 1
+            """, (
+                user_id,
+                clean_provider,
+            ))
+
+            identity = cur.fetchone()
+
+            if not identity:
+                return {
+                    "status": "not_linked"
+                }
+
+            # Проверяем, останется ли хотя бы один другой способ
+            # восстановить доступ к этому users.id.
+            cur.execute("""
+                SELECT COUNT(*) AS count
+                FROM user_identities
+                WHERE user_id = %s
+                  AND id <> %s
+            """, (
+                user_id,
+                identity["id"],
+            ))
+
+            row = cur.fetchone()
+            remaining_identities = row["count"] if row else 0
+
+            if remaining_identities == 0:
+                return {
+                    "status": "last_identity"
+                }
+
+            # Удаляем ТОЛЬКО Apple / Google identity.
+            # users, QR, чашки, подарки, история и Telegram
+            # не изменяются.
+            cur.execute("""
+                DELETE FROM user_identities
+                WHERE id = %s
+                RETURNING *
+            """, (identity["id"],))
+
+            deleted_identity = cur.fetchone()
+
+            return {
+                "status": "unlinked",
+                "identity": deleted_identity,
+            }
+
+           
 def create_user_with_identity(
     provider: str,
     provider_user_id: str,
