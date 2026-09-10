@@ -517,7 +517,7 @@ def link_user_identity(user_id: int, provider: str, provider_user_id: str):
                 "status": "linked",
                 "identity": cur.fetchone(),
             }
- def unlink_user_identity(user_id: int, provider: str):
+def unlink_user_identity(user_id: int, provider: str):
     clean_provider = (provider or "").strip().lower()
 
     if clean_provider not in {"apple", "google"}:
