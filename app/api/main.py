@@ -247,7 +247,31 @@ def user_qr(telegram_user_id: int):
         "qr_token": row["personal_qr_token"]
     }
 
+@app.get("/account/{user_id}/qr")
+def account_qr(user_id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT personal_qr_token
+                FROM users
+                WHERE id = %s
+                """,
+                (user_id,)
+            )
 
+            row = cur.fetchone()
+
+    if not row:
+        return {
+            "ok": False,
+            "message": "Користувача не знайдено"
+        }
+
+    return {
+        "ok": True,
+        "qr_token": row["personal_qr_token"]
+    }
 @app.get("/users/{telegram_user_id}/shops")
 def user_shops(telegram_user_id: int):
     with get_connection() as conn:
