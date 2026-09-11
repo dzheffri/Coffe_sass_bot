@@ -711,6 +711,11 @@ class LinkTelegramVerifyRequest(BaseModel):
     provider: str
     provider_user_id: str
 
+class MergeTelegramVerifyRequest(BaseModel):
+    telegram_id: str
+    code: str
+    current_user_id: int
+
 
 @app.post("/auth/link-telegram/send-code")
 async def link_telegram_send_code(data: LinkTelegramSendCodeRequest):
@@ -847,6 +852,139 @@ def link_telegram_verify(data: LinkTelegramVerifyRequest):
         "status": "linked",
         "message": "Профіль успішно прив’язано",
         "user_id": telegram_user["id"],
+        "telegram_user_id": telegram_user["telegram_user_id"],
+        "personal_qr_token": telegram_user["personal_qr_token"],
+    }
+
+@app.post("/auth/merge-telegram/verify")
+def merge_telegram_verify(data: MergeTelegramVerifyRequest):
+    telegram_id = data.telegram_id.strip()
+    code = data.code.strip()
+
+    # -------------------------------------------------
+    # 1. Проверяем Telegram ID
+    # -------------------------------------------------
+
+    if not telegram_id.isdigit():
+        return {
+            "ok": False,
+            "message": "Некоректний Telegram ID",
+        }
+
+    # -------------------------------------------------
+    # 2. Проверяем код
+    # -------------------------------------------------
+
+    storage_key = f"link:{telegram_id}"
+    saved = codes_storage.get(storage_key)
+
+    if not saved:
+        return {
+            "ok": False,
+            "message": "Код не знайдено",
+        }
+
+    if datetime.utcnow() > saved["expires_at"]:
+        del codes_storage[storage_key]
+
+        return {
+            "ok": False,
+            "message": "Термін дії коду завершився",
+        }
+
+    if code != saved["code"]:
+        return {
+            "ok": False,
+            "message": "Невірний код",
+        }
+
+    # -------------------------------------------------
+    # 3. Находим Telegram-профиль
+    # -------------------------------------------------
+
+    telegram_user = get_user_by_identity(
+        "telegram",
+        telegram_id,
+    )
+
+    if not telegram_user:
+        return {
+            "ok": False,
+            "message": "Профіль Telegram не знайдено",
+        }
+
+    target_user_id = telegram_user["id"]
+
+    # -------------------------------------------------
+    # 4. Если это уже один и тот же аккаунт
+    # -------------------------------------------------
+
+    if data.current_user_id == target_user_id:
+        del codes_storage[storage_key]
+
+        return {
+            "ok": True,
+            "status": "already_merged",
+            "message": "Telegram вже підключено до цього профілю",
+            "user_id": target_user_id,
+            "telegram_user_id": telegram_user["telegram_user_id"],
+            "personal_qr_token": telegram_user["personal_qr_token"],
+        }
+
+    # -------------------------------------------------
+    # 5. Объединяем аккаунты
+    #
+    # current_user_id = текущий Google/Apple users.id
+    # target_user_id  = существующий Telegram users.id
+    # -------------------------------------------------
+
+    try:
+        result = merge_users(
+            source_user_id=data.current_user_id,
+            target_user_id=target_user_id,
+        )
+
+    except Exception as e:
+        print("MERGE USERS ERROR:", e)
+
+        return {
+            "ok": False,
+            "status": "merge_error",
+            "message": "Не вдалося об’єднати профілі",
+        }
+
+    status = result["status"]
+
+    # -------------------------------------------------
+    # 6. Обрабатываем результат
+    # -------------------------------------------------
+
+    if status not in {
+        "merged",
+        "already_merged",
+    }:
+        return {
+            "ok": False,
+            "status": status,
+            "message": (
+                "Не вдалося об’єднати профілі"
+                if status != "provider_conflict"
+                else "Ці профілі мають різні способи входу одного типу"
+            ),
+        }
+
+    # Код удаляем только после успешного merge.
+    del codes_storage[storage_key]
+
+    # -------------------------------------------------
+    # 7. Возвращаем итоговый Telegram users.id
+    # -------------------------------------------------
+
+    return {
+        "ok": True,
+        "status": status,
+        "message": "Профілі успішно об’єднано",
+        "user_id": target_user_id,
         "telegram_user_id": telegram_user["telegram_user_id"],
         "personal_qr_token": telegram_user["personal_qr_token"],
     }
