@@ -289,18 +289,62 @@ def init_db():
 init_db()
 
 
-def ensure_user(telegram_user_id: int, username: str | None, full_name: str | None):
+def ensure_user(
+    telegram_user_id: int,
+    username: str | None,
+    full_name: str | None,
+):
     with get_connection() as conn:
         with conn.cursor() as cur:
+
+            # -------------------------------------------------
+            # 1. Создаём пользователя или обновляем его данные
+            # -------------------------------------------------
+
             cur.execute("""
-                INSERT INTO users (telegram_user_id, username, full_name, personal_qr_token)
+                INSERT INTO users (
+                    telegram_user_id,
+                    username,
+                    full_name,
+                    personal_qr_token
+                )
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (telegram_user_id) DO UPDATE
                 SET username = EXCLUDED.username,
                     full_name = EXCLUDED.full_name
                 RETURNING *
-            """, (telegram_user_id, username, full_name, str(uuid.uuid4())))
-            return cur.fetchone()
+            """, (
+                telegram_user_id,
+                username,
+                full_name,
+                str(uuid.uuid4()),
+            ))
+
+            user = cur.fetchone()
+
+            # -------------------------------------------------
+            # 2. Гарантируем Telegram identity
+            #
+            # Важно для Apple / Google / merge авторизации.
+            # Даже старый пользователь после /start будет
+            # автоматически восстановлен в user_identities.
+            # -------------------------------------------------
+
+            cur.execute("""
+                INSERT INTO user_identities (
+                    user_id,
+                    provider,
+                    provider_user_id
+                )
+                VALUES (%s, 'telegram', %s)
+                ON CONFLICT (provider, provider_user_id)
+                DO NOTHING
+            """, (
+                user["id"],
+                str(telegram_user_id),
+            ))
+
+            return user
 
 
 def get_user_by_telegram_id(telegram_user_id: int):
