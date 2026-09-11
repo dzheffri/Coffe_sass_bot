@@ -517,6 +517,432 @@ def link_user_identity(user_id: int, provider: str, provider_user_id: str):
                 "status": "linked",
                 "identity": cur.fetchone(),
             }
+
+def merge_users(source_user_id: int, target_user_id: int):
+    """
+    Объединяет два users.id.
+
+    source_user_id:
+        текущий Apple / Google профиль.
+
+    target_user_id:
+        старый Telegram профиль, который становится основным.
+
+    Все бонусы и история source переносятся в target.
+    """
+
+    if source_user_id == target_user_id:
+        return {
+            "status": "already_merged",
+            "user_id": target_user_id,
+        }
+
+    # ВАЖНО:
+    # get_connection() обычно autocommit=True.
+    # Для merge нужна одна настоящая транзакция.
+    conn = get_connection()
+
+    try:
+        conn.autocommit = False
+
+        with conn.cursor() as cur:
+
+            # -------------------------------------------------
+            # 1. Блокируем оба аккаунта на время merge
+            # -------------------------------------------------
+
+            cur.execute("""
+                SELECT *
+                FROM users
+                WHERE id IN (%s, %s)
+                ORDER BY id
+                FOR UPDATE
+            """, (
+                source_user_id,
+                target_user_id,
+            ))
+
+            users = cur.fetchall()
+
+            if len(users) != 2:
+                conn.rollback()
+                return {
+                    "status": "user_not_found",
+                }
+
+            # -------------------------------------------------
+            # 2. Проверяем identities.
+            #
+            # Нельзя получить два разных Google или два разных
+            # Apple на одном итоговом users.id.
+            # -------------------------------------------------
+
+            cur.execute("""
+                SELECT *
+                FROM user_identities
+                WHERE user_id IN (%s, %s)
+                ORDER BY id
+            """, (
+                source_user_id,
+                target_user_id,
+            ))
+
+            identities = cur.fetchall()
+
+            source_identities = {
+                row["provider"]: row
+                for row in identities
+                if row["user_id"] == source_user_id
+            }
+
+            target_identities = {
+                row["provider"]: row
+                for row in identities
+                if row["user_id"] == target_user_id
+            }
+
+            for provider, source_identity in source_identities.items():
+                target_identity = target_identities.get(provider)
+
+                if (
+                    target_identity
+                    and target_identity["provider_user_id"]
+                    != source_identity["provider_user_id"]
+                ):
+                    conn.rollback()
+                    return {
+                        "status": "provider_conflict",
+                        "provider": provider,
+                    }
+
+            # -------------------------------------------------
+            # 3. shop_clients
+            #
+            # Если оба аккаунта были в одной кофейне —
+            # складываем прогресс.
+            #
+            # cups может стать >= 7, поэтому сразу превращаем
+            # полные семёрки в бесплатный кофе.
+            # -------------------------------------------------
+
+            cur.execute("""
+                SELECT *
+                FROM shop_clients
+                WHERE user_id = %s
+                ORDER BY id
+            """, (source_user_id,))
+
+            source_clients = cur.fetchall()
+
+            for source_client in source_clients:
+
+                cur.execute("""
+                    SELECT *
+                    FROM shop_clients
+                    WHERE shop_id = %s
+                      AND user_id = %s
+                    LIMIT 1
+                    FOR UPDATE
+                """, (
+                    source_client["shop_id"],
+                    target_user_id,
+                ))
+
+                target_client = cur.fetchone()
+
+                if target_client:
+
+                    combined_cups = (
+                        target_client["cups"]
+                        + source_client["cups"]
+                    )
+
+                    extra_free = combined_cups // 7
+                    remaining_cups = combined_cups % 7
+
+                    combined_free_balance = (
+                        target_client["free_coffee_balance"]
+                        + source_client["free_coffee_balance"]
+                        + extra_free
+                    )
+
+                    combined_total_scans = (
+                        target_client["total_scans"]
+                        + source_client["total_scans"]
+                    )
+
+                    combined_earned = (
+                        target_client["total_free_coffee_earned"]
+                        + source_client["total_free_coffee_earned"]
+                        + extra_free
+                    )
+
+                    combined_redeemed = (
+                        target_client["total_free_coffee_redeemed"]
+                        + source_client["total_free_coffee_redeemed"]
+                    )
+
+                    created_at = min(
+                        target_client["created_at"],
+                        source_client["created_at"],
+                    )
+
+                    last_activity_at = max(
+                        target_client["last_activity_at"],
+                        source_client["last_activity_at"],
+                    )
+
+                    cur.execute("""
+                        UPDATE shop_clients
+                        SET cups = %s,
+                            free_coffee_balance = %s,
+                            total_scans = %s,
+                            total_free_coffee_earned = %s,
+                            total_free_coffee_redeemed = %s,
+                            created_at = %s,
+                            last_activity_at = %s
+                        WHERE id = %s
+                    """, (
+                        remaining_cups,
+                        combined_free_balance,
+                        combined_total_scans,
+                        combined_earned,
+                        combined_redeemed,
+                        created_at,
+                        last_activity_at,
+                        target_client["id"],
+                    ))
+
+                    cur.execute("""
+                        DELETE FROM shop_clients
+                        WHERE id = %s
+                    """, (
+                        source_client["id"],
+                    ))
+
+                else:
+                    cur.execute("""
+                        UPDATE shop_clients
+                        SET user_id = %s
+                        WHERE id = %s
+                    """, (
+                        target_user_id,
+                        source_client["id"],
+                    ))
+
+            # -------------------------------------------------
+            # 4. История операций
+            # -------------------------------------------------
+
+            cur.execute("""
+                UPDATE transactions
+                SET user_id = %s
+                WHERE user_id = %s
+            """, (
+                target_user_id,
+                source_user_id,
+            ))
+
+            # Если source когда-либо был бариста/админом,
+            # сохраняем и ссылки admin_user_id в истории.
+            cur.execute("""
+                UPDATE transactions
+                SET admin_user_id = %s
+                WHERE admin_user_id = %s
+            """, (
+                target_user_id,
+                source_user_id,
+            ))
+
+            # -------------------------------------------------
+            # 5. reminder_logs
+            # -------------------------------------------------
+
+            cur.execute("""
+                UPDATE reminder_logs
+                SET user_id = %s
+                WHERE user_id = %s
+            """, (
+                target_user_id,
+                source_user_id,
+            ))
+
+            # -------------------------------------------------
+            # 6. touch_logs
+            # -------------------------------------------------
+
+            cur.execute("""
+                UPDATE touch_logs
+                SET user_id = %s
+                WHERE user_id = %s
+            """, (
+                target_user_id,
+                source_user_id,
+            ))
+
+            # -------------------------------------------------
+            # 7. return_logs
+            #
+            # Здесь есть UNIQUE(shop_id, user_id, touch_log_id).
+            # Сначала удаляем потенциальные дубли.
+            # -------------------------------------------------
+
+            cur.execute("""
+                DELETE FROM return_logs source
+                USING return_logs target
+                WHERE source.user_id = %s
+                  AND target.user_id = %s
+                  AND source.shop_id = target.shop_id
+                  AND source.touch_log_id = target.touch_log_id
+            """, (
+                source_user_id,
+                target_user_id,
+            ))
+
+            cur.execute("""
+                UPDATE return_logs
+                SET user_id = %s
+                WHERE user_id = %s
+            """, (
+                target_user_id,
+                source_user_id,
+            ))
+
+            # -------------------------------------------------
+            # 8. broadcasts
+            # -------------------------------------------------
+
+            cur.execute("""
+                UPDATE broadcasts
+                SET sender_user_id = %s
+                WHERE sender_user_id = %s
+            """, (
+                target_user_id,
+                source_user_id,
+            ))
+
+            # -------------------------------------------------
+            # 9. shop_admins
+            #
+            # UNIQUE(shop_id, user_id), поэтому сначала
+            # разбираем каждую запись source отдельно.
+            # -------------------------------------------------
+
+            cur.execute("""
+                SELECT *
+                FROM shop_admins
+                WHERE user_id = %s
+                ORDER BY id
+            """, (source_user_id,))
+
+            source_admins = cur.fetchall()
+
+            for source_admin in source_admins:
+
+                cur.execute("""
+                    SELECT *
+                    FROM shop_admins
+                    WHERE shop_id = %s
+                      AND user_id = %s
+                    LIMIT 1
+                """, (
+                    source_admin["shop_id"],
+                    target_user_id,
+                ))
+
+                target_admin = cur.fetchone()
+
+                if target_admin:
+
+                    # owner важнее admin
+                    final_role = (
+                        "owner"
+                        if (
+                            source_admin["role"] == "owner"
+                            or target_admin["role"] == "owner"
+                        )
+                        else "admin"
+                    )
+
+                    cur.execute("""
+                        UPDATE shop_admins
+                        SET role = %s
+                        WHERE id = %s
+                    """, (
+                        final_role,
+                        target_admin["id"],
+                    ))
+
+                    cur.execute("""
+                        DELETE FROM shop_admins
+                        WHERE id = %s
+                    """, (
+                        source_admin["id"],
+                    ))
+
+                else:
+
+                    cur.execute("""
+                        UPDATE shop_admins
+                        SET user_id = %s
+                        WHERE id = %s
+                    """, (
+                        target_user_id,
+                        source_admin["id"],
+                    ))
+
+            # -------------------------------------------------
+            # 10. Переносим Apple / Google identities
+            # -------------------------------------------------
+
+            for provider, source_identity in source_identities.items():
+
+                target_identity = target_identities.get(provider)
+
+                if target_identity:
+                    # Одинаковая identity уже есть на target.
+                    # Source-копию можно удалить.
+                    cur.execute("""
+                        DELETE FROM user_identities
+                        WHERE id = %s
+                    """, (
+                        source_identity["id"],
+                    ))
+
+                else:
+                    cur.execute("""
+                        UPDATE user_identities
+                        SET user_id = %s
+                        WHERE id = %s
+                    """, (
+                        target_user_id,
+                        source_identity["id"],
+                    ))
+
+            # -------------------------------------------------
+            # 11. Удаляем уже пустой source users.id
+            # -------------------------------------------------
+
+            cur.execute("""
+                DELETE FROM users
+                WHERE id = %s
+            """, (
+                source_user_id,
+            ))
+
+            conn.commit()
+
+            return {
+                "status": "merged",
+                "user_id": target_user_id,
+            }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 def unlink_user_identity(user_id: int, provider: str):
     clean_provider = (provider or "").strip().lower()
 
