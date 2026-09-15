@@ -586,12 +586,25 @@ def test_identity_auth(data: TestIdentityAuthRequest):
             "message": "Підтримуються тільки apple або google",
         }
 
-    if not provider_user_id:
+    # Для Google больше не доверяем provider_user_id от телефона.
+    # Проверяем настоящий Google ID Token и сами получаем Google sub.
+    if provider == "google":
+        payload = verify_google_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Google ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
+
+    # Apple пока работает по старой схеме.
+    if provider == "apple" and not provider_user_id:
         return {
             "ok": False,
             "message": "provider_user_id is required",
         }
-
     # -------------------------------------------------
     # 1. Проверяем, существует ли уже Apple/Google login
     # -------------------------------------------------
