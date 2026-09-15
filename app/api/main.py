@@ -840,7 +840,8 @@ async def link_telegram_send_code(data: LinkTelegramSendCodeRequest):
         "ok": True,
         "message": "Код надіслано у Telegram",
     }
-
+@app.post("/auth/link-telegram/verify")
+def link_telegram_verify(data: LinkTelegramVerifyRequest):
 
     telegram_id = data.telegram_id.strip()
     code = data.code.strip()
