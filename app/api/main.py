@@ -940,10 +940,7 @@ def link_telegram_verify(data: LinkTelegramVerifyRequest):
         "personal_qr_token": telegram_user["personal_qr_token"],
     }
 
-@app.post("/auth/merge-telegram/verify")
-def merge_telegram_verify(data: MergeTelegramVerifyRequest):
-    telegram_id = data.telegram_id.strip()
-    code = data.code.strip()
+
 @app.post("/auth/merge-telegram/verify")
 def merge_telegram_verify(data: MergeTelegramVerifyRequest):
     telegram_id = data.telegram_id.strip()
