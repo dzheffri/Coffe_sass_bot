@@ -781,6 +781,9 @@ class MergeTelegramVerifyRequest(BaseModel):
     telegram_id: str
     code: str
     current_user_id: int
+    provider: str
+    provider_user_id: str
+    id_token: str | None = None
 
 
 @app.post("/auth/link-telegram/send-code")
