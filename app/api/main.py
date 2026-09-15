@@ -775,6 +775,7 @@ class LinkTelegramVerifyRequest(BaseModel):
     code: str
     provider: str
     provider_user_id: str
+    id_token: str | None = None
 
 class MergeTelegramVerifyRequest(BaseModel):
     telegram_id: str
