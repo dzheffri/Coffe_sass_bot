@@ -569,10 +569,10 @@ def telegram_miniapp_auth(data: TelegramMiniAppAuthRequest):
 
 class TestIdentityAuthRequest(BaseModel):
     provider: str
-    provider_user_id: str
+    provider_user_id: str = ""
+    id_token: str | None = None
     action: str = "check"
     telegram_id: int | None = None
-
 
 @app.post("/auth/test-identity")
 def test_identity_auth(data: TestIdentityAuthRequest):
