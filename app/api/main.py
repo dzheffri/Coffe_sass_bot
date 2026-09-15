@@ -4,6 +4,8 @@ import random
 import json
 import hmac
 import hashlib
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone
 
@@ -117,7 +119,33 @@ class AddAdminRequest(BaseModel):
 
 
 codes_storage: dict[str, dict] = {}
+def verify_google_id_token(token: str):
+    if not token:
+        return None
 
+    try:
+        payload = id_token.verify_oauth2_token(
+            token,
+            google_requests.Request(),
+            audience=None,
+        )
+
+        if payload.get("iss") not in {
+            "accounts.google.com",
+            "https://accounts.google.com",
+        }:
+            return None
+
+        google_sub = payload.get("sub")
+
+        if not google_sub:
+            return None
+
+        return payload
+
+    except Exception as e:
+        print("GOOGLE TOKEN VERIFY ERROR:", e)
+        return None
 
 def validate_telegram_init_data(init_data: str, max_age_seconds: int = 86400):
     if not init_data:
