@@ -842,8 +842,6 @@ async def link_telegram_send_code(data: LinkTelegramSendCodeRequest):
     }
 
 
-@app.post("/auth/link-telegram/verify")
-def link_telegram_verify(data: LinkTelegramVerifyRequest):
     telegram_id = data.telegram_id.strip()
     code = data.code.strip()
     provider = data.provider.strip().lower()
@@ -855,7 +853,21 @@ def link_telegram_verify(data: LinkTelegramVerifyRequest):
             "message": "Некоректний спосіб входу",
         }
 
-    if not provider_user_id:
+    # Для Google не доверяем ID, который прислал телефон.
+    # Проверяем настоящий Google ID Token.
+    if provider == "google":
+        payload = verify_google_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Google ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
+
+    # Apple пока оставляем по старой схеме.
+    if provider == "apple" and not provider_user_id:
         return {
             "ok": False,
             "message": "provider_user_id is required",
