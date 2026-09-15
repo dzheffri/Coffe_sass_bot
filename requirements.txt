@@ -9,3 +9,4 @@ fastapi
 uvicorn
 pydantic
 python-multipart
+google-auth
