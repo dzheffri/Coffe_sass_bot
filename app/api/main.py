@@ -942,7 +942,25 @@ def link_telegram_verify(data: LinkTelegramVerifyRequest):
 def merge_telegram_verify(data: MergeTelegramVerifyRequest):
     telegram_id = data.telegram_id.strip()
     code = data.code.strip()
+provider = data.provider.strip().lower()
+provider_user_id = data.provider_user_id.strip()
 
+if provider not in {"apple", "google"}:
+    return {
+        "ok": False,
+        "message": "Некоректний спосіб входу",
+    }
+
+if provider == "google":
+    payload = verify_google_id_token(data.id_token or "")
+
+    if not payload:
+        return {
+            "ok": False,
+            "message": "Invalid Google ID token",
+        }
+
+    provider_user_id = str(payload["sub"])
     # -------------------------------------------------
     # 1. Проверяем Telegram ID
     # -------------------------------------------------
