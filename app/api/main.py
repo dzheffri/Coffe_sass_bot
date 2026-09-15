@@ -127,7 +127,7 @@ def verify_google_id_token(token: str):
         payload = id_token.verify_oauth2_token(
             token,
             google_requests.Request(),
-            audience=None,
+            audience=os.getenv("GOOGLE_CLIENT_ID"),
         )
 
         if payload.get("iss") not in {
