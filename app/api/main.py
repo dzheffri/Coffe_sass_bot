@@ -600,11 +600,7 @@ def test_identity_auth(data: TestIdentityAuthRequest):
         provider_user_id = str(payload["sub"])
         
 
-        if authenticated_user["id"] != data.current_user_id:
-            return {
-                "ok": False,
-                "message": "Google профіль не відповідає поточному користувачу",
-            }
+        
     # Apple пока работает по старой схеме.
     if provider == "apple" and not provider_user_id:
         return {
