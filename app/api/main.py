@@ -964,7 +964,22 @@ def merge_telegram_verify(data: MergeTelegramVerifyRequest):
             }
 
         provider_user_id = str(payload["sub"])
+        authenticated_user = get_user_by_identity(
+            provider,
+            provider_user_id,
+        )
 
+        if not authenticated_user:
+            return {
+                "ok": False,
+                "message": "Google профіль не знайдено",
+            }
+
+        if authenticated_user["id"] != data.current_user_id:
+            return {
+                "ok": False,
+                "message": "Google профіль не відповідає поточному користувачу",
+            }
     # -------------------------------------------------
     # 1. Проверяем Telegram ID
     # -------------------------------------------------
