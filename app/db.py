@@ -80,9 +80,12 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS shop_admins (
                     id BIGSERIAL PRIMARY KEY,
-                    shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
-                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    role TEXT NOT NULL CHECK (role IN ('admin', 'owner')),
+                    shop_id BIGINT NOT NULL
+                        REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL
+                        CHECK (role IN ('admin', 'owner')),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     UNIQUE(shop_id, user_id)
                 )
@@ -91,8 +94,10 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS shop_clients (
                     id BIGSERIAL PRIMARY KEY,
-                    shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
-                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    shop_id BIGINT NOT NULL
+                        REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
                     cups INTEGER NOT NULL DEFAULT 0,
                     free_coffee_balance INTEGER NOT NULL DEFAULT 0,
                     total_scans INTEGER NOT NULL DEFAULT 0,
@@ -107,10 +112,14 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS transactions (
                     id BIGSERIAL PRIMARY KEY,
-                    shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
-                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    admin_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    type TEXT NOT NULL CHECK (type IN ('add_cups', 'redeem_free')),
+                    shop_id BIGINT NOT NULL
+                        REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    admin_user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    type TEXT NOT NULL
+                        CHECK (type IN ('add_cups', 'redeem_free')),
                     cups_added INTEGER NOT NULL DEFAULT 0,
                     free_redeemed INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -120,9 +129,12 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     id BIGSERIAL PRIMARY KEY,
-                    shop_id BIGINT UNIQUE NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
-                    plan TEXT NOT NULL CHECK (plan IN ('trial', 'basic', 'pro')),
-                    status TEXT NOT NULL CHECK (status IN ('active', 'expired', 'blocked')),
+                    shop_id BIGINT UNIQUE NOT NULL
+                        REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    plan TEXT NOT NULL
+                        CHECK (plan IN ('trial', 'basic', 'pro')),
+                    status TEXT NOT NULL
+                        CHECK (status IN ('active', 'expired', 'blocked')),
                     expires_at TIMESTAMPTZ NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
@@ -131,8 +143,10 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS broadcasts (
                     id BIGSERIAL PRIMARY KEY,
-                    shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
-                    sender_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    shop_id BIGINT NOT NULL
+                        REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    sender_user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
                     text TEXT NOT NULL,
                     recipients_count INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -142,8 +156,10 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS reminder_logs (
                     id BIGSERIAL PRIMARY KEY,
-                    shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
-                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    shop_id BIGINT NOT NULL
+                        REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
                     reminder_type TEXT NOT NULL,
                     sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
@@ -152,21 +168,28 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS touch_logs (
                     id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
-                    type TEXT NOT NULL CHECK (type IN ('auto', 'broadcast', 'service')),
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    shop_id BIGINT NOT NULL
+                        REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    type TEXT NOT NULL
+                        CHECK (type IN ('auto', 'broadcast', 'service')),
                     sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
 
-            # НОВАЯ таблица — фиксированные возвраты, чтобы статистика не прыгала
+            # Фиксированные возвраты, чтобы статистика не прыгала.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS return_logs (
                     id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
-                    touch_log_id BIGINT NOT NULL REFERENCES touch_logs(id) ON DELETE CASCADE,
-                    touch_type TEXT NOT NULL CHECK (touch_type IN ('auto', 'broadcast')),
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    shop_id BIGINT NOT NULL
+                        REFERENCES coffee_shops(id) ON DELETE CASCADE,
+                    touch_log_id BIGINT NOT NULL
+                        REFERENCES touch_logs(id) ON DELETE CASCADE,
+                    touch_type TEXT NOT NULL
+                        CHECK (touch_type IN ('auto', 'broadcast')),
                     returned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     UNIQUE(shop_id, user_id, touch_log_id)
                 )
@@ -194,7 +217,12 @@ def init_db():
 
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_reminder_logs_lookup
-                ON reminder_logs(shop_id, user_id, reminder_type, sent_at DESC)
+                ON reminder_logs(
+                    shop_id,
+                    user_id,
+                    reminder_type,
+                    sent_at DESC
+                )
             """)
 
             cur.execute("""
@@ -219,102 +247,117 @@ def init_db():
 
             cur.execute("""
                 ALTER TABLE coffee_shops
-                ADD COLUMN IF NOT EXISTS pending_owner_telegram_id BIGINT NULL
+                ADD COLUMN IF NOT EXISTS
+                    pending_owner_telegram_id BIGINT NULL
             """)
 
             cur.execute("""
                 ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS panel_mode TEXT NOT NULL DEFAULT 'auto'
+                ADD COLUMN IF NOT EXISTS
+                    panel_mode TEXT NOT NULL DEFAULT 'auto'
             """)
+
             cur.execute("""
                 ALTER TABLE users
                 ALTER COLUMN telegram_user_id DROP NOT NULL
-            """)            
-        # =====================================================
-        # APPLE WALLET
-        # =====================================================
+            """)
 
-        cur.execute("""
-            ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS selected_card_design TEXT NOT NULL DEFAULT 'basic'
-        """)
+            # =====================================================
+            # APPLE WALLET
+            # =====================================================
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_passes (
-                user_id BIGINT PRIMARY KEY
-                    REFERENCES users(id) ON DELETE CASCADE,
+            cur.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS
+                    selected_card_design TEXT NOT NULL DEFAULT 'basic'
+            """)
 
-                serial_number TEXT UNIQUE NOT NULL,
-                authentication_token TEXT UNIQUE NOT NULL,
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_passes (
+                    user_id BIGINT PRIMARY KEY
+                        REFERENCES users(id) ON DELETE CASCADE,
 
-                update_tag BIGINT NOT NULL DEFAULT 1,
+                    serial_number TEXT UNIQUE NOT NULL,
+                    authentication_token TEXT UNIQUE NOT NULL,
 
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
+                    update_tag BIGINT NOT NULL DEFAULT 1,
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_device_registrations (
-                id BIGSERIAL PRIMARY KEY,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
 
-                device_library_identifier TEXT NOT NULL,
-                pass_type_identifier TEXT NOT NULL,
-                serial_number TEXT NOT NULL,
-                push_token TEXT NOT NULL,
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_device_registrations (
+                    id BIGSERIAL PRIMARY KEY,
 
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    device_library_identifier TEXT NOT NULL,
+                    pass_type_identifier TEXT NOT NULL,
+                    serial_number TEXT NOT NULL,
+                    push_token TEXT NOT NULL,
 
-                UNIQUE (
-                    device_library_identifier,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                    UNIQUE (
+                        device_library_identifier,
+                        pass_type_identifier,
+                        serial_number
+                    )
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                    idx_wallet_device_registrations_serial
+                ON wallet_device_registrations (
                     pass_type_identifier,
                     serial_number
                 )
-            )
-        """)
+            """)
 
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS
-            idx_wallet_device_registrations_serial
-            ON wallet_device_registrations (
-                pass_type_identifier,
-                serial_number
-            )
-        """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                    idx_wallet_device_registrations_device
+                ON wallet_device_registrations (
+                    device_library_identifier,
+                    pass_type_identifier
+                )
+            """)
 
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS
-            idx_wallet_device_registrations_device
-            ON wallet_device_registrations (
-                device_library_identifier,
-                pass_type_identifier
-            )
-        """)
-     cur.execute("""
-        CREATE TABLE IF NOT EXISTS admin_login_tickets (
-            id BIGSERIAL PRIMARY KEY,
-            ticket TEXT UNIQUE NOT NULL,
-            telegram_user_id BIGINT NOT NULL,
-            expires_at TIMESTAMPTZ NOT NULL,
-            used_at TIMESTAMPTZ NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)           
+            # =====================================================
+            # ADMIN LOGIN
+            # =====================================================
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_login_tickets (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket TEXT UNIQUE NOT NULL,
+                    telegram_user_id BIGINT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    used_at TIMESTAMPTZ NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
 
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_admin_login_tickets_ticket
                 ON admin_login_tickets(ticket)
             """)
-            # Способы авторизации пользователя:
-            # Telegram, Apple и другие в будущем.
-            # Все они привязываются к внутреннему users.id.
+
+            # =====================================================
+            # USER IDENTITIES
+            # Telegram, Apple, Google и другие способы авторизации.
+            # =====================================================
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_identities (
                     id BIGSERIAL PRIMARY KEY,
+
                     user_id BIGINT NOT NULL
                         REFERENCES users(id)
                         ON DELETE CASCADE,
+
                     provider TEXT NOT NULL,
                     provider_user_id TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -332,19 +375,19 @@ def init_db():
             # Безопасно переносим существующие Telegram ID.
             # Пользователи, QR, чашки и подарки не изменяются.
             cur.execute("""
-    INSERT INTO user_identities (
-        user_id,
-        provider,
-        provider_user_id
-    )
-    SELECT
-        id,
-        'telegram',
-        telegram_user_id::TEXT
-    FROM users
-    WHERE telegram_user_id IS NOT NULL
-    ON CONFLICT (provider, provider_user_id) DO NOTHING
-""")
+                INSERT INTO user_identities (
+                    user_id,
+                    provider,
+                    provider_user_id
+                )
+                SELECT
+                    id,
+                    'telegram',
+                    telegram_user_id::TEXT
+                FROM users
+                WHERE telegram_user_id IS NOT NULL
+                ON CONFLICT (provider, provider_user_id) DO NOTHING
+            """)
 
 init_db()
 
