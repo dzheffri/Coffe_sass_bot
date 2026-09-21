@@ -291,16 +291,16 @@ def init_db():
                 pass_type_identifier
             )
         """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS admin_login_tickets (
-                    id BIGSERIAL PRIMARY KEY,
-                    ticket TEXT UNIQUE NOT NULL,
-                    telegram_user_id BIGINT NOT NULL,
-                    expires_at TIMESTAMPTZ NOT NULL,
-                    used_at TIMESTAMPTZ NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
+     cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_login_tickets (
+            id BIGSERIAL PRIMARY KEY,
+            ticket TEXT UNIQUE NOT NULL,
+            telegram_user_id BIGINT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            used_at TIMESTAMPTZ NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)           
 
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_admin_login_tickets_ticket
