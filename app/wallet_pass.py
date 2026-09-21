@@ -51,12 +51,12 @@ WALLET_ASSETS_DIR = os.path.join(
 
 CARD_DESIGNS = {
     "basic": {
-        "title": "Класика",
-        "background": "rgb(242, 242, 242)",
-        "foreground": "rgb(30, 30, 30)",
-        "label": "rgb(90, 90, 90)",
-        "strip": "strip_basic",
-    },
+    "title": "Класика",
+    "background": "rgb(250, 235, 185)",
+    "foreground": "rgb(30, 30, 30)",
+    "label": "rgb(95, 82, 55)",
+    "strip": "strip_basic",
+},
     "gold": {
         "title": "Золота",
         "background": "rgb(225, 164, 45)",
@@ -279,7 +279,7 @@ def build_pass_json(
         "labelColor": design["label"],
 
         # Название рядом с логотипом
-        "logoText": "Наші",
+        
 
         # QR
         "barcodes": [
