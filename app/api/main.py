@@ -1746,55 +1746,72 @@ async def download_wallet_pass(user_id: int):
 # ---------------------------------------------------------
 
 @app.post("/wallet/pass/{user_id}/design")
-async def change_wallet_design(
+async def update_wallet_design(
     user_id: int,
-    body: WalletDesignRequest,
+    payload: WalletDesignRequest,
 ):
-
+    # Wallet для гостевого аккаунта не выдаём.
     if user_id == 32650:
         raise HTTPException(
             status_code=403,
             detail="Wallet is unavailable in guest mode",
         )
 
-    design_id = (
-        body.design_id or ""
-    ).strip().lower()
+    design_id = (payload.design_id or "").strip().lower()
 
     if design_id not in VALID_CARD_DESIGNS:
         raise HTTPException(
             status_code=400,
-            detail="Unknown card design",
+            detail="Invalid card design",
         )
 
-    wallet_data = get_or_create_wallet_pass(user_id)
-
-    if not wallet_data:
-        raise HTTPException(
-            status_code=404,
-            detail="User not found",
-        )
-
-    result = set_wallet_card_design(
-        user_id,
-        design_id,
+    # Сохраняем новый дизайн.
+    wallet_pass = set_wallet_card_design(
+        user_id=user_id,
+        design_id=design_id,
     )
 
-    if result is None:
+    if not wallet_pass:
         raise HTTPException(
-            status_code=400,
-            detail="Unable to change card design",
+            status_code=404,
+            detail="User or Wallet pass not found",
         )
 
-    updated_wallet = get_or_create_wallet_pass(user_id)
+    serial_number = wallet_pass["serial_number"]
+
+    # Находим все iPhone, где установлена эта карта.
+    push_tokens = get_wallet_push_tokens(
+        serial_number=serial_number
+    )
+
+    print(
+        "📲 WALLET UPDATE:",
+        f"user_id={user_id}",
+        f"design={design_id}",
+        f"serial={serial_number}",
+        f"devices={len(push_tokens)}",
+    )
+
+    # Отправляем тихий сигнал Apple Wallet.
+    # После него Wallet сам запросит свежий .pkpass.
+    push_result = {
+        "sent": 0,
+        "failed": 0,
+    }
+
+    if push_tokens:
+        push_result = await send_wallet_pushes(
+            push_tokens
+        )
 
     return {
         "ok": True,
+        "user_id": user_id,
         "design_id": design_id,
-        "serial_number": updated_wallet["serial_number"],
-        "update_tag": updated_wallet["update_tag"],
+        "serial_number": serial_number,
+        "registered_devices": len(push_tokens),
+        "push": push_result,
     }
-
 
 # ---------------------------------------------------------
 # APPLE WALLET WEB SERVICE
