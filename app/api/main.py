@@ -709,7 +709,44 @@ def test_identity_auth(data: TestIdentityAuthRequest):
         "ok": False,
         "message": "Unknown action",
     }
+# =========================================================
+# APPLE REVIEW GUEST LOGIN
+# =========================================================
 
+@app.post("/auth/guest")
+def guest_auth():
+    guest_user_id = 32650
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    telegram_user_id,
+                    personal_qr_token
+                FROM users
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (guest_user_id,)
+            )
+
+            user = cur.fetchone()
+
+    if not user:
+        return {
+            "ok": False,
+            "message": "Гостьовий профіль не знайдено",
+        }
+
+    return {
+        "ok": True,
+        "status": "guest",
+        "user_id": user["id"],
+        "telegram_user_id": user["telegram_user_id"],
+        "personal_qr_token": user["personal_qr_token"],
+    }
 class UnlinkIdentityRequest(BaseModel):
     user_id: int
     provider: str
