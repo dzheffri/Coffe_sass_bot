@@ -47,15 +47,6 @@ WALLET_ASSETS_DIR = os.path.join(
 
 # =========================================================
 # CARD DESIGNS
-#
-# IDs полностью совпадают с CardDesign.swift:
-#
-# basic
-# gold
-# fire
-# diamond
-# coffee
-# explorer
 # =========================================================
 
 CARD_DESIGNS = {
@@ -64,36 +55,42 @@ CARD_DESIGNS = {
         "background": "rgb(242, 242, 242)",
         "foreground": "rgb(30, 30, 30)",
         "label": "rgb(90, 90, 90)",
+        "strip": "strip_basic",
     },
     "gold": {
         "title": "Золота",
         "background": "rgb(225, 164, 45)",
         "foreground": "rgb(35, 25, 10)",
         "label": "rgb(90, 60, 10)",
+        "strip": "strip_gold",
     },
     "fire": {
         "title": "Вогонь",
         "background": "rgb(200, 55, 35)",
         "foreground": "rgb(255, 255, 255)",
         "label": "rgb(255, 220, 200)",
+        "strip": "strip_fire",
     },
     "diamond": {
         "title": "Діамант",
         "background": "rgb(60, 165, 215)",
         "foreground": "rgb(255, 255, 255)",
         "label": "rgb(220, 245, 255)",
+        "strip": "strip_diamond",
     },
     "coffee": {
         "title": "Кавоман",
         "background": "rgb(70, 45, 35)",
         "foreground": "rgb(255, 255, 255)",
         "label": "rgb(220, 200, 185)",
+        "strip": "strip_coffee",
     },
     "explorer": {
         "title": "Дослідник",
         "background": "rgb(45, 125, 105)",
         "foreground": "rgb(255, 255, 255)",
         "label": "rgb(210, 240, 230)",
+        "strip": "strip_explorer",
     },
 }
 
@@ -114,29 +111,14 @@ def normalize_design_id(design_id: str | None) -> str:
 
 
 def wallet_serial_number(user_id: int) -> str:
-    """
-    Постоянный serialNumber Wallet-карты пользователя.
-
-    Он не меняется при смене скина или баланса.
-    Благодаря этому Wallet понимает, что это обновление
-    уже существующей карты.
-    """
     return f"nashi-user-{user_id}"
 
 
 def generate_authentication_token() -> str:
-    """
-    Генерируется один раз и сохраняется в БД.
-    Используется Wallet для запросов обновления карты.
-    """
     return secrets.token_urlsafe(32)
 
 
 def load_wallet_asset(filename: str) -> bytes:
-    """
-    Загружает готовый брендовый PNG из app/wallet_assets.
-    """
-
     path = os.path.join(
         WALLET_ASSETS_DIR,
         filename,
@@ -163,13 +145,6 @@ def _require_env(name: str, value: str | None):
 
 
 def load_signing_material():
-    """
-    Загружает:
-    - приватный ключ Pass Type ID;
-    - Pass Type ID certificate;
-    - Apple WWDR intermediate certificate.
-    """
-
     _require_env(
         "WALLET_P12_BASE64",
         WALLET_P12_BASE64,
@@ -292,40 +267,21 @@ def build_pass_json(
         "organizationName": "Наші",
         "description": "Картка лояльності «Наші»",
 
-        # ---------------------------------------------
-        # UPDATE SERVICE
-        # ---------------------------------------------
-
+        # Автоматические обновления Wallet
         "webServiceURL": (
             WALLET_WEB_SERVICE_URL.rstrip("/")
         ),
+        "authenticationToken": authentication_token,
 
-        "authenticationToken": (
-            authentication_token
-        ),
+        # Цвета выбранного скина
+        "backgroundColor": design["background"],
+        "foregroundColor": design["foreground"],
+        "labelColor": design["label"],
 
-        # ---------------------------------------------
-        # DESIGN
-        # ---------------------------------------------
-
+        # Название рядом с логотипом
         "logoText": "Наші",
 
-        "backgroundColor": (
-            design["background"]
-        ),
-
-        "foregroundColor": (
-            design["foreground"]
-        ),
-
-        "labelColor": (
-            design["label"]
-        ),
-
-        # ---------------------------------------------
         # QR
-        # ---------------------------------------------
-
         "barcodes": [
             {
                 "format": "PKBarcodeFormatQR",
@@ -335,7 +291,6 @@ def build_pass_json(
             }
         ],
 
-        # Оставляем для совместимости.
         "barcode": {
             "format": "PKBarcodeFormatQR",
             "message": qr_message,
@@ -343,12 +298,10 @@ def build_pass_json(
             "altText": "Наші",
         },
 
-        # ---------------------------------------------
-        # STORE CARD
-        # ---------------------------------------------
-
+        # Карта
         "storeCard": {
 
+            # Справа сверху
             "headerFields": [
                 {
                     "key": "skin",
@@ -357,33 +310,36 @@ def build_pass_json(
                 }
             ],
 
-            "primaryFields": [
+            # ВАЖНО:
+            # primaryFields оставляем пустым.
+            # Именно primary раньше делал имя огромным.
+            "primaryFields": [],
+
+            # Имя + основные показатели нормального размера
+            "secondaryFields": [
                 {
                     "key": "member",
                     "label": "ВЛАСНИК",
                     "value": display_name,
-                }
-            ],
-
-            "secondaryFields": [
+                },
                 {
                     "key": "cups",
                     "label": "КАВИ",
                     "value": int(total_cups),
                 },
+            ],
+
+            "auxiliaryFields": [
                 {
                     "key": "gifts",
                     "label": "ПОДАРУНКИ",
                     "value": int(total_free),
                 },
-            ],
-
-            "auxiliaryFields": [
                 {
                     "key": "shops",
                     "label": "КАВʼЯРНІ",
                     "value": int(shops_count),
-                }
+                },
             ],
 
             "backFields": [
@@ -391,8 +347,8 @@ def build_pass_json(
                     "key": "about",
                     "label": "ПРО КАРТКУ",
                     "value": (
-                        "Персональна картка "
-                        "програми лояльності «Наші»."
+                        "Персональна картка програми "
+                        "лояльності «Наші»."
                     ),
                 },
                 {
@@ -420,10 +376,6 @@ def build_pass_json(
 def create_manifest(
     files: dict[str, bytes],
 ) -> bytes:
-    """
-    Apple Pass manifest:
-    filename -> SHA-1 содержимого файла.
-    """
 
     manifest = {}
 
@@ -447,10 +399,6 @@ def create_manifest(
 def sign_manifest(
     manifest_data: bytes,
 ) -> bytes:
-    """
-    Создаёт detached PKCS#7 signature
-    для manifest.json.
-    """
 
     (
         private_key,
@@ -500,9 +448,6 @@ def create_pkpass(
     shops_count: int,
     authentication_token: str,
 ) -> bytes:
-    """
-    Полностью собирает подписанный .pkpass в памяти.
-    """
 
     if not personal_qr_token:
         raise RuntimeError(
@@ -514,11 +459,18 @@ def create_pkpass(
             "Wallet authentication token is missing"
         )
 
+    design_id = normalize_design_id(
+        selected_design
+    )
+
+    design = CARD_DESIGNS[design_id]
+    strip_name = design["strip"]
+
     pass_json = build_pass_json(
         user_id=user_id,
         full_name=full_name,
         personal_qr_token=personal_qr_token,
-        selected_design=selected_design,
+        selected_design=design_id,
         total_cups=total_cups,
         total_free=total_free,
         shops_count=shops_count,
@@ -533,7 +485,7 @@ def create_pkpass(
             separators=(",", ":"),
         ).encode("utf-8"),
 
-        # Настоящие брендовые assets «Наші».
+        # Настоящий логотип/иконка «Наші»
         "icon.png": load_wallet_asset(
             "icon.png"
         ),
@@ -553,15 +505,24 @@ def create_pkpass(
         "logo@3x.png": load_wallet_asset(
             "logo@3x.png"
         ),
+
+        # Фирменная широкая картинка.
+        # Имя внутри .pkpass всегда strip.png,
+        # но исходный файл выбирается по скину.
+        "strip.png": load_wallet_asset(
+            f"{strip_name}.png"
+        ),
+
+        "strip@2x.png": load_wallet_asset(
+            f"{strip_name}@2x.png"
+        ),
     }
 
     manifest_data = create_manifest(
         files
     )
 
-    files["manifest.json"] = (
-        manifest_data
-    )
+    files["manifest.json"] = manifest_data
 
     signature = sign_manifest(
         manifest_data
@@ -593,9 +554,6 @@ def create_pkpass(
 def wallet_last_modified_http_date(
     updated_at: datetime | None,
 ) -> str:
-    """
-    HTTP-date для ответа Wallet Web Service.
-    """
 
     value = (
         updated_at
