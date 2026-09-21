@@ -51,7 +51,7 @@ from app.db import (
     get_wallet_push_tokens,
     get_wallet_user_stats,
 )
-from app.wallet_pass import (
+from app.wallet_push import send_wallet_pushes (
     WALLET_PASS_TYPE_ID,
     VALID_CARD_DESIGNS,
     create_pkpass,
