@@ -1750,14 +1750,15 @@ async def update_wallet_design(
     user_id: int,
     payload: WalletDesignRequest,
 ):
-    # Wallet для гостевого аккаунта не выдаём.
     if user_id == 32650:
         raise HTTPException(
             status_code=403,
             detail="Wallet is unavailable in guest mode",
         )
 
-    design_id = (payload.design_id or "").strip().lower()
+    design_id = (
+        payload.design_id or ""
+    ).strip().lower()
 
     if design_id not in VALID_CARD_DESIGNS:
         raise HTTPException(
@@ -1765,23 +1766,35 @@ async def update_wallet_design(
             detail="Invalid card design",
         )
 
-    # Сохраняем новый дизайн.
-    wallet_pass = set_wallet_card_design(
-        user_id=user_id,
-        design_id=design_id,
-    )
+    # Сначала гарантируем, что Wallet-pass существует.
+    wallet_data = get_or_create_wallet_pass(user_id)
 
-    if not wallet_pass:
+    if not wallet_data:
         raise HTTPException(
             status_code=404,
-            detail="User or Wallet pass not found",
+            detail="User not found",
         )
 
-    serial_number = wallet_pass["serial_number"]
+    # Меняем дизайн и увеличиваем update_tag.
+    result = set_wallet_card_design(
+        user_id,
+        design_id,
+    )
 
-    # Находим все iPhone, где установлена эта карта.
+    if result is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to change card design",
+        )
+
+    # Получаем уже обновлённую Wallet-карту.
+    updated_wallet = get_or_create_wallet_pass(user_id)
+
+    serial_number = updated_wallet["serial_number"]
+
+    # Все iPhone, где установлена эта карта.
     push_tokens = get_wallet_push_tokens(
-        serial_number=serial_number
+        serial_number
     )
 
     print(
@@ -1792,8 +1805,6 @@ async def update_wallet_design(
         f"devices={len(push_tokens)}",
     )
 
-    # Отправляем тихий сигнал Apple Wallet.
-    # После него Wallet сам запросит свежий .pkpass.
     push_result = {
         "sent": 0,
         "failed": 0,
@@ -1806,9 +1817,9 @@ async def update_wallet_design(
 
     return {
         "ok": True,
-        "user_id": user_id,
         "design_id": design_id,
         "serial_number": serial_number,
+        "update_tag": updated_wallet["update_tag"],
         "registered_devices": len(push_tokens),
         "push": push_result,
     }
