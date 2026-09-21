@@ -9,7 +9,7 @@ from google.auth.transport import requests as google_requests
 from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request, Response, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -41,8 +41,22 @@ from app.db import (
     merge_users,
     unlink_user_identity,
     create_user_with_identity,
+    get_or_create_wallet_pass,
+    get_wallet_pass_by_serial,
+    set_wallet_card_design,
+    touch_wallet_pass,
+    register_wallet_device,
+    unregister_wallet_device,
+    get_wallet_device_serials,
+    get_wallet_push_tokens,
+    get_wallet_user_stats,
 )
-
+from app.wallet_pass import (
+    WALLET_PASS_TYPE_ID,
+    VALID_CARD_DESIGNS,
+    create_pkpass,
+    wallet_last_modified_http_date,
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
@@ -1619,3 +1633,425 @@ async def upload_image(file: UploadFile = File(...)):
     }
 # persistence test
 # postgres persistence test 2026-09-07
+# =========================================================
+# APPLE WALLET
+# =========================================================
+
+
+class WalletDesignRequest(BaseModel):
+    design_id: str
+
+
+class WalletPushTokenRequest(BaseModel):
+    pushToken: str
+
+
+class WalletLogRequest(BaseModel):
+    logs: list[str]
+
+
+def _wallet_authorized(
+    authorization: str | None,
+    authentication_token: str,
+) -> bool:
+    """
+    Проверяет стандартный заголовок Apple Wallet:
+
+    Authorization: ApplePass <authenticationToken>
+    """
+
+    if not authorization:
+        return False
+
+    expected = f"ApplePass {authentication_token}"
+
+    return hmac.compare_digest(
+        authorization.strip(),
+        expected,
+    )
+
+
+def _build_wallet_pkpass(wallet_data):
+    """
+    Собирает актуальную версию карты пользователя.
+    """
+
+    stats = get_wallet_user_stats(
+        wallet_data["user_id"]
+    )
+
+    return create_pkpass(
+        user_id=wallet_data["user_id"],
+        full_name=wallet_data["full_name"],
+        personal_qr_token=wallet_data["personal_qr_token"],
+        selected_design=wallet_data["selected_card_design"],
+        total_cups=stats["total_cups"],
+        total_free=stats["total_free"],
+        shops_count=stats["shops_count"],
+        authentication_token=wallet_data["authentication_token"],
+    )
+
+
+# ---------------------------------------------------------
+# НАШЕ ПРИЛОЖЕНИЕ:
+# первоначальное получение Wallet-карты
+# ---------------------------------------------------------
+
+@app.get("/wallet/pass/{user_id}")
+async def download_wallet_pass(user_id: int):
+
+    # Общему Apple Review guest-профилю
+    # настоящую Wallet-карту не выдаём.
+    if user_id == 32650:
+        raise HTTPException(
+            status_code=403,
+            detail="Wallet is unavailable in guest mode",
+        )
+
+    wallet_data = get_or_create_wallet_pass(user_id)
+
+    if not wallet_data:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    try:
+        pkpass = _build_wallet_pkpass(wallet_data)
+    except Exception as exc:
+        print(
+            "WALLET BUILD ERROR:",
+            repr(exc),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create Wallet pass",
+        )
+
+    return Response(
+        content=pkpass,
+        media_type="application/vnd.apple.pkpass",
+        headers={
+            "Content-Disposition":
+                'attachment; filename="nashi.pkpass"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# ---------------------------------------------------------
+# НАШЕ ПРИЛОЖЕНИЕ:
+# выбор дизайна карты
+# ---------------------------------------------------------
+
+@app.post("/wallet/pass/{user_id}/design")
+async def change_wallet_design(
+    user_id: int,
+    body: WalletDesignRequest,
+):
+
+    if user_id == 32650:
+        raise HTTPException(
+            status_code=403,
+            detail="Wallet is unavailable in guest mode",
+        )
+
+    design_id = (
+        body.design_id or ""
+    ).strip().lower()
+
+    if design_id not in VALID_CARD_DESIGNS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown card design",
+        )
+
+    wallet_data = get_or_create_wallet_pass(user_id)
+
+    if not wallet_data:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    result = set_wallet_card_design(
+        user_id,
+        design_id,
+    )
+
+    if result is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to change card design",
+        )
+
+    updated_wallet = get_or_create_wallet_pass(user_id)
+
+    return {
+        "ok": True,
+        "design_id": design_id,
+        "serial_number": updated_wallet["serial_number"],
+        "update_tag": updated_wallet["update_tag"],
+    }
+
+
+# ---------------------------------------------------------
+# APPLE WALLET WEB SERVICE
+#
+# Регистрация устройства для обновлений.
+# Apple вызывает этот endpoint автоматически после
+# добавления карты в Wallet.
+# ---------------------------------------------------------
+
+@app.post(
+    "/v1/devices/{device_library_identifier}"
+    "/registrations/{pass_type_identifier}/{serial_number}"
+)
+async def wallet_register_device(
+    device_library_identifier: str,
+    pass_type_identifier: str,
+    serial_number: str,
+    body: WalletPushTokenRequest,
+    authorization: str | None = Header(
+        default=None,
+        alias="Authorization",
+    ),
+):
+
+    if pass_type_identifier != WALLET_PASS_TYPE_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="Pass not found",
+        )
+
+    wallet_data = get_wallet_pass_by_serial(
+        serial_number
+    )
+
+    if not wallet_data:
+        raise HTTPException(
+            status_code=404,
+            detail="Pass not found",
+        )
+
+    if not _wallet_authorized(
+        authorization,
+        wallet_data["authentication_token"],
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+        )
+
+    push_token = (body.pushToken or "").strip()
+
+    if not push_token:
+        raise HTTPException(
+            status_code=400,
+            detail="pushToken is required",
+        )
+
+    created = register_wallet_device(
+        device_library_identifier,
+        pass_type_identifier,
+        serial_number,
+        push_token,
+    )
+
+    # Apple ожидает 201 для новой регистрации
+    # и 200, если регистрация уже существовала.
+    return Response(
+        status_code=201 if created else 200
+    )
+
+
+# ---------------------------------------------------------
+# APPLE WALLET WEB SERVICE
+# удаление регистрации
+# ---------------------------------------------------------
+
+@app.delete(
+    "/v1/devices/{device_library_identifier}"
+    "/registrations/{pass_type_identifier}/{serial_number}"
+)
+async def wallet_unregister_device(
+    device_library_identifier: str,
+    pass_type_identifier: str,
+    serial_number: str,
+    authorization: str | None = Header(
+        default=None,
+        alias="Authorization",
+    ),
+):
+
+    if pass_type_identifier != WALLET_PASS_TYPE_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="Pass not found",
+        )
+
+    wallet_data = get_wallet_pass_by_serial(
+        serial_number
+    )
+
+    if not wallet_data:
+        raise HTTPException(
+            status_code=404,
+            detail="Pass not found",
+        )
+
+    if not _wallet_authorized(
+        authorization,
+        wallet_data["authentication_token"],
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+        )
+
+    unregister_wallet_device(
+        device_library_identifier,
+        pass_type_identifier,
+        serial_number,
+    )
+
+    return Response(status_code=200)
+
+
+# ---------------------------------------------------------
+# APPLE WALLET WEB SERVICE
+# какие карты на устройстве изменились
+# ---------------------------------------------------------
+
+@app.get(
+    "/v1/devices/{device_library_identifier}"
+    "/registrations/{pass_type_identifier}"
+)
+async def wallet_get_updated_passes(
+    device_library_identifier: str,
+    pass_type_identifier: str,
+    passesUpdatedSince: str | None = None,
+):
+
+    if pass_type_identifier != WALLET_PASS_TYPE_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="Pass type not found",
+        )
+
+    updated_since = None
+
+    if passesUpdatedSince:
+        try:
+            updated_since = int(
+                passesUpdatedSince
+            )
+        except ValueError:
+            updated_since = None
+
+    result = get_wallet_device_serials(
+        device_library_identifier,
+        pass_type_identifier,
+        updated_since,
+    )
+
+    serial_numbers = result["serial_numbers"]
+
+    if not serial_numbers:
+        return Response(status_code=204)
+
+    return {
+        "serialNumbers": serial_numbers,
+        "lastUpdated": result["last_updated"],
+    }
+
+
+# ---------------------------------------------------------
+# APPLE WALLET WEB SERVICE
+# Wallet запрашивает новую версию .pkpass
+# ---------------------------------------------------------
+
+@app.get(
+    "/v1/passes/{pass_type_identifier}/{serial_number}"
+)
+async def wallet_get_updated_pass(
+    pass_type_identifier: str,
+    serial_number: str,
+    authorization: str | None = Header(
+        default=None,
+        alias="Authorization",
+    ),
+):
+
+    if pass_type_identifier != WALLET_PASS_TYPE_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="Pass not found",
+        )
+
+    wallet_data = get_wallet_pass_by_serial(
+        serial_number
+    )
+
+    if not wallet_data:
+        raise HTTPException(
+            status_code=404,
+            detail="Pass not found",
+        )
+
+    if not _wallet_authorized(
+        authorization,
+        wallet_data["authentication_token"],
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+        )
+
+    try:
+        pkpass = _build_wallet_pkpass(
+            wallet_data
+        )
+    except Exception as exc:
+        print(
+            "WALLET UPDATE BUILD ERROR:",
+            repr(exc),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create Wallet pass",
+        )
+
+    last_modified = wallet_last_modified_http_date(
+        wallet_data["updated_at"]
+    )
+
+    return Response(
+        content=pkpass,
+        media_type="application/vnd.apple.pkpass",
+        headers={
+            "Last-Modified": last_modified,
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+# ---------------------------------------------------------
+# APPLE WALLET WEB SERVICE
+# диагностические сообщения от Wallet
+# ---------------------------------------------------------
+
+@app.post("/v1/log")
+async def wallet_log_messages(
+    body: WalletLogRequest,
+):
+
+    for message in body.logs:
+        print(
+            "APPLE WALLET LOG:",
+            message,
+        )
+
+    return Response(status_code=200)
