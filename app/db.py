@@ -230,7 +230,67 @@ def init_db():
                 ALTER TABLE users
                 ALTER COLUMN telegram_user_id DROP NOT NULL
             """)            
+        # =====================================================
+        # APPLE WALLET
+        # =====================================================
 
+        cur.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS selected_card_design TEXT NOT NULL DEFAULT 'basic'
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_passes (
+                user_id BIGINT PRIMARY KEY
+                    REFERENCES users(id) ON DELETE CASCADE,
+
+                serial_number TEXT UNIQUE NOT NULL,
+                authentication_token TEXT UNIQUE NOT NULL,
+
+                update_tag BIGINT NOT NULL DEFAULT 1,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_device_registrations (
+                id BIGSERIAL PRIMARY KEY,
+
+                device_library_identifier TEXT NOT NULL,
+                pass_type_identifier TEXT NOT NULL,
+                serial_number TEXT NOT NULL,
+                push_token TEXT NOT NULL,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                UNIQUE (
+                    device_library_identifier,
+                    pass_type_identifier,
+                    serial_number
+                )
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_wallet_device_registrations_serial
+            ON wallet_device_registrations (
+                pass_type_identifier,
+                serial_number
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_wallet_device_registrations_device
+            ON wallet_device_registrations (
+                device_library_identifier,
+                pass_type_identifier
+            )
+        """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS admin_login_tickets (
                     id BIGSERIAL PRIMARY KEY,
@@ -2251,4 +2311,407 @@ def consume_admin_login_ticket(ticket: str):
             """, (clean_ticket,))
 
             return cur.fetchone()
+# =========================================================
+# APPLE WALLET
+# =========================================================
 
+WALLET_CARD_DESIGNS = {
+    "basic",
+    "gold",
+    "fire",
+    "diamond",
+    "coffee",
+    "explorer",
+}
+
+
+def get_or_create_wallet_pass(user_id: int):
+    """
+    Возвращает Wallet-состояние пользователя.
+    Если Wallet-карта ещё не создавалась — создаёт её.
+    """
+
+    serial_number = f"nashi-user-{user_id}"
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    u.id AS user_id,
+                    u.full_name,
+                    u.personal_qr_token,
+                    u.selected_card_design,
+                    wp.serial_number,
+                    wp.authentication_token,
+                    wp.update_tag,
+                    wp.created_at,
+                    wp.updated_at
+                FROM users u
+                LEFT JOIN wallet_passes wp
+                    ON wp.user_id = u.id
+                WHERE u.id = %s
+                """,
+                (user_id,),
+            )
+
+            row = cur.fetchone()
+
+            if not row:
+                return None
+
+            if row["serial_number"]:
+                return row
+
+            authentication_token = uuid.uuid4().hex + uuid.uuid4().hex
+
+            cur.execute(
+                """
+                INSERT INTO wallet_passes (
+                    user_id,
+                    serial_number,
+                    authentication_token
+                )
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (
+                    user_id,
+                    serial_number,
+                    authentication_token,
+                ),
+            )
+
+            cur.execute(
+                """
+                SELECT
+                    u.id AS user_id,
+                    u.full_name,
+                    u.personal_qr_token,
+                    u.selected_card_design,
+                    wp.serial_number,
+                    wp.authentication_token,
+                    wp.update_tag,
+                    wp.created_at,
+                    wp.updated_at
+                FROM users u
+                JOIN wallet_passes wp
+                    ON wp.user_id = u.id
+                WHERE u.id = %s
+                """,
+                (user_id,),
+            )
+
+            return cur.fetchone()
+
+
+def get_wallet_pass_by_serial(serial_number: str):
+    """
+    Находит пользователя и Wallet-карту по serialNumber.
+    Используется самим Apple Wallet при обновлении pass.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    u.id AS user_id,
+                    u.full_name,
+                    u.personal_qr_token,
+                    u.selected_card_design,
+                    wp.serial_number,
+                    wp.authentication_token,
+                    wp.update_tag,
+                    wp.created_at,
+                    wp.updated_at
+                FROM wallet_passes wp
+                JOIN users u
+                    ON u.id = wp.user_id
+                WHERE wp.serial_number = %s
+                """,
+                (serial_number,),
+            )
+
+            return cur.fetchone()
+
+
+def set_wallet_card_design(
+    user_id: int,
+    design_id: str,
+):
+    """
+    Меняет выбранный дизайн пользователя
+    и помечает Wallet-pass как обновлённый.
+    """
+
+    design_id = (design_id or "").strip().lower()
+
+    if design_id not in WALLET_CARD_DESIGNS:
+        return None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET selected_card_design = %s
+                WHERE id = %s
+                RETURNING id
+                """,
+                (
+                    design_id,
+                    user_id,
+                ),
+            )
+
+            user = cur.fetchone()
+
+            if not user:
+                return None
+
+            cur.execute(
+                """
+                UPDATE wallet_passes
+                SET
+                    update_tag = update_tag + 1,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            return design_id
+
+
+def touch_wallet_pass(user_id: int):
+    """
+    Помечает pass как изменённый.
+
+    Эту функцию позже вызываем после начисления/списания
+    кофе, чтобы Wallet получил новые цифры.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE wallet_passes
+                SET
+                    update_tag = update_tag + 1,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                RETURNING
+                    serial_number,
+                    update_tag,
+                    updated_at
+                """,
+                (user_id,),
+            )
+
+            return cur.fetchone()
+
+
+def register_wallet_device(
+    device_library_identifier: str,
+    pass_type_identifier: str,
+    serial_number: str,
+    push_token: str,
+):
+    """
+    Регистрирует iPhone для обновлений Wallet-карты.
+
+    Возвращает True, если регистрация новая.
+    Возвращает False, если такое устройство уже было.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO wallet_device_registrations (
+                    device_library_identifier,
+                    pass_type_identifier,
+                    serial_number,
+                    push_token
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (
+                    device_library_identifier,
+                    pass_type_identifier,
+                    serial_number
+                )
+                DO NOTHING
+                RETURNING id
+                """,
+                (
+                    device_library_identifier,
+                    pass_type_identifier,
+                    serial_number,
+                    push_token,
+                ),
+            )
+
+            return cur.fetchone() is not None
+
+
+def unregister_wallet_device(
+    device_library_identifier: str,
+    pass_type_identifier: str,
+    serial_number: str,
+):
+    """
+    Удаляет регистрацию Wallet-карты с устройства.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM wallet_device_registrations
+                WHERE device_library_identifier = %s
+                  AND pass_type_identifier = %s
+                  AND serial_number = %s
+                RETURNING id
+                """,
+                (
+                    device_library_identifier,
+                    pass_type_identifier,
+                    serial_number,
+                ),
+            )
+
+            return cur.fetchone() is not None
+
+
+def get_wallet_device_serials(
+    device_library_identifier: str,
+    pass_type_identifier: str,
+    passes_updated_since: int | None = None,
+):
+    """
+    Возвращает serialNumber карт на конкретном устройстве.
+
+    Если Apple передал passesUpdatedSince —
+    возвращаем только более новые версии.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            if passes_updated_since is None:
+                cur.execute(
+                    """
+                    SELECT
+                        wp.serial_number,
+                        wp.update_tag
+                    FROM wallet_device_registrations wdr
+                    JOIN wallet_passes wp
+                        ON wp.serial_number = wdr.serial_number
+                    WHERE wdr.device_library_identifier = %s
+                      AND wdr.pass_type_identifier = %s
+                    ORDER BY wp.update_tag ASC
+                    """,
+                    (
+                        device_library_identifier,
+                        pass_type_identifier,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        wp.serial_number,
+                        wp.update_tag
+                    FROM wallet_device_registrations wdr
+                    JOIN wallet_passes wp
+                        ON wp.serial_number = wdr.serial_number
+                    WHERE wdr.device_library_identifier = %s
+                      AND wdr.pass_type_identifier = %s
+                      AND wp.update_tag > %s
+                    ORDER BY wp.update_tag ASC
+                    """,
+                    (
+                        device_library_identifier,
+                        pass_type_identifier,
+                        passes_updated_since,
+                    ),
+                )
+
+            rows = cur.fetchall()
+
+            if not rows:
+                return {
+                    "serial_numbers": [],
+                    "last_updated": None,
+                }
+
+            return {
+                "serial_numbers": [
+                    row["serial_number"]
+                    for row in rows
+                ],
+                "last_updated": str(
+                    max(row["update_tag"] for row in rows)
+                ),
+            }
+
+
+def get_wallet_push_tokens(serial_number: str):
+    """
+    Все pushToken устройств, где установлена эта карта.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT push_token
+                FROM wallet_device_registrations
+                WHERE serial_number = %s
+                """,
+                (serial_number,),
+            )
+
+            return [
+                row["push_token"]
+                for row in cur.fetchall()
+            ]
+
+
+def get_wallet_user_stats(user_id: int):
+    """
+    Данные, которые показываем непосредственно
+    на Apple Wallet карте.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(SUM(sc.total_scans), 0) AS total_cups,
+                    COALESCE(
+                        SUM(sc.free_coffee_balance),
+                        0
+                    ) AS total_free,
+                    COUNT(sc.id) AS shops_count
+                FROM shop_clients sc
+                WHERE sc.user_id = %s
+                """,
+                (user_id,),
+            )
+
+            row = cur.fetchone()
+
+            return {
+                "total_cups": int(
+                    row["total_cups"] or 0
+                ),
+                "total_free": int(
+                    row["total_free"] or 0
+                ),
+                "shops_count": int(
+                    row["shops_count"] or 0
+                ),
+            }
