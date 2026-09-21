@@ -51,13 +51,14 @@ from app.db import (
     get_wallet_push_tokens,
     get_wallet_user_stats,
 )
-from app.wallet_push import send_wallet_pushes (
+from app.wallet_pass import (
     WALLET_PASS_TYPE_ID,
     VALID_CARD_DESIGNS,
     create_pkpass,
     wallet_last_modified_http_date,
 )
 
+from app.wallet_push import send_wallet_pushes
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 
