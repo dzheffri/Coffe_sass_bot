@@ -12,3 +12,4 @@ python-multipart
 google-auth
 requests
 cryptography
+httpx[http2]
