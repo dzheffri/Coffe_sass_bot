@@ -11,3 +11,4 @@ pydantic
 python-multipart
 google-auth
 requests
+cryptography
