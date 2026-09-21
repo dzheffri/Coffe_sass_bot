@@ -7,15 +7,13 @@ import secrets
 import zipfile
 from datetime import datetime, timezone
 
-import qrcode
-from PIL import Image, ImageDraw
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.serialization.pkcs7 import (
     PKCS7Options,
     PKCS7SignatureBuilder,
 )
-from cryptography import x509
 
 
 # =========================================================
@@ -39,6 +37,11 @@ WALLET_WWDR_BASE64 = os.getenv("WALLET_WWDR_BASE64")
 WALLET_WEB_SERVICE_URL = os.getenv(
     "WALLET_WEB_SERVICE_URL",
     "https://coffesassbot-production.up.railway.app",
+)
+
+WALLET_ASSETS_DIR = os.path.join(
+    os.path.dirname(__file__),
+    "wallet_assets",
 )
 
 
@@ -114,8 +117,7 @@ def wallet_serial_number(user_id: int) -> str:
     """
     Постоянный serialNumber Wallet-карты пользователя.
 
-    ВАЖНО:
-    Он НЕ меняется при смене скина или баланса.
+    Он не меняется при смене скина или баланса.
     Благодаря этому Wallet понимает, что это обновление
     уже существующей карты.
     """
@@ -130,13 +132,34 @@ def generate_authentication_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def load_wallet_asset(filename: str) -> bytes:
+    """
+    Загружает готовый брендовый PNG из app/wallet_assets.
+    """
+
+    path = os.path.join(
+        WALLET_ASSETS_DIR,
+        filename,
+    )
+
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            f"Wallet asset not found: {path}"
+        )
+
+    with open(path, "rb") as file:
+        return file.read()
+
+
 # =========================================================
 # CERTIFICATES
 # =========================================================
 
 def _require_env(name: str, value: str | None):
     if not value:
-        raise RuntimeError(f"{name} is not configured")
+        raise RuntimeError(
+            f"{name} is not configured"
+        )
 
 
 def load_signing_material():
@@ -147,12 +170,25 @@ def load_signing_material():
     - Apple WWDR intermediate certificate.
     """
 
-    _require_env("WALLET_P12_BASE64", WALLET_P12_BASE64)
-    _require_env("WALLET_P12_PASSWORD", WALLET_P12_PASSWORD)
-    _require_env("WALLET_WWDR_BASE64", WALLET_WWDR_BASE64)
+    _require_env(
+        "WALLET_P12_BASE64",
+        WALLET_P12_BASE64,
+    )
+
+    _require_env(
+        "WALLET_P12_PASSWORD",
+        WALLET_P12_PASSWORD,
+    )
+
+    _require_env(
+        "WALLET_WWDR_BASE64",
+        WALLET_WWDR_BASE64,
+    )
 
     try:
-        p12_data = base64.b64decode(WALLET_P12_BASE64)
+        p12_data = base64.b64decode(
+            WALLET_P12_BASE64
+        )
     except Exception as exc:
         raise RuntimeError(
             "WALLET_P12_BASE64 contains invalid Base64"
@@ -181,18 +217,26 @@ def load_signing_material():
         )
 
     try:
-        wwdr_data = base64.b64decode(WALLET_WWDR_BASE64)
+        wwdr_data = base64.b64decode(
+            WALLET_WWDR_BASE64
+        )
     except Exception as exc:
         raise RuntimeError(
             "WALLET_WWDR_BASE64 contains invalid Base64"
         ) from exc
 
     try:
-        wwdr_certificate = x509.load_der_x509_certificate(wwdr_data)
+        wwdr_certificate = (
+            x509.load_der_x509_certificate(
+                wwdr_data
+            )
+        )
     except ValueError:
         try:
-            wwdr_certificate = x509.load_pem_x509_certificate(
-                wwdr_data
+            wwdr_certificate = (
+                x509.load_pem_x509_certificate(
+                    wwdr_data
+                )
             )
         except Exception as exc:
             raise RuntimeError(
@@ -205,76 +249,6 @@ def load_signing_material():
         wwdr_certificate,
         additional_certificates or [],
     )
-
-
-# =========================================================
-# IMAGES
-# =========================================================
-
-def _png_bytes(image: Image.Image) -> bytes:
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def create_icon(size: int) -> bytes:
-    """
-    Временный серверный icon для первой рабочей версии.
-
-    Позже спокойно заменим его на финальный брендовый
-    asset «Наші» без изменения архитектуры Wallet.
-    """
-
-    image = Image.new(
-        "RGB",
-        (size, size),
-        (245, 236, 215),
-    )
-
-    draw = ImageDraw.Draw(image)
-
-    margin = max(2, size // 7)
-
-    draw.rounded_rectangle(
-        (
-            margin,
-            margin,
-            size - margin,
-            size - margin,
-        ),
-        radius=max(2, size // 5),
-        fill=(72, 52, 38),
-    )
-
-    return _png_bytes(image)
-
-
-def create_logo(width: int, height: int) -> bytes:
-    """
-    Простой брендовый placeholder.
-    Финальное изображение «Наші» можно заменить позже.
-    """
-
-    image = Image.new(
-        "RGBA",
-        (width, height),
-        (0, 0, 0, 0),
-    )
-
-    draw = ImageDraw.Draw(image)
-
-    draw.rounded_rectangle(
-        (
-            2,
-            2,
-            width - 2,
-            height - 2,
-        ),
-        radius=max(4, height // 4),
-        fill=(72, 52, 38, 255),
-    )
-
-    return _png_bytes(image)
 
 
 # =========================================================
@@ -293,12 +267,20 @@ def build_pass_json(
     authentication_token: str,
 ) -> dict:
 
-    design_id = normalize_design_id(selected_design)
+    design_id = normalize_design_id(
+        selected_design
+    )
+
     design = CARD_DESIGNS[design_id]
 
-    display_name = (full_name or "").strip() or "Кавоман"
+    display_name = (
+        (full_name or "").strip()
+        or "Кавоман"
+    )
 
-    qr_message = f"coffee:{personal_qr_token}"
+    qr_message = (
+        f"coffee:{personal_qr_token}"
+    )
 
     return {
         "formatVersion": 1,
@@ -308,28 +290,41 @@ def build_pass_json(
         "teamIdentifier": WALLET_TEAM_ID,
 
         "organizationName": "Наші",
-        "description": "Картка лояльності Наші",
+        "description": "Картка лояльності «Наші»",
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # UPDATE SERVICE
-        # -------------------------------------------------
+        # ---------------------------------------------
 
-        "webServiceURL": WALLET_WEB_SERVICE_URL.rstrip("/"),
-        "authenticationToken": authentication_token,
+        "webServiceURL": (
+            WALLET_WEB_SERVICE_URL.rstrip("/")
+        ),
 
-        # -------------------------------------------------
+        "authenticationToken": (
+            authentication_token
+        ),
+
+        # ---------------------------------------------
         # DESIGN
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         "logoText": "Наші",
 
-        "backgroundColor": design["background"],
-        "foregroundColor": design["foreground"],
-        "labelColor": design["label"],
+        "backgroundColor": (
+            design["background"]
+        ),
 
-        # -------------------------------------------------
+        "foregroundColor": (
+            design["foreground"]
+        ),
+
+        "labelColor": (
+            design["label"]
+        ),
+
+        # ---------------------------------------------
         # QR
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         "barcodes": [
             {
@@ -340,7 +335,7 @@ def build_pass_json(
             }
         ],
 
-        # Старый ключ оставляем для совместимости.
+        # Оставляем для совместимости.
         "barcode": {
             "format": "PKBarcodeFormatQR",
             "message": qr_message,
@@ -348,11 +343,12 @@ def build_pass_json(
             "altText": "Наші",
         },
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # STORE CARD
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         "storeCard": {
+
             "headerFields": [
                 {
                     "key": "skin",
@@ -364,7 +360,7 @@ def build_pass_json(
             "primaryFields": [
                 {
                     "key": "member",
-                    "label": "ВЛАСНИК КАРТКИ",
+                    "label": "ВЛАСНИК",
                     "value": display_name,
                 }
             ],
@@ -393,15 +389,24 @@ def build_pass_json(
             "backFields": [
                 {
                     "key": "about",
-                    "label": "Наші",
+                    "label": "ПРО КАРТКУ",
                     "value": (
-                        "Персональна картка програми лояльності «Наші»."
+                        "Персональна картка "
+                        "програми лояльності «Наші»."
                     ),
                 },
                 {
                     "key": "design",
-                    "label": "Стиль картки",
+                    "label": "СТИЛЬ КАРТКИ",
                     "value": design["title"],
+                },
+                {
+                    "key": "usage",
+                    "label": "ЯК КОРИСТУВАТИСЯ",
+                    "value": (
+                        "Покажіть QR-код баристі "
+                        "під час покупки."
+                    ),
                 },
             ],
         },
@@ -412,7 +417,9 @@ def build_pass_json(
 # MANIFEST
 # =========================================================
 
-def create_manifest(files: dict[str, bytes]) -> bytes:
+def create_manifest(
+    files: dict[str, bytes],
+) -> bytes:
     """
     Apple Pass manifest:
     filename -> SHA-1 содержимого файла.
@@ -421,7 +428,9 @@ def create_manifest(files: dict[str, bytes]) -> bytes:
     manifest = {}
 
     for filename, data in files.items():
-        manifest[filename] = hashlib.sha1(data).hexdigest()
+        manifest[filename] = (
+            hashlib.sha1(data).hexdigest()
+        )
 
     return json.dumps(
         manifest,
@@ -435,9 +444,12 @@ def create_manifest(files: dict[str, bytes]) -> bytes:
 # SIGNATURE
 # =========================================================
 
-def sign_manifest(manifest_data: bytes) -> bytes:
+def sign_manifest(
+    manifest_data: bytes,
+) -> bytes:
     """
-    Создаёт detached PKCS#7 signature для manifest.json.
+    Создаёт detached PKCS#7 signature
+    для manifest.json.
     """
 
     (
@@ -447,8 +459,9 @@ def sign_manifest(manifest_data: bytes) -> bytes:
         _additional_certificates,
     ) = load_signing_material()
 
-    builder = PKCS7SignatureBuilder().set_data(
-        manifest_data
+    builder = (
+        PKCS7SignatureBuilder()
+        .set_data(manifest_data)
     )
 
     builder = builder.add_signer(
@@ -513,28 +526,46 @@ def create_pkpass(
     )
 
     files: dict[str, bytes] = {
+
         "pass.json": json.dumps(
             pass_json,
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8"),
 
-        # icon обязателен для Wallet pass.
-        "icon.png": create_icon(29),
-        "icon@2x.png": create_icon(58),
-        "icon@3x.png": create_icon(87),
+        # Настоящие брендовые assets «Наші».
+        "icon.png": load_wallet_asset(
+            "icon.png"
+        ),
+        "icon@2x.png": load_wallet_asset(
+            "icon@2x.png"
+        ),
+        "icon@3x.png": load_wallet_asset(
+            "icon@3x.png"
+        ),
 
-        # Logo пока генерируем сервером.
-        "logo.png": create_logo(160, 50),
-        "logo@2x.png": create_logo(320, 100),
-        "logo@3x.png": create_logo(480, 150),
+        "logo.png": load_wallet_asset(
+            "logo.png"
+        ),
+        "logo@2x.png": load_wallet_asset(
+            "logo@2x.png"
+        ),
+        "logo@3x.png": load_wallet_asset(
+            "logo@3x.png"
+        ),
     }
 
-    manifest_data = create_manifest(files)
+    manifest_data = create_manifest(
+        files
+    )
 
-    files["manifest.json"] = manifest_data
+    files["manifest.json"] = (
+        manifest_data
+    )
 
-    signature = sign_manifest(manifest_data)
+    signature = sign_manifest(
+        manifest_data
+    )
 
     files["signature"] = signature
 
@@ -547,7 +578,10 @@ def create_pkpass(
     ) as archive:
 
         for filename, data in files.items():
-            archive.writestr(filename, data)
+            archive.writestr(
+                filename,
+                data,
+            )
 
     return output.getvalue()
 
@@ -563,12 +597,19 @@ def wallet_last_modified_http_date(
     HTTP-date для ответа Wallet Web Service.
     """
 
-    value = updated_at or datetime.now(timezone.utc)
+    value = (
+        updated_at
+        or datetime.now(timezone.utc)
+    )
 
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
+        value = value.replace(
+            tzinfo=timezone.utc
+        )
 
-    value = value.astimezone(timezone.utc)
+    value = value.astimezone(
+        timezone.utc
+    )
 
     return value.strftime(
         "%a, %d %b %Y %H:%M:%S GMT"
