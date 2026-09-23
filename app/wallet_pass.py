@@ -15,6 +15,8 @@ from cryptography.hazmat.primitives.serialization.pkcs7 import (
     PKCS7SignatureBuilder,
 )
 
+from app.skin_catalog import SKIN_CATALOG
+
 
 # =========================================================
 # CONFIG
@@ -93,6 +95,39 @@ CARD_DESIGNS = {
         "strip": "strip_explorer",
     },
 }
+
+
+def hex_to_wallet_rgb(hex_color: str) -> str:
+    value = (hex_color or "#FFFFFF").strip().lstrip("#")
+
+    if len(value) != 6:
+        value = "FFFFFF"
+
+    try:
+        red = int(value[0:2], 16)
+        green = int(value[2:4], 16)
+        blue = int(value[4:6], 16)
+    except ValueError:
+        red, green, blue = 255, 255, 255
+
+    return f"rgb({red}, {green}, {blue})"
+
+
+for skin in SKIN_CATALOG:
+    CARD_DESIGNS[skin["id"]] = {
+        "title": skin["title"],
+        "background": hex_to_wallet_rgb(
+            skin["card_color"]
+        ),
+        "foreground": hex_to_wallet_rgb(
+            skin["foreground_color"]
+        ),
+        "label": hex_to_wallet_rgb(
+            skin["foreground_color"]
+        ),
+        "skin_filename": skin["filename"],
+    }
+
 
 VALID_CARD_DESIGNS = set(CARD_DESIGNS.keys())
 
@@ -464,7 +499,29 @@ def create_pkpass(
     )
 
     design = CARD_DESIGNS[design_id]
-    strip_name = design["strip"]
+
+    skin_filename = design.get("skin_filename")
+
+    if skin_filename:
+        strip_1x = load_wallet_asset(
+            skin_filename
+        )
+
+        # Новые серверные скины хранятся одним
+        # качественным PNG. Используем тот же файл
+        # и для Retina-варианта внутри .pkpass.
+        strip_2x = strip_1x
+
+    else:
+        strip_name = design["strip"]
+
+        strip_1x = load_wallet_asset(
+            f"{strip_name}.png"
+        )
+
+        strip_2x = load_wallet_asset(
+            f"{strip_name}@2x.png"
+        )
 
     pass_json = build_pass_json(
         user_id=user_id,
@@ -509,13 +566,9 @@ def create_pkpass(
         # Фирменная широкая картинка.
         # Имя внутри .pkpass всегда strip.png,
         # но исходный файл выбирается по скину.
-        "strip.png": load_wallet_asset(
-            f"{strip_name}.png"
-        ),
+        "strip.png": strip_1x,
 
-        "strip@2x.png": load_wallet_asset(
-            f"{strip_name}@2x.png"
-        ),
+        "strip@2x.png": strip_2x,
     }
 
     manifest_data = create_manifest(
