@@ -2494,15 +2494,15 @@ def set_wallet_card_design(
     design_id = (design_id or "").strip().lower()
 
     remote_skin_ids = {
-    skin["id"]
-    for skin in SKIN_CATALOG
-}
+        skin["id"]
+        for skin in SKIN_CATALOG
+    }
 
-if (
-    design_id not in WALLET_CARD_DESIGNS
-    and design_id not in remote_skin_ids
-):
-    return None
+    if (
+        design_id not in WALLET_CARD_DESIGNS
+        and design_id not in remote_skin_ids
+    ):
+        return None
 
     with get_connection() as conn:
         with conn.cursor() as cur:
