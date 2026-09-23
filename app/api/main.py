@@ -96,6 +96,8 @@ def ensure_telegram_link_sessions_table():
                     token_hash VARCHAR(64) PRIMARY KEY,
                     provider VARCHAR(20) NOT NULL,
                     provider_user_id TEXT NOT NULL,
+                    mode VARCHAR(20) NOT NULL DEFAULT 'link',
+                    current_user_id BIGINT,
                     status VARCHAR(20) NOT NULL DEFAULT 'pending',
                     telegram_user_id BIGINT,
                     user_id INTEGER,
@@ -104,6 +106,20 @@ def ensure_telegram_link_sessions_table():
                     expires_at TIMESTAMPTZ NOT NULL,
                     confirmed_at TIMESTAMPTZ
                 )
+                """
+            )
+
+            cur.execute(
+                """
+                ALTER TABLE telegram_link_sessions
+                ADD COLUMN IF NOT EXISTS mode VARCHAR(20) NOT NULL DEFAULT 'link'
+                """
+            )
+
+            cur.execute(
+                """
+                ALTER TABLE telegram_link_sessions
+                ADD COLUMN IF NOT EXISTS current_user_id BIGINT
                 """
             )
 
@@ -772,6 +788,13 @@ class TelegramLinkConfirmRequest(BaseModel):
     telegram_id: int
 
 
+class TelegramMergeStartRequest(BaseModel):
+    current_user_id: int
+    provider: str
+    provider_user_id: str = ""
+    id_token: str | None = None
+
+
 def _telegram_link_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -845,15 +868,121 @@ def telegram_link_start(data: TelegramLinkStartRequest):
                     token_hash,
                     provider,
                     provider_user_id,
+                    mode,
                     status,
                     expires_at
                 )
-                VALUES (%s, %s, %s, 'pending', %s)
+                VALUES (%s, %s, %s, 'link', 'pending', %s)
                 """,
                 (
                     token_hash,
                     provider,
                     provider_user_id,
+                    expires_at,
+                ),
+            )
+
+    deep_link = (
+        "https://t.me/forYouMeCoffeBot"
+        f"?start=link_{token}"
+    )
+
+    return {
+        "ok": True,
+        "status": "pending",
+        "token": token,
+        "deep_link": deep_link,
+        "expires_in": 900,
+    }
+
+
+@app.post("/auth/telegram-merge/start")
+def telegram_merge_start(data: TelegramMergeStartRequest):
+    provider = data.provider.strip().lower()
+    provider_user_id = data.provider_user_id.strip()
+
+    if data.current_user_id <= 0:
+        return {
+            "ok": False,
+            "message": "Некоректний поточний профіль",
+        }
+
+    if provider not in {"apple", "google"}:
+        return {
+            "ok": False,
+            "message": "Некоректний спосіб входу",
+        }
+
+    # Для Google обязательно подтверждаем настоящий Google ID Token
+    # и проверяем, что он принадлежит именно current_user_id.
+    if provider == "google":
+        payload = verify_google_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Google ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
+
+    if provider == "apple" and not provider_user_id:
+        return {
+            "ok": False,
+            "message": "provider_user_id is required",
+        }
+
+    authenticated_user = get_user_by_identity(
+        provider,
+        provider_user_id,
+    )
+
+    if not authenticated_user:
+        return {
+            "ok": False,
+            "message": "Поточний профіль входу не знайдено",
+        }
+
+    if authenticated_user["id"] != data.current_user_id:
+        return {
+            "ok": False,
+            "message": "Спосіб входу не відповідає поточному профілю",
+        }
+
+    token = secrets.token_urlsafe(24)
+    token_hash = _telegram_link_token_hash(token)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM telegram_link_sessions
+                WHERE provider = %s
+                  AND provider_user_id = %s
+                  AND status = 'pending'
+                """,
+                (provider, provider_user_id),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO telegram_link_sessions (
+                    token_hash,
+                    provider,
+                    provider_user_id,
+                    mode,
+                    current_user_id,
+                    status,
+                    expires_at
+                )
+                VALUES (%s, %s, %s, 'merge', %s, 'pending', %s)
+                """,
+                (
+                    token_hash,
+                    provider,
+                    provider_user_id,
+                    data.current_user_id,
                     expires_at,
                 ),
             )
@@ -949,6 +1078,8 @@ def telegram_link_confirm(data: TelegramLinkConfirmRequest):
                 SELECT
                     provider,
                     provider_user_id,
+                    mode,
+                    current_user_id,
                     status,
                     expires_at,
                     telegram_user_id,
@@ -997,21 +1128,70 @@ def telegram_link_confirm(data: TelegramLinkConfirmRequest):
             "message": "Профіль Telegram у «Наші» не знайдено",
         }
 
-    link_result = link_user_identity(
-        telegram_user["id"],
-        session["provider"],
-        session["provider_user_id"],
-    )
+    session_mode = session["mode"] or "link"
 
-    if link_result["status"] not in {
-        "linked",
-        "already_linked",
-    }:
-        return {
-            "ok": False,
-            "status": link_result["status"],
-            "message": "Не вдалося прив’язати профіль",
-        }
+    if session_mode == "merge":
+        current_user_id = session["current_user_id"]
+
+        if not current_user_id:
+            return {
+                "ok": False,
+                "status": "merge_error",
+                "message": "Не вдалося визначити поточний профіль",
+            }
+
+        target_user_id = telegram_user["id"]
+
+        if current_user_id == target_user_id:
+            action_status = "already_merged"
+        else:
+            try:
+                merge_result = merge_users(
+                    source_user_id=current_user_id,
+                    target_user_id=target_user_id,
+                )
+            except Exception as e:
+                print("TELEGRAM DEEPLINK MERGE ERROR:", e)
+                return {
+                    "ok": False,
+                    "status": "merge_error",
+                    "message": "Не вдалося об’єднати профілі",
+                }
+
+            action_status = merge_result["status"]
+
+            if action_status not in {
+                "merged",
+                "already_merged",
+            }:
+                return {
+                    "ok": False,
+                    "status": action_status,
+                    "message": (
+                        "Не вдалося об’єднати профілі"
+                        if action_status != "provider_conflict"
+                        else "Ці профілі мають різні способи входу одного типу"
+                    ),
+                }
+
+    else:
+        link_result = link_user_identity(
+            telegram_user["id"],
+            session["provider"],
+            session["provider_user_id"],
+        )
+
+        action_status = link_result["status"]
+
+        if action_status not in {
+            "linked",
+            "already_linked",
+        }:
+            return {
+                "ok": False,
+                "status": action_status,
+                "message": "Не вдалося прив’язати профіль",
+            }
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -1037,7 +1217,12 @@ def telegram_link_confirm(data: TelegramLinkConfirmRequest):
     return {
         "ok": True,
         "status": "confirmed",
-        "message": "Профіль успішно підключено",
+        "action_status": action_status,
+        "message": (
+            "Профілі успішно об’єднано"
+            if session_mode == "merge"
+            else "Профіль успішно підключено"
+        ),
         "user_id": telegram_user["id"],
         "telegram_user_id": telegram_user["telegram_user_id"],
         "personal_qr_token": telegram_user["personal_qr_token"],
