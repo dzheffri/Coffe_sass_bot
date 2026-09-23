@@ -1,7 +1,7 @@
 import uuid
 from math import ceil
 from datetime import datetime, timezone
-
+from app.skin_catalog import SKIN_CATALOG
 from psycopg import connect
 from psycopg.rows import dict_row
 
@@ -2365,6 +2365,9 @@ WALLET_CARD_DESIGNS = {
     "diamond",
     "coffee",
     "explorer",
+} | {
+    skin["id"]
+    for skin in SKIN_CATALOG
 }
 
 
@@ -2490,8 +2493,16 @@ def set_wallet_card_design(
 
     design_id = (design_id or "").strip().lower()
 
-    if design_id not in WALLET_CARD_DESIGNS:
-        return None
+    remote_skin_ids = {
+    skin["id"]
+    for skin in SKIN_CATALOG
+}
+
+if (
+    design_id not in WALLET_CARD_DESIGNS
+    and design_id not in remote_skin_ids
+):
+    return None
 
     with get_connection() as conn:
         with conn.cursor() as cur:
