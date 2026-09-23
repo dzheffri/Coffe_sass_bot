@@ -8,7 +8,7 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone
-
+from app.skin_catalog import SKIN_CATALOG, skin_progress
 from fastapi import FastAPI, UploadFile, File, Request, Response, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -61,7 +61,10 @@ from app.wallet_pass import (
 from app.wallet_push import send_wallet_pushes
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
-
+SKIN_ASSETS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "wallet_assets",
+)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 app = FastAPI(title="Coffee Club API")
@@ -75,7 +78,11 @@ app.add_middleware(
 )
 
 app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
-
+app.mount(
+    "/skin-assets",
+    StaticFiles(directory=SKIN_ASSETS_DIR),
+    name="skin-assets",
+)
 init_web_panel_db()
 
 
@@ -1632,6 +1639,55 @@ async def upload_image(file: UploadFile = File(...)):
         "ok": True,
         "url": f"/uploads/{filename}"
     }
+@app.get("/skins/{user_id}")
+async def get_skins(user_id: int):
+    if user_id == 32650:
+        stats = {
+            "total_cups": 0,
+            "total_free": 0,
+            "shops_count": 0,
+        }
+    else:
+        stats = get_wallet_user_stats(user_id)
+
+        if not stats:
+            raise HTTPException(
+                status_code=404,
+                detail="User not found",
+            )
+
+    result = []
+
+    for skin in SKIN_CATALOG:
+        progress = skin_progress(
+            skin,
+            total_cups=stats["total_cups"],
+            total_free=stats["total_free"],
+            shops_count=stats["shops_count"],
+        )
+
+        result.append(
+            {
+                "id": skin["id"],
+                "title": skin["title"],
+                "achievement": skin["achievement"],
+                "metric": skin["metric"],
+                "target": skin["target"],
+                "current": progress["current"],
+                "unlocked": progress["unlocked"],
+                "card_color": skin["card_color"],
+                "foreground_color": skin["foreground_color"],
+                "image_url": (
+                    "https://coffesassbot-production.up.railway.app"
+                    f"/skin-assets/{skin['filename']}"
+                ),
+            }
+        )
+
+    return {
+        "ok": True,
+        "skins": result,
+    }    
 # persistence test
 # postgres persistence test 2026-09-07
 # =========================================================
