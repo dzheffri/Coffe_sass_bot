@@ -4,6 +4,7 @@ import random
 import json
 import hmac
 import hashlib
+import secrets
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from urllib.parse import parse_qsl
@@ -84,6 +85,30 @@ app.mount(
     name="skin-assets",
 )
 init_web_panel_db()
+
+
+def ensure_telegram_link_sessions_table():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_link_sessions (
+                    token_hash VARCHAR(64) PRIMARY KEY,
+                    provider VARCHAR(20) NOT NULL,
+                    provider_user_id TEXT NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    telegram_user_id BIGINT,
+                    user_id INTEGER,
+                    personal_qr_token TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    confirmed_at TIMESTAMPTZ
+                )
+                """
+            )
+
+
+ensure_telegram_link_sessions_table()
 
 
 class SendCodeRequest(BaseModel):
@@ -731,6 +756,294 @@ def test_identity_auth(data: TestIdentityAuthRequest):
         "ok": False,
         "message": "Unknown action",
     }
+
+# =========================================================
+# TELEGRAM DEEP-LINK ACCOUNT LINK
+# =========================================================
+
+class TelegramLinkStartRequest(BaseModel):
+    provider: str
+    provider_user_id: str = ""
+    id_token: str | None = None
+
+
+class TelegramLinkConfirmRequest(BaseModel):
+    token: str
+    telegram_id: int
+
+
+def _telegram_link_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+@app.post("/auth/telegram-link/start")
+def telegram_link_start(data: TelegramLinkStartRequest):
+    provider = data.provider.strip().lower()
+    provider_user_id = data.provider_user_id.strip()
+
+    if provider not in {"apple", "google"}:
+        return {
+            "ok": False,
+            "message": "Некоректний спосіб входу",
+        }
+
+    # Для Google доверяем только проверенному ID Token.
+    if provider == "google":
+        payload = verify_google_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Google ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
+
+    # Apple пока остаётся по текущей схеме.
+    if provider == "apple" and not provider_user_id:
+        return {
+            "ok": False,
+            "message": "provider_user_id is required",
+        }
+
+    # Если этот Google/Apple уже привязан, новую сессию не создаём.
+    existing_user = get_user_by_identity(
+        provider,
+        provider_user_id,
+    )
+
+    if existing_user:
+        return {
+            "ok": True,
+            "status": "existing",
+            "user_id": existing_user["id"],
+            "telegram_user_id": existing_user["telegram_user_id"],
+            "personal_qr_token": existing_user["personal_qr_token"],
+        }
+
+    token = secrets.token_urlsafe(24)
+    token_hash = _telegram_link_token_hash(token)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # Удаляем старые незавершённые сессии этого способа входа,
+            # чтобы у пользователя была только одна актуальная ссылка.
+            cur.execute(
+                """
+                DELETE FROM telegram_link_sessions
+                WHERE provider = %s
+                  AND provider_user_id = %s
+                  AND status = 'pending'
+                """,
+                (provider, provider_user_id),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO telegram_link_sessions (
+                    token_hash,
+                    provider,
+                    provider_user_id,
+                    status,
+                    expires_at
+                )
+                VALUES (%s, %s, %s, 'pending', %s)
+                """,
+                (
+                    token_hash,
+                    provider,
+                    provider_user_id,
+                    expires_at,
+                ),
+            )
+
+    deep_link = (
+        "https://t.me/forYouMeCoffeBot"
+        f"?start=link_{token}"
+    )
+
+    return {
+        "ok": True,
+        "status": "pending",
+        "token": token,
+        "deep_link": deep_link,
+        "expires_in": 900,
+    }
+
+
+@app.get("/auth/telegram-link/status/{token}")
+def telegram_link_status(token: str):
+    clean_token = token.strip()
+
+    if not clean_token:
+        return {
+            "ok": False,
+            "status": "not_found",
+            "message": "Сесію не знайдено",
+        }
+
+    token_hash = _telegram_link_token_hash(clean_token)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    status,
+                    telegram_user_id,
+                    user_id,
+                    personal_qr_token,
+                    expires_at
+                FROM telegram_link_sessions
+                WHERE token_hash = %s
+                LIMIT 1
+                """,
+                (token_hash,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return {
+            "ok": False,
+            "status": "not_found",
+            "message": "Сесію не знайдено",
+        }
+
+    if (
+        row["status"] == "pending"
+        and datetime.now(timezone.utc) > row["expires_at"]
+    ):
+        return {
+            "ok": True,
+            "status": "expired",
+            "message": "Час підтвердження завершився",
+        }
+
+    return {
+        "ok": True,
+        "status": row["status"],
+        "user_id": row["user_id"],
+        "telegram_user_id": row["telegram_user_id"],
+        "personal_qr_token": row["personal_qr_token"],
+    }
+
+
+@app.post("/auth/telegram-link/confirm")
+def telegram_link_confirm(data: TelegramLinkConfirmRequest):
+    token = data.token.strip()
+
+    if not token:
+        return {
+            "ok": False,
+            "status": "not_found",
+            "message": "Сесію не знайдено",
+        }
+
+    token_hash = _telegram_link_token_hash(token)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    provider,
+                    provider_user_id,
+                    status,
+                    expires_at,
+                    telegram_user_id,
+                    user_id,
+                    personal_qr_token
+                FROM telegram_link_sessions
+                WHERE token_hash = %s
+                LIMIT 1
+                """,
+                (token_hash,),
+            )
+            session = cur.fetchone()
+
+    if not session:
+        return {
+            "ok": False,
+            "status": "not_found",
+            "message": "Сесію не знайдено",
+        }
+
+    if session["status"] == "confirmed":
+        return {
+            "ok": True,
+            "status": "confirmed",
+            "user_id": session["user_id"],
+            "telegram_user_id": session["telegram_user_id"],
+            "personal_qr_token": session["personal_qr_token"],
+        }
+
+    if datetime.now(timezone.utc) > session["expires_at"]:
+        return {
+            "ok": False,
+            "status": "expired",
+            "message": "Час підтвердження завершився",
+        }
+
+    telegram_user = get_user_by_identity(
+        "telegram",
+        str(data.telegram_id),
+    )
+
+    if not telegram_user:
+        return {
+            "ok": False,
+            "status": "telegram_not_found",
+            "message": "Профіль Telegram у «Наші» не знайдено",
+        }
+
+    link_result = link_user_identity(
+        telegram_user["id"],
+        session["provider"],
+        session["provider_user_id"],
+    )
+
+    if link_result["status"] not in {
+        "linked",
+        "already_linked",
+    }:
+        return {
+            "ok": False,
+            "status": link_result["status"],
+            "message": "Не вдалося прив’язати профіль",
+        }
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE telegram_link_sessions
+                SET
+                    status = 'confirmed',
+                    telegram_user_id = %s,
+                    user_id = %s,
+                    personal_qr_token = %s,
+                    confirmed_at = NOW()
+                WHERE token_hash = %s
+                """,
+                (
+                    telegram_user["telegram_user_id"],
+                    telegram_user["id"],
+                    telegram_user["personal_qr_token"],
+                    token_hash,
+                ),
+            )
+
+    return {
+        "ok": True,
+        "status": "confirmed",
+        "message": "Профіль успішно підключено",
+        "user_id": telegram_user["id"],
+        "telegram_user_id": telegram_user["telegram_user_id"],
+        "personal_qr_token": telegram_user["personal_qr_token"],
+    }
+
+
 # =========================================================
 # APPLE REVIEW GUEST LOGIN
 # =========================================================
