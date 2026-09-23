@@ -1814,24 +1814,23 @@ async def update_wallet_design(
         )
 
     design_id = (
-    payload.design_id or ""
-).strip().lower()
+        payload.design_id or ""
+    ).strip().lower()
 
-remote_skin_ids = {
-    skin["id"]
-    for skin in SKIN_CATALOG
-}
+    remote_skin_ids = {
+        skin["id"]
+        for skin in SKIN_CATALOG
+    }
 
-if (
-    design_id not in VALID_CARD_DESIGNS
-    and design_id not in remote_skin_ids
-):
-    raise HTTPException(
-        status_code=400,
-        detail="Invalid card design",
-    )
+    if (
+        design_id not in VALID_CARD_DESIGNS
+        and design_id not in remote_skin_ids
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid card design",
+        )
 
-    # Сначала гарантируем, что Wallet-pass существует.
     wallet_data = get_or_create_wallet_pass(user_id)
 
     if not wallet_data:
@@ -1840,7 +1839,6 @@ if (
             detail="User not found",
         )
 
-    # Меняем дизайн и увеличиваем update_tag.
     result = set_wallet_card_design(
         user_id,
         design_id,
@@ -1852,43 +1850,38 @@ if (
             detail="Unable to change card design",
         )
 
-    # Получаем уже обновлённую Wallet-карту.
     updated_wallet = get_or_create_wallet_pass(user_id)
 
     serial_number = updated_wallet["serial_number"]
 
-    # Все iPhone, где установлена эта карта.
     push_tokens = get_wallet_push_tokens(
         serial_number
     )
 
     print(
-        "📲 WALLET UPDATE:",
-        f"user_id={user_id}",
-        f"design={design_id}",
-        f"serial={serial_number}",
-        f"devices={len(push_tokens)}",
+        f"📲 WALLET UPDATE: "
+        f"user_id={user_id} "
+        f"design={design_id} "
+        f"serial={serial_number} "
+        f"devices={len(push_tokens)}"
     )
 
-    push_result = {
-        "sent": 0,
-        "failed": 0,
-    }
+    push_result = await send_wallet_pushes(
+        push_tokens
+    )
 
-    if push_tokens:
-        push_result = await send_wallet_pushes(
-            push_tokens
-        )
+    print(
+        "📲 WALLET APNS RESULT:",
+        f"sent={push_result.get('sent', 0)},",
+        f"failed={push_result.get('failed', 0)}",
+    )
 
     return {
         "ok": True,
         "design_id": design_id,
         "serial_number": serial_number,
         "update_tag": updated_wallet["update_tag"],
-        "registered_devices": len(push_tokens),
-        "push": push_result,
     }
-
 # ---------------------------------------------------------
 # APPLE WALLET WEB SERVICE
 #
