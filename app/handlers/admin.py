@@ -10,8 +10,13 @@ from app.db import (
     subscription_is_active,
     get_user_by_telegram_id,
     get_shop_client_balance_by_user_id,
+    touch_wallet_pass,
+    get_wallet_push_tokens,
+    get_app_push_devices_for_user,
 )
 from app.states import AdminScanStates
+from app.wallet_push import send_wallet_pushes
+from app.app_push import send_app_pushes
 
 
 router = Router()
@@ -22,6 +27,88 @@ pending_scan: dict[int, dict] = {}
 
 def is_staff(telegram_user_id: int):
     return get_admin_shop_and_role(telegram_user_id) is not None
+
+
+async def refresh_wallet_and_send_app_push(
+    user_id: int,
+    title: str,
+    body: str,
+    event_type: str,
+    shop_id: int,
+):
+    """
+    После успешного начисления/списания:
+    1) помечаем Wallet-pass обновлённым;
+    2) отправляем Wallet silent push;
+    3) отправляем обычный push в приложение.
+
+    Любая ошибка push не должна ломать саму операцию с чашками.
+    """
+
+    # -------------------------
+    # APPLE WALLET
+    # -------------------------
+    try:
+        wallet_state = touch_wallet_pass(user_id)
+
+        if wallet_state:
+            serial_number = wallet_state["serial_number"]
+
+            wallet_tokens = get_wallet_push_tokens(
+                serial_number
+            )
+
+            wallet_result = await send_wallet_pushes(
+                wallet_tokens
+            )
+
+            print(
+                "📲 WALLET LOYALTY UPDATE:",
+                f"user_id={user_id}",
+                f"serial={serial_number}",
+                f"devices={len(wallet_tokens)}",
+                f"sent={wallet_result.get('sent', 0)}",
+                f"failed={wallet_result.get('failed', 0)}",
+            )
+
+    except Exception as exc:
+        print(
+            "WALLET LOYALTY UPDATE ERROR:",
+            repr(exc),
+        )
+
+    # -------------------------
+    # APP PUSH
+    # -------------------------
+    try:
+        devices = get_app_push_devices_for_user(
+            user_id
+        )
+
+        if devices:
+            push_result = await send_app_pushes(
+                devices=devices,
+                title=title,
+                body=body,
+                data={
+                    "type": event_type,
+                    "shop_id": shop_id,
+                },
+            )
+
+            print(
+                "🔔 APP LOYALTY PUSH:",
+                f"user_id={user_id}",
+                f"devices={len(devices)}",
+                f"sent={push_result.get('sent', 0)}",
+                f"failed={push_result.get('failed', 0)}",
+            )
+
+    except Exception as exc:
+        print(
+            "APP LOYALTY PUSH ERROR:",
+            repr(exc),
+        )
 
 
 @router.message(F.text == "☕ Режим: нарахування")
@@ -165,6 +252,20 @@ async def handle_scanner_data(message: types.Message, state: FSMContext):
             f"🎁 Залишок безкоштовних кав: {result['free_coffee_balance']}"
         )
 
+        # Wallet + обычный iOS push.
+        await refresh_wallet_and_send_app_push(
+            user_id=user["id"],
+            title="🎁 Безкоштовну каву використано",
+            body=(
+                f"{shop['name']}. "
+                f"Залишок безкоштовних кав: "
+                f"{result['free_coffee_balance']}"
+            ),
+            event_type="free_coffee_redeemed",
+            shop_id=shop["id"],
+        )
+
+        # Старое Telegram-уведомление оставляем.
         try:
             await message.bot.send_message(
                 user["telegram_user_id"],
@@ -225,6 +326,36 @@ async def handle_cups_count(message: types.Message, state: FSMContext):
 
     await message.answer(answer_text)
 
+    # Если этой покупкой заработали бесплатный кофе,
+    # делаем push более заметным.
+    if earned_free > 0:
+        push_title = "🎁 Безкоштовна кава вже ваша"
+        push_body = (
+            f"{data['shop_name']}. "
+            f"Нараховано {count} чашок. "
+            f"Безкоштовних кав: "
+            f"{shop_client['free_coffee_balance']}"
+        )
+        event_type = "free_coffee_earned"
+    else:
+        cup_word = "чашку" if count == 1 else "чашки"
+        push_title = f"☕ Нараховано {count} {cup_word}"
+        push_body = (
+            f"{data['shop_name']}. "
+            f"Зараз у вас {shop_client['cups']}/7 чашок"
+        )
+        event_type = "cups_added"
+
+    # Wallet + обычный iOS push.
+    await refresh_wallet_and_send_app_push(
+        user_id=data["client_user_id"],
+        title=push_title,
+        body=push_body,
+        event_type=event_type,
+        shop_id=data["shop_id"],
+    )
+
+    # Старое Telegram-уведомление оставляем.
     try:
         notify_text = (
             f"☕ Тобі нарахували {count} чашок\n"
