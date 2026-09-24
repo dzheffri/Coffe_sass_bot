@@ -56,6 +56,11 @@ from app.db import (
     get_wallet_device_serials,
     get_wallet_push_tokens,
     get_wallet_user_stats,
+    register_app_push_device,
+    set_app_push_device_enabled,
+    unregister_app_push_device,
+    get_app_push_devices_for_user,
+    get_app_push_devices_for_shop,
 )
 from app.wallet_pass import (
     WALLET_PASS_TYPE_ID,
@@ -65,6 +70,7 @@ from app.wallet_pass import (
 )
 
 from app.wallet_push import send_wallet_pushes
+from app.app_push import send_app_pushes
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 SKIN_ASSETS_DIR = os.path.join(
@@ -180,6 +186,20 @@ class ReminderSettingsRequest(BaseModel):
 
     inactive_14_30_enabled: bool
     inactive_14_30_days: int
+
+    # Пока старая админка это поле не отправляет,
+    # поэтому оставляем None и сохраняем текущее значение из БД.
+    shop_news_enabled: bool | None = None
+
+
+class AppPushDeviceRequest(BaseModel):
+    device_token: str
+    environment: str = "production"
+    notifications_enabled: bool = True
+
+
+class AppPushDeviceRemoveRequest(BaseModel):
+    device_token: str
 
 
 class AddAdminRequest(BaseModel):
@@ -1953,17 +1973,145 @@ async def verify_code(data: VerifyCodeRequest):
     return {"ok": True}
 
 
+
+# =========================================================
+# APP PUSH DEVICES
+# =========================================================
+
+@app.post("/users/{user_id}/push-token")
+def register_user_push_token(
+    user_id: int,
+    data: AppPushDeviceRequest,
+):
+    """
+    Регистрирует обычный APNs device token приложения «Наші».
+    Это НЕ Wallet pushToken.
+    """
+
+    clean_token = (data.device_token or "").strip()
+
+    if not clean_token:
+        raise HTTPException(
+            status_code=400,
+            detail="device_token is required",
+        )
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM users WHERE id = %s",
+                (user_id,),
+            )
+            user = cur.fetchone()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    try:
+        device = register_app_push_device(
+            user_id=user_id,
+            device_token=clean_token,
+            environment=data.environment,
+            platform="ios",
+        )
+
+        if not data.notifications_enabled:
+            device = set_app_push_device_enabled(
+                clean_token,
+                False,
+            )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "environment": device["environment"],
+        "notifications_enabled": device["notifications_enabled"],
+    }
+
+
+@app.delete("/users/{user_id}/push-token")
+def unregister_user_push_token(
+    user_id: int,
+    data: AppPushDeviceRemoveRequest,
+):
+    clean_token = (data.device_token or "").strip()
+
+    if not clean_token:
+        raise HTTPException(
+            status_code=400,
+            detail="device_token is required",
+        )
+
+    removed = unregister_app_push_device(
+        clean_token
+    )
+
+    return {
+        "ok": True,
+        "removed": removed,
+    }
+
+
 @app.get("/owner/shop/{owner_telegram_id}")
 def owner_get_shop(owner_telegram_id: int):
     return get_shop_profile(owner_telegram_id)
 
 
 @app.put("/owner/shop/{owner_telegram_id}")
-def owner_update_shop(
+async def owner_update_shop(
     owner_telegram_id: int,
     data: UpdateShopRequest
 ):
-    return update_shop_profile(
+    # До сохранения считаем, сколько реально заполненных
+    # карточек "Новинки" уже было. Так обычное редактирование
+    # существующей карточки не вызывает новый push.
+    old_profile = get_shop_profile(owner_telegram_id)
+
+    old_news = []
+    if old_profile and old_profile.get("ok"):
+        old_news = (
+            old_profile.get("shop", {}).get("news", [])
+            or []
+        )
+
+    def is_meaningful_news(item):
+        if isinstance(item, dict):
+            title = str(item.get("title") or "").strip()
+            price = str(item.get("price") or "").strip()
+            image_url = str(item.get("image_url") or "").strip()
+        else:
+            title = str(getattr(item, "title", "") or "").strip()
+            price = str(getattr(item, "price", "") or "").strip()
+            image_url = str(getattr(item, "image_url", "") or "").strip()
+
+        return bool(title or price or image_url)
+
+    old_meaningful_count = sum(
+        1 for item in old_news
+        if is_meaningful_news(item)
+    )
+
+    new_news_payload = [
+        item.dict()
+        for item in data.news
+    ]
+
+    new_meaningful = [
+        item
+        for item in new_news_payload
+        if is_meaningful_news(item)
+    ]
+
+    result = update_shop_profile(
         owner_telegram_id=owner_telegram_id,
         name=data.name,
         subtitle=data.subtitle,
@@ -1974,8 +2122,94 @@ def owner_update_shop(
         description=data.description,
         logo_url=data.logo_url,
         cover_url=data.cover_url,
-        news=[item.dict() for item in data.news],
+        news=new_news_payload,
     )
+
+    # Push отправляем только если количество заполненных
+    # карточек реально выросло.
+    if (
+        result
+        and result.get("ok")
+        and len(new_meaningful) > old_meaningful_count
+    ):
+        try:
+            shop_id = get_owner_shop_id(
+                owner_telegram_id
+            )
+
+            if shop_id:
+                settings = get_shop_reminder_settings(
+                    shop_id
+                )
+
+                shop_news_enabled = bool(
+                    settings
+                    and settings.get(
+                        "shop_news_enabled",
+                        True,
+                    )
+                )
+
+                if shop_news_enabled:
+                    devices = (
+                        get_app_push_devices_for_shop(
+                            shop_id
+                        )
+                    )
+
+                    newest_item = new_meaningful[-1]
+                    news_title = (
+                        str(
+                            newest_item.get("title")
+                            or ""
+                        ).strip()
+                    )
+
+                    shop_name = (
+                        (data.name or "").strip()
+                        or "Кавʼярня"
+                    )
+
+                    if news_title:
+                        body = (
+                            f"{news_title}. "
+                            f"Зазирни в «Наші» 👀"
+                        )
+                    else:
+                        body = (
+                            "Кавʼярня додала новинку — "
+                            "зазирни в «Наші» 👀"
+                        )
+
+                    push_result = await send_app_pushes(
+                        devices=devices,
+                        title=(
+                            f"📰 {shop_name} має новинку"
+                        ),
+                        body=body,
+                        data={
+                            "type": "shop_news",
+                            "shop_id": shop_id,
+                        },
+                    )
+
+                    print(
+                        "🔔 SHOP NEWS PUSH:",
+                        f"shop_id={shop_id}",
+                        f"devices={len(devices)}",
+                        f"sent={push_result.get('sent', 0)}",
+                        f"failed={push_result.get('failed', 0)}",
+                    )
+
+        except Exception as exc:
+            # Ошибка push никогда не должна мешать
+            # сохранению профиля кофейни.
+            print(
+                "SHOP NEWS PUSH ERROR:",
+                repr(exc),
+            )
+
+    return result
 
 
 @app.get("/owner/analytics/{owner_telegram_id}/overview")
@@ -2035,6 +2269,11 @@ def owner_get_reminder_settings(owner_telegram_id: int):
 
             "inactive_14_30_enabled": settings["inactive_14_30_enabled"],
             "inactive_14_30_days": settings["inactive_14_30_days"],
+
+            "shop_news_enabled": settings.get(
+                "shop_news_enabled",
+                True,
+            ),
         }
     }
 
@@ -2066,6 +2305,20 @@ def owner_update_reminder_settings(
         }
 
     try:
+        current_settings = get_shop_reminder_settings(
+            shop_id
+        )
+
+        if data.shop_news_enabled is None:
+            shop_news_enabled = bool(
+                current_settings.get(
+                    "shop_news_enabled",
+                    True,
+                )
+            )
+        else:
+            shop_news_enabled = data.shop_news_enabled
+
         settings = update_shop_reminder_settings(
             shop_id=shop_id,
             one_left_enabled=data.one_left_enabled,
@@ -2076,6 +2329,7 @@ def owner_update_reminder_settings(
             inactive_5_7_days=data.inactive_5_7_days,
             inactive_14_30_enabled=data.inactive_14_30_enabled,
             inactive_14_30_days=data.inactive_14_30_days,
+            shop_news_enabled=shop_news_enabled,
         )
 
     except ValueError as e:
@@ -2099,6 +2353,11 @@ def owner_update_reminder_settings(
 
             "inactive_14_30_enabled": settings["inactive_14_30_enabled"],
             "inactive_14_30_days": settings["inactive_14_30_days"],
+
+            "shop_news_enabled": settings.get(
+                "shop_news_enabled",
+                True,
+            ),
         }
     }
 
