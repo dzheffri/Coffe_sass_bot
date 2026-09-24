@@ -2036,7 +2036,40 @@ def register_user_push_token(
         "environment": device["environment"],
         "notifications_enabled": device["notifications_enabled"],
     }
+@app.post("/users/{user_id}/push-test")
+async def send_test_app_push(
+    user_id: int,
+):
+    devices = get_app_push_devices_for_user(
+        user_id
+    )
 
+    if not devices:
+        raise HTTPException(
+            status_code=404,
+            detail="No push devices registered",
+        )
+
+    result = await send_app_pushes(
+        devices=devices,
+        title="☕ Тестовий push від «Наші»",
+        body=(
+            "Все працює 🎉 "
+            "Тепер застосунок може отримувати "
+            "справжні push-сповіщення."
+        ),
+        data={
+            "type": "test",
+        },
+    )
+
+    return {
+        "ok": True,
+        "devices": len(devices),
+        "sent": result.get("sent", 0),
+        "failed": result.get("failed", 0),
+        "errors": result.get("errors", []),
+    }
 
 @app.delete("/users/{user_id}/push-token")
 def unregister_user_push_token(
