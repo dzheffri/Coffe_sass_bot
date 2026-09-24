@@ -2071,9 +2071,11 @@ async def owner_update_shop(
     owner_telegram_id: int,
     data: UpdateShopRequest
 ):
-    # До сохранения считаем, сколько реально заполненных
-    # карточек "Новинки" уже было. Так обычное редактирование
-    # существующей карточки не вызывает новый push.
+    # До сохранения запоминаем текущие карточки "Новинки".
+    # Сравниваем не количество карточек, а их содержимое.
+    # Поэтому сценарий:
+    #   удалили старую -> добавили новую -> сохранили
+    # тоже даст push, даже если общее количество осталось тем же.
     old_profile = get_shop_profile(owner_telegram_id)
 
     old_news = []
@@ -2083,7 +2085,7 @@ async def owner_update_shop(
             or []
         )
 
-    def is_meaningful_news(item):
+    def news_fields(item):
         if isinstance(item, dict):
             title = str(item.get("title") or "").strip()
             price = str(item.get("price") or "").strip()
@@ -2093,12 +2095,31 @@ async def owner_update_shop(
             price = str(getattr(item, "price", "") or "").strip()
             image_url = str(getattr(item, "image_url", "") or "").strip()
 
+        return title, price, image_url
+
+    def is_meaningful_news(item):
+        title, price, image_url = news_fields(item)
         return bool(title or price or image_url)
 
-    old_meaningful_count = sum(
-        1 for item in old_news
+    def news_identity(item):
+        """
+        Идентичность новинки для определения именно новой карточки.
+
+        Цена специально не участвует:
+        изменение только цены не должно слать новый push.
+        """
+        title, _, image_url = news_fields(item)
+
+        return (
+            title.casefold(),
+            image_url,
+        )
+
+    old_identities = {
+        news_identity(item)
+        for item in old_news
         if is_meaningful_news(item)
-    )
+    }
 
     new_news_payload = [
         item.dict()
@@ -2109,6 +2130,12 @@ async def owner_update_shop(
         item
         for item in new_news_payload
         if is_meaningful_news(item)
+    ]
+
+    newly_added_news = [
+        item
+        for item in new_meaningful
+        if news_identity(item) not in old_identities
     ]
 
     result = update_shop_profile(
@@ -2125,12 +2152,12 @@ async def owner_update_shop(
         news=new_news_payload,
     )
 
-    # Push отправляем только если количество заполненных
-    # карточек реально выросло.
+    # Push отправляем только если появилась реально новая
+    # карточка. Удаление само по себе push не вызывает.
     if (
         result
         and result.get("ok")
-        and len(new_meaningful) > old_meaningful_count
+        and newly_added_news
     ):
         try:
             shop_id = get_owner_shop_id(
@@ -2157,7 +2184,7 @@ async def owner_update_shop(
                         )
                     )
 
-                    newest_item = new_meaningful[-1]
+                    newest_item = newly_added_news[-1]
                     news_title = (
                         str(
                             newest_item.get("title")
