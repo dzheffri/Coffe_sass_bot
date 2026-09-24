@@ -5,8 +5,13 @@ import json
 import hmac
 import hashlib
 import secrets
+import base64
+import time
+from urllib.request import urlopen
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes
 from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone
 from app.skin_catalog import SKIN_CATALOG, skin_progress
@@ -209,6 +214,159 @@ def verify_google_id_token(token: str):
     except Exception as e:
         print("GOOGLE TOKEN VERIFY ERROR:", e)
         return None
+
+
+APPLE_ISSUER = "https://appleid.apple.com"
+APPLE_KEYS_URL = "https://appleid.apple.com/auth/keys"
+APPLE_CLIENT_ID = os.getenv(
+    "APPLE_CLIENT_ID",
+    "com.dzheffri.coffeeclubpass",
+)
+
+_apple_keys_cache = {
+    "keys": None,
+    "expires_at": 0,
+}
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding_len = (-len(value)) % 4
+    return base64.urlsafe_b64decode(
+        value + ("=" * padding_len)
+    )
+
+
+def _load_apple_keys():
+    now = time.time()
+
+    if (
+        _apple_keys_cache["keys"] is not None
+        and now < _apple_keys_cache["expires_at"]
+    ):
+        return _apple_keys_cache["keys"]
+
+    with urlopen(APPLE_KEYS_URL, timeout=10) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    keys = data.get("keys") or []
+
+    _apple_keys_cache["keys"] = keys
+    _apple_keys_cache["expires_at"] = now + 3600
+
+    return keys
+
+
+def verify_apple_id_token(token: str):
+    if not token:
+        return None
+
+    try:
+        parts = token.split(".")
+
+        if len(parts) != 3:
+            return None
+
+        header = json.loads(
+            _b64url_decode(parts[0]).decode("utf-8")
+        )
+
+        payload = json.loads(
+            _b64url_decode(parts[1]).decode("utf-8")
+        )
+
+        if header.get("alg") != "RS256":
+            return None
+
+        kid = header.get("kid")
+        if not kid:
+            return None
+
+        apple_keys = _load_apple_keys()
+
+        jwk = next(
+            (
+                key
+                for key in apple_keys
+                if key.get("kid") == kid
+            ),
+            None,
+        )
+
+        if not jwk:
+            # На случай ротации ключей Apple обновляем кэш один раз.
+            _apple_keys_cache["keys"] = None
+            _apple_keys_cache["expires_at"] = 0
+
+            apple_keys = _load_apple_keys()
+
+            jwk = next(
+                (
+                    key
+                    for key in apple_keys
+                    if key.get("kid") == kid
+                ),
+                None,
+            )
+
+        if not jwk:
+            return None
+
+        n = int.from_bytes(
+            _b64url_decode(jwk["n"]),
+            "big",
+        )
+
+        e = int.from_bytes(
+            _b64url_decode(jwk["e"]),
+            "big",
+        )
+
+        public_key = rsa.RSAPublicNumbers(
+            e,
+            n,
+        ).public_key()
+
+        signing_input = (
+            f"{parts[0]}.{parts[1]}"
+        ).encode("utf-8")
+
+        signature = _b64url_decode(parts[2])
+
+        public_key.verify(
+            signature,
+            signing_input,
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+
+        if payload.get("iss") != APPLE_ISSUER:
+            return None
+
+        audience = payload.get("aud")
+
+        if isinstance(audience, list):
+            if APPLE_CLIENT_ID not in audience:
+                return None
+        elif audience != APPLE_CLIENT_ID:
+            return None
+
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return None
+
+        if exp <= time.time():
+            return None
+
+        apple_sub = payload.get("sub")
+        if not apple_sub:
+            return None
+
+        return payload
+
+    except Exception as e:
+        print("APPLE TOKEN VERIFY ERROR:", e)
+        return None
+
 
 def validate_telegram_init_data(init_data: str, max_age_seconds: int = 86400):
     if not init_data:
@@ -664,12 +822,17 @@ def test_identity_auth(data: TestIdentityAuthRequest):
         
 
         
-    # Apple пока работает по старой схеме.
-    if provider == "apple" and not provider_user_id:
-        return {
-            "ok": False,
-            "message": "provider_user_id is required",
-        }
+    # Для Apple тоже доверяем только проверенному ID Token.
+    if provider == "apple":
+        payload = verify_apple_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Apple ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
     # -------------------------------------------------
     # 1. Проверяем, существует ли уже Apple/Google login
     # -------------------------------------------------
@@ -822,12 +985,17 @@ def telegram_link_start(data: TelegramLinkStartRequest):
 
         provider_user_id = str(payload["sub"])
 
-    # Apple пока остаётся по текущей схеме.
-    if provider == "apple" and not provider_user_id:
-        return {
-            "ok": False,
-            "message": "provider_user_id is required",
-        }
+    # Для Apple тоже доверяем только проверенному ID Token.
+    if provider == "apple":
+        payload = verify_apple_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Apple ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
 
     # Если этот Google/Apple уже привязан, новую сессию не создаём.
     existing_user = get_user_by_identity(
@@ -926,11 +1094,17 @@ def telegram_merge_start(data: TelegramMergeStartRequest):
 
         provider_user_id = str(payload["sub"])
 
-    if provider == "apple" and not provider_user_id:
-        return {
-            "ok": False,
-            "message": "provider_user_id is required",
-        }
+    # Для Apple тоже доверяем только проверенному ID Token.
+    if provider == "apple":
+        payload = verify_apple_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Apple ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
 
     authenticated_user = get_user_by_identity(
         provider,
@@ -1430,11 +1604,17 @@ def link_telegram_verify(data: LinkTelegramVerifyRequest):
         provider_user_id = str(payload["sub"])
 
     # Apple пока оставляем по старой схеме.
-    if provider == "apple" and not provider_user_id:
-        return {
-            "ok": False,
-            "message": "provider_user_id is required",
-        }
+    # Для Apple тоже доверяем только проверенному ID Token.
+    if provider == "apple":
+        payload = verify_apple_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Apple ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
 
     storage_key = f"link:{telegram_id}"
     saved = codes_storage.get(storage_key)
@@ -1536,6 +1716,34 @@ def merge_telegram_verify(data: MergeTelegramVerifyRequest):
             return {
                 "ok": False,
                 "message": "Google профіль не відповідає поточному користувачу",
+            }
+
+    if provider == "apple":
+        payload = verify_apple_id_token(data.id_token or "")
+
+        if not payload:
+            return {
+                "ok": False,
+                "message": "Invalid Apple ID token",
+            }
+
+        provider_user_id = str(payload["sub"])
+
+        authenticated_user = get_user_by_identity(
+            provider,
+            provider_user_id,
+        )
+
+        if not authenticated_user:
+            return {
+                "ok": False,
+                "message": "Apple профіль не знайдено",
+            }
+
+        if authenticated_user["id"] != data.current_user_id:
+            return {
+                "ok": False,
+                "message": "Apple профіль не відповідає поточному користувачу",
             }
     # -------------------------------------------------
     # 1. Проверяем Telegram ID
