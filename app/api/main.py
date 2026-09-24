@@ -72,7 +72,7 @@ from app.wallet_pass import (
 from app.wallet_push import send_wallet_pushes
 from app.app_push import send_app_pushes
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+UPLOADS_DIR = "/data/uploads"
 SKIN_ASSETS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "wallet_assets",
