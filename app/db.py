@@ -73,8 +73,49 @@ def init_db():
                     inactive_14_30_days INTEGER NOT NULL DEFAULT 7
                         CHECK (inactive_14_30_days BETWEEN 1 AND 7),
 
+                    shop_news_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
+            """)
+
+            # =====================================================
+            # APP PUSH / SHOP NEWS SETTINGS
+            # =====================================================
+
+            # Для уже существующих кофеен добавляем отдельный переключатель
+            # пушей про новые карточки в блоке "Новинки".
+            cur.execute("""
+                ALTER TABLE shop_reminder_settings
+                ADD COLUMN IF NOT EXISTS
+                    shop_news_enabled BOOLEAN NOT NULL DEFAULT TRUE
+            """)
+
+            # Обычные APNs-токены приложения.
+            # Это отдельные токены от Apple Wallet pushToken.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_push_devices (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id) ON DELETE CASCADE,
+                    device_token TEXT NOT NULL UNIQUE,
+                    platform TEXT NOT NULL DEFAULT 'ios',
+                    environment TEXT NOT NULL DEFAULT 'production'
+                        CHECK (environment IN ('sandbox', 'production')),
+                    notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_app_push_devices_user_id
+                ON app_push_devices(user_id)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_app_push_devices_enabled
+                ON app_push_devices(user_id, notifications_enabled)
             """)
 
             cur.execute("""
@@ -2245,7 +2286,15 @@ def update_shop_reminder_settings(
     inactive_5_7_days: int,
     inactive_14_30_enabled: bool,
     inactive_14_30_days: int,
+    shop_news_enabled: bool = True,
 ):
+    """
+    Настройки уведомлений конкретной кофейни.
+
+    shop_news_enabled добавлен с default=True, чтобы текущий main.py
+    продолжал работать до того, как мы обновим API и админку.
+    """
+
     values = [
         one_left_days,
         free_coffee_days,
@@ -2269,11 +2318,12 @@ def update_shop_reminder_settings(
                     inactive_5_7_days,
                     inactive_14_30_enabled,
                     inactive_14_30_days,
+                    shop_news_enabled,
                     updated_at
                 )
                 VALUES (
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, NOW()
+                    %s, %s, %s, %s, %s, NOW()
                 )
                 ON CONFLICT (shop_id)
                 DO UPDATE SET
@@ -2285,6 +2335,7 @@ def update_shop_reminder_settings(
                     inactive_5_7_days = EXCLUDED.inactive_5_7_days,
                     inactive_14_30_enabled = EXCLUDED.inactive_14_30_enabled,
                     inactive_14_30_days = EXCLUDED.inactive_14_30_days,
+                    shop_news_enabled = EXCLUDED.shop_news_enabled,
                     updated_at = NOW()
                 RETURNING *
             """, (
@@ -2297,6 +2348,7 @@ def update_shop_reminder_settings(
                 inactive_5_7_days,
                 inactive_14_30_enabled,
                 inactive_14_30_days,
+                shop_news_enabled,
             ))
 
             return cur.fetchone()
@@ -2354,6 +2406,166 @@ def consume_admin_login_ticket(ticket: str):
             """, (clean_ticket,))
 
             return cur.fetchone()
+# =========================================================
+# APP PUSH DEVICES
+# =========================================================
+
+def register_app_push_device(
+    user_id: int,
+    device_token: str,
+    environment: str = "production",
+    platform: str = "ios",
+):
+    """
+    Регистрирует обычный APNs device token приложения.
+
+    Важно: это НЕ Wallet pushToken.
+    Один физический iPhone может получить новый token, поэтому
+    запись обновляется по device_token.
+    """
+
+    clean_token = (device_token or "").strip().lower()
+    clean_environment = (environment or "production").strip().lower()
+    clean_platform = (platform or "ios").strip().lower()
+
+    if not clean_token:
+        raise ValueError("device_token is required")
+
+    if clean_environment not in {"sandbox", "production"}:
+        raise ValueError("environment must be sandbox or production")
+
+    if clean_platform != "ios":
+        raise ValueError("only ios platform is supported")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # Токен мог раньше принадлежать другому users.id
+            # после выхода/входа или merge. Перепривязываем безопасно.
+            cur.execute("""
+                INSERT INTO app_push_devices (
+                    user_id,
+                    device_token,
+                    platform,
+                    environment,
+                    notifications_enabled,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, TRUE, NOW())
+                ON CONFLICT (device_token)
+                DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    platform = EXCLUDED.platform,
+                    environment = EXCLUDED.environment,
+                    notifications_enabled = TRUE,
+                    updated_at = NOW()
+                RETURNING *
+            """, (
+                user_id,
+                clean_token,
+                clean_platform,
+                clean_environment,
+            ))
+
+            return cur.fetchone()
+
+
+def set_app_push_device_enabled(
+    device_token: str,
+    enabled: bool,
+):
+    clean_token = (device_token or "").strip().lower()
+
+    if not clean_token:
+        return None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE app_push_devices
+                SET
+                    notifications_enabled = %s,
+                    updated_at = NOW()
+                WHERE device_token = %s
+                RETURNING *
+            """, (
+                bool(enabled),
+                clean_token,
+            ))
+
+            return cur.fetchone()
+
+
+def unregister_app_push_device(device_token: str):
+    clean_token = (device_token or "").strip().lower()
+
+    if not clean_token:
+        return False
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM app_push_devices
+                WHERE device_token = %s
+                RETURNING id
+            """, (clean_token,))
+
+            return cur.fetchone() is not None
+
+
+def get_app_push_devices_for_user(user_id: int):
+    """
+    Все включённые APNs-токены пользователя.
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    device_token,
+                    environment
+                FROM app_push_devices
+                WHERE user_id = %s
+                  AND notifications_enabled = TRUE
+                  AND platform = 'ios'
+                ORDER BY id
+            """, (user_id,))
+
+            return cur.fetchall()
+
+
+def get_app_push_devices_for_shop(shop_id: int):
+    """
+    Все включённые APNs-токены клиентов конкретной кофейни.
+    Используем для push по \"Новинкам\".
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT
+                    apd.user_id,
+                    apd.device_token,
+                    apd.environment
+                FROM shop_clients sc
+                JOIN app_push_devices apd
+                    ON apd.user_id = sc.user_id
+                WHERE sc.shop_id = %s
+                  AND apd.notifications_enabled = TRUE
+                  AND apd.platform = 'ios'
+                ORDER BY apd.user_id
+            """, (shop_id,))
+
+            return cur.fetchall()
+
+
+def remove_invalid_app_push_token(device_token: str):
+    """
+    Удаляем токен, если APNs сообщает, что он больше невалиден.
+    """
+
+    return unregister_app_push_device(device_token)
+
+
 # =========================================================
 # APPLE WALLET
 # =========================================================
