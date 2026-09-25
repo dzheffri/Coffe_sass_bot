@@ -1,6 +1,8 @@
 import uuid
+import secrets
+import hashlib
 from math import ceil
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from app.skin_catalog import SKIN_CATALOG
 from psycopg import connect
 from psycopg.rows import dict_row
@@ -413,6 +415,40 @@ def init_db():
                 ON user_identities(user_id)
             """)
 
+            # =====================================================
+            # APP SESSIONS
+            # Сессии iOS-приложения после успешного Google / Apple login.
+            # На устройстве хранится настоящий случайный token,
+            # в PostgreSQL — только его SHA-256 hash.
+            # =====================================================
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_sessions (
+                    id BIGSERIAL PRIMARY KEY,
+
+                    user_id BIGINT NOT NULL
+                        REFERENCES users(id)
+                        ON DELETE CASCADE,
+
+                    token_hash VARCHAR(64) NOT NULL UNIQUE,
+
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    revoked_at TIMESTAMPTZ NULL
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_app_sessions_user_id
+                ON app_sessions(user_id)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_app_sessions_expires_at
+                ON app_sessions(expires_at)
+            """)
+
             # Безопасно переносим существующие Telegram ID.
             # Пользователи, QR, чашки и подарки не изменяются.
             cur.execute("""
@@ -431,6 +467,322 @@ def init_db():
             """)
 
 init_db()
+
+
+# =========================================================
+# APP SESSIONS / ACCOUNT SECURITY
+# =========================================================
+
+APP_SESSION_TTL_DAYS = 30
+
+
+def _hash_app_session_token(token: str) -> str:
+    """
+    Возвращает SHA-256 hash session token.
+    Настоящий token в PostgreSQL не сохраняется.
+    """
+    clean_token = (token or "").strip()
+
+    if not clean_token:
+        return ""
+
+    return hashlib.sha256(
+        clean_token.encode("utf-8")
+    ).hexdigest()
+
+
+def create_app_session(user_id: int) -> str:
+    """
+    Создаёт новую session для пользователя и возвращает
+    настоящий opaque token для iPhone.
+
+    В БД сохраняется только SHA-256 hash.
+    """
+    token = secrets.token_urlsafe(32)
+    token_hash = _hash_app_session_token(token)
+    expires_at = utc_now() + timedelta(days=APP_SESSION_TTL_DAYS)
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app_sessions (
+                    user_id,
+                    token_hash,
+                    expires_at
+                )
+                VALUES (%s, %s, %s)
+                """,
+                (
+                    user_id,
+                    token_hash,
+                    expires_at,
+                ),
+            )
+
+    return token
+
+
+def get_app_session(token: str):
+    """
+    Проверяет session token и возвращает текущего пользователя.
+
+    Возвращает None, если token:
+    - отсутствует;
+    - неизвестен;
+    - истёк;
+    - был отозван.
+    """
+    token_hash = _hash_app_session_token(token)
+
+    if not token_hash:
+        return None
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.id AS session_id,
+                    s.user_id,
+                    s.created_at AS session_created_at,
+                    s.expires_at AS session_expires_at,
+                    s.last_used_at AS session_last_used_at,
+                    u.telegram_user_id,
+                    u.username,
+                    u.full_name,
+                    u.personal_qr_token,
+                    u.selected_card_design
+                FROM app_sessions s
+                JOIN users u
+                    ON u.id = s.user_id
+                WHERE s.token_hash = %s
+                  AND s.revoked_at IS NULL
+                  AND s.expires_at > NOW()
+                LIMIT 1
+                """,
+                (token_hash,),
+            )
+
+            session = cur.fetchone()
+
+            if not session:
+                return None
+
+            cur.execute(
+                """
+                UPDATE app_sessions
+                SET last_used_at = NOW()
+                WHERE id = %s
+                """,
+                (session["session_id"],),
+            )
+
+            return session
+
+
+def revoke_app_session(token: str) -> bool:
+    """
+    Logout только текущей session.
+    """
+    token_hash = _hash_app_session_token(token)
+
+    if not token_hash:
+        return False
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE app_sessions
+                SET revoked_at = NOW()
+                WHERE token_hash = %s
+                  AND revoked_at IS NULL
+                RETURNING id
+                """,
+                (token_hash,),
+            )
+
+            return cur.fetchone() is not None
+
+
+def revoke_all_user_sessions(user_id: int) -> int:
+    """
+    Отзывает все активные sessions пользователя.
+    Пригодится для security reset и перед удалением аккаунта.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE app_sessions
+                SET revoked_at = NOW()
+                WHERE user_id = %s
+                  AND revoked_at IS NULL
+                """,
+                (user_id,),
+            )
+
+            return cur.rowcount
+
+
+def delete_user_account(user_id: int):
+    """
+    Полностью удаляет пользовательский аккаунт.
+
+    Большинство связанных данных удаляются автоматически
+    благодаря ON DELETE CASCADE:
+    - user_identities;
+    - app_sessions;
+    - app_push_devices;
+    - shop_clients;
+    - transactions;
+    - reminder/touch/return logs;
+    - broadcasts, если пользователь был sender;
+    - shop_admins;
+    - wallet_passes.
+
+    wallet_device_registrations не имеет FK на users, поэтому
+    Wallet-регистрации удаляем вручную по serial_number.
+
+    telegram_link_sessions тоже не имеет FK, поэтому связанные
+    pending/completed link/merge sessions очищаем вручную, если
+    эта таблица уже существует.
+    """
+    conn = get_connection()
+
+    try:
+        conn.autocommit = False
+
+        with conn.cursor() as cur:
+            # Блокируем пользователя, чтобы удаление было атомарным.
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    telegram_user_id
+                FROM users
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (user_id,),
+            )
+
+            user = cur.fetchone()
+
+            if not user:
+                conn.rollback()
+                return {
+                    "status": "user_not_found",
+                }
+
+            # Находим Wallet serial до удаления wallet_passes.
+            cur.execute(
+                """
+                SELECT serial_number
+                FROM wallet_passes
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+            wallet_rows = cur.fetchall()
+            wallet_serials = [
+                row["serial_number"]
+                for row in wallet_rows
+                if row.get("serial_number")
+            ]
+
+            # wallet_device_registrations не связан FK с users/wallet_passes.
+            if wallet_serials:
+                cur.execute(
+                    """
+                    DELETE FROM wallet_device_registrations
+                    WHERE serial_number = ANY(%s)
+                    """,
+                    (wallet_serials,),
+                )
+
+            # Deep-link Telegram sessions создаются отдельно в main.py
+            # и не имеют FK. Таблица может отсутствовать в процессах,
+            # где импортируется только db.py, поэтому проверяем её наличие.
+            cur.execute("SELECT to_regclass('public.telegram_link_sessions') AS table_name")
+            telegram_sessions_table = cur.fetchone()
+
+            if (
+                telegram_sessions_table
+                and telegram_sessions_table.get("table_name")
+            ):
+                cur.execute(
+                    """
+                    DELETE FROM telegram_link_sessions
+                    WHERE user_id = %s
+                       OR current_user_id = %s
+                    """,
+                    (user_id, user_id),
+                )
+
+            # Старые admin login tickets привязаны по Telegram ID, не FK.
+            telegram_user_id = user.get("telegram_user_id")
+
+            if telegram_user_id is not None:
+                cur.execute(
+                    """
+                    DELETE FROM admin_login_tickets
+                    WHERE telegram_user_id = %s
+                    """,
+                    (telegram_user_id,),
+                )
+
+            # Удаление users.id запускает все ON DELETE CASCADE.
+            cur.execute(
+                """
+                DELETE FROM users
+                WHERE id = %s
+                RETURNING id
+                """,
+                (user_id,),
+            )
+
+            deleted_user = cur.fetchone()
+
+            if not deleted_user:
+                conn.rollback()
+                return {
+                    "status": "user_not_found",
+                }
+
+        conn.commit()
+
+        return {
+            "status": "deleted",
+            "user_id": user_id,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+def cleanup_expired_app_sessions() -> int:
+    """
+    Удаляет давно истёкшие/отозванные session-записи.
+    Не обязателен для работы auth, но пригодится для периодической очистки.
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM app_sessions
+                WHERE expires_at < NOW() - INTERVAL '30 days'
+                   OR revoked_at < NOW() - INTERVAL '30 days'
+                """
+            )
+
+            return cur.rowcount
 
 
 def ensure_user(
