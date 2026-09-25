@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import hashes
 from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone
 from app.skin_catalog import SKIN_CATALOG, skin_progress
-from fastapi import FastAPI, UploadFile, File, Request, Response, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Request, Response, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -47,6 +47,11 @@ from app.db import (
     merge_users,
     unlink_user_identity,
     create_user_with_identity,
+    create_app_session,
+    get_app_session,
+    revoke_app_session,
+    revoke_all_user_sessions,
+    delete_user_account,
     get_or_create_wallet_pass,
     get_wallet_pass_by_serial,
     set_wallet_card_design,
@@ -207,6 +212,63 @@ class AddAdminRequest(BaseModel):
 
 
 codes_storage: dict[str, dict] = {}
+
+# =========================================================
+# APP SESSION AUTH
+# =========================================================
+
+GUEST_USER_ID = 32650
+
+
+def _get_bearer_token_or_401(
+    authorization: str | None,
+) -> str:
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization header is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    scheme, separator, token = authorization.partition(" ")
+
+    if (
+        separator != " "
+        or scheme.lower() != "bearer"
+        or not token.strip()
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return token.strip()
+
+
+def get_current_user(
+    authorization: str | None = Header(default=None),
+):
+    token = _get_bearer_token_or_401(authorization)
+    session = get_app_session(token)
+
+    if not session:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired session",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return session
+
+
+def _create_login_response_session(user_id: int) -> dict:
+    return {
+        "access_token": create_app_session(user_id),
+        "token_type": "bearer",
+    }
+
+
 def verify_google_id_token(token: str):
     if not token:
         return None
@@ -863,12 +925,17 @@ def test_identity_auth(data: TestIdentityAuthRequest):
     )
 
     if existing_user:
+        session_data = _create_login_response_session(
+            existing_user["id"]
+        )
+
         return {
             "ok": True,
             "status": "existing",
             "user_id": existing_user["id"],
             "telegram_user_id": existing_user["telegram_user_id"],
             "personal_qr_token": existing_user["personal_qr_token"],
+            **session_data,
         }
 
     # -------------------------------------------------
@@ -922,12 +989,17 @@ def test_identity_auth(data: TestIdentityAuthRequest):
                 "status": link_result["status"],
             }
 
+        session_data = _create_login_response_session(
+            telegram_user["id"]
+        )
+
         return {
             "ok": True,
             "status": "linked",
             "user_id": telegram_user["id"],
             "telegram_user_id": telegram_user["telegram_user_id"],
             "personal_qr_token": telegram_user["personal_qr_token"],
+            **session_data,
         }
 
     # -------------------------------------------------
@@ -942,6 +1014,9 @@ def test_identity_auth(data: TestIdentityAuthRequest):
         )
 
         user = result["user"]
+        session_data = _create_login_response_session(
+            user["id"]
+        )
 
         return {
             "ok": True,
@@ -949,6 +1024,7 @@ def test_identity_auth(data: TestIdentityAuthRequest):
             "user_id": user["id"],
             "telegram_user_id": user["telegram_user_id"],
             "personal_qr_token": user["personal_qr_token"],
+            **session_data,
         }
 
     return {
@@ -1024,12 +1100,17 @@ def telegram_link_start(data: TelegramLinkStartRequest):
     )
 
     if existing_user:
+        session_data = _create_login_response_session(
+            existing_user["id"]
+        )
+
         return {
             "ok": True,
             "status": "existing",
             "user_id": existing_user["id"],
             "telegram_user_id": existing_user["telegram_user_id"],
             "personal_qr_token": existing_user["personal_qr_token"],
+            **session_data,
         }
 
     token = secrets.token_urlsafe(24)
@@ -1429,7 +1510,7 @@ def telegram_link_confirm(data: TelegramLinkConfirmRequest):
 
 @app.post("/auth/guest")
 def guest_auth():
-    guest_user_id = 32650
+    guest_user_id = GUEST_USER_ID
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -1454,13 +1535,173 @@ def guest_auth():
             "message": "Гостьовий профіль не знайдено",
         }
 
+    session_data = _create_login_response_session(
+        user["id"]
+    )
+
     return {
         "ok": True,
         "status": "guest",
         "user_id": user["id"],
         "telegram_user_id": user["telegram_user_id"],
         "personal_qr_token": user["personal_qr_token"],
+        **session_data,
     }
+
+
+# =========================================================
+# AUTHENTICATED APP SESSION ENDPOINTS
+# =========================================================
+
+@app.post("/auth/logout")
+def app_logout(
+    authorization: str | None = Header(default=None),
+):
+    token = _get_bearer_token_or_401(authorization)
+    session = get_app_session(token)
+
+    if not session:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired session",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    revoked = revoke_app_session(token)
+
+    return {
+        "ok": True,
+        "revoked": revoked,
+    }
+
+
+@app.get("/me")
+def me(
+    current_user=Depends(get_current_user),
+):
+    return {
+        "ok": True,
+        "user_id": current_user["user_id"],
+        "telegram_user_id": current_user["telegram_user_id"],
+        "username": current_user["username"],
+        "full_name": current_user["full_name"],
+        "personal_qr_token": current_user["personal_qr_token"],
+    }
+
+
+@app.get("/me/qr")
+def me_qr(
+    current_user=Depends(get_current_user),
+):
+    return account_qr(current_user["user_id"])
+
+
+@app.get("/me/shops")
+def me_shops(
+    current_user=Depends(get_current_user),
+):
+    return account_shops(current_user["user_id"])
+
+
+@app.get("/me/stats")
+def me_stats(
+    current_user=Depends(get_current_user),
+):
+    return account_stats(current_user["user_id"])
+
+
+@app.delete("/me")
+def delete_me(
+    current_user=Depends(get_current_user),
+):
+    user_id = current_user["user_id"]
+
+    if user_id == GUEST_USER_ID:
+        raise HTTPException(
+            status_code=403,
+            detail="Guest account cannot be deleted",
+        )
+
+    try:
+        result = delete_user_account(user_id)
+    except Exception as exc:
+        print("DELETE ACCOUNT ERROR:", repr(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to delete account",
+        )
+
+    if result["status"] == "user_not_found":
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    return {
+        "ok": True,
+        "status": "deleted",
+    }
+
+
+class MeUnlinkIdentityRequest(BaseModel):
+    provider: str
+
+
+@app.post("/me/unlink-identity")
+def unlink_my_identity(
+    data: MeUnlinkIdentityRequest,
+    current_user=Depends(get_current_user),
+):
+    provider = data.provider.strip().lower()
+
+    if provider not in {"apple", "google"}:
+        return {
+            "ok": False,
+            "status": "invalid_provider",
+            "message": "Можна відв'язати тільки Apple або Google",
+        }
+
+    result = unlink_user_identity(
+        user_id=current_user["user_id"],
+        provider=provider,
+    )
+
+    status = result["status"]
+
+    if status == "unlinked":
+        return {
+            "ok": True,
+            "status": "unlinked",
+            "message": "Спосіб входу успішно відв'язано",
+        }
+
+    if status == "not_linked":
+        return {
+            "ok": True,
+            "status": "not_linked",
+            "message": "Цей спосіб входу вже не прив'язаний",
+        }
+
+    if status == "last_identity":
+        return {
+            "ok": False,
+            "status": "last_identity",
+            "message": "Неможливо відв'язати єдиний спосіб входу",
+        }
+
+    if status == "user_not_found":
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    return {
+        "ok": False,
+        "status": status,
+        "message": "Не вдалося відв'язати спосіб входу",
+    }
+
+
 class UnlinkIdentityRequest(BaseModel):
     user_id: int
     provider: str
@@ -1688,6 +1929,10 @@ def link_telegram_verify(data: LinkTelegramVerifyRequest):
 
     del codes_storage[storage_key]
 
+    session_data = _create_login_response_session(
+        telegram_user["id"]
+    )
+
     return {
         "ok": True,
         "status": "linked",
@@ -1695,6 +1940,7 @@ def link_telegram_verify(data: LinkTelegramVerifyRequest):
         "user_id": telegram_user["id"],
         "telegram_user_id": telegram_user["telegram_user_id"],
         "personal_qr_token": telegram_user["personal_qr_token"],
+        **session_data,
     }
 
 
@@ -1828,6 +2074,10 @@ def merge_telegram_verify(data: MergeTelegramVerifyRequest):
     if data.current_user_id == target_user_id:
         del codes_storage[storage_key]
 
+        session_data = _create_login_response_session(
+            target_user_id
+        )
+
         return {
             "ok": True,
             "status": "already_merged",
@@ -1835,6 +2085,7 @@ def merge_telegram_verify(data: MergeTelegramVerifyRequest):
             "user_id": target_user_id,
             "telegram_user_id": telegram_user["telegram_user_id"],
             "personal_qr_token": telegram_user["personal_qr_token"],
+            **session_data,
         }
 
     # -------------------------------------------------
@@ -1886,6 +2137,10 @@ def merge_telegram_verify(data: MergeTelegramVerifyRequest):
     # 7. Возвращаем итоговый Telegram users.id
     # -------------------------------------------------
 
+    session_data = _create_login_response_session(
+        target_user_id
+    )
+
     return {
         "ok": True,
         "status": status,
@@ -1893,7 +2148,10 @@ def merge_telegram_verify(data: MergeTelegramVerifyRequest):
         "user_id": target_user_id,
         "telegram_user_id": telegram_user["telegram_user_id"],
         "personal_qr_token": telegram_user["personal_qr_token"],
+        **session_data,
     }
+
+
 @app.post("/auth/send-code")
 async def send_code(data: SendCodeRequest):
     telegram_id = data.telegram_id.strip()
@@ -2087,6 +2345,61 @@ def unregister_user_push_token(
     removed = unregister_app_push_device(
         clean_token
     )
+
+    return {
+        "ok": True,
+        "removed": removed,
+    }
+
+
+@app.post("/me/push-token")
+def register_my_push_token(
+    data: AppPushDeviceRequest,
+    current_user=Depends(get_current_user),
+):
+    return register_user_push_token(
+        user_id=current_user["user_id"],
+        data=data,
+    )
+
+
+@app.delete("/me/push-token")
+def unregister_my_push_token(
+    data: AppPushDeviceRemoveRequest,
+    current_user=Depends(get_current_user),
+):
+    clean_token = (data.device_token or "").strip()
+
+    if not clean_token:
+        raise HTTPException(
+            status_code=400,
+            detail="device_token is required",
+        )
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM app_push_devices
+                WHERE user_id = %s
+                  AND device_token = %s
+                LIMIT 1
+                """,
+                (
+                    current_user["user_id"],
+                    clean_token,
+                ),
+            )
+            device = cur.fetchone()
+
+    if not device:
+        return {
+            "ok": True,
+            "removed": False,
+        }
+
+    removed = unregister_app_push_device(clean_token)
 
     return {
         "ok": True,
@@ -2666,7 +2979,7 @@ async def upload_image(file: UploadFile = File(...)):
     }
 @app.get("/skins/{user_id}")
 async def get_skins(user_id: int):
-    if user_id == 32650:
+    if user_id == GUEST_USER_ID:
         stats = {
             "total_cups": 0,
             "total_free": 0,
@@ -2784,7 +3097,7 @@ async def download_wallet_pass(user_id: int):
 
     # Общему Apple Review guest-профилю
     # настоящую Wallet-карту не выдаём.
-    if user_id == 32650:
+    if user_id == GUEST_USER_ID:
         raise HTTPException(
             status_code=403,
             detail="Wallet is unavailable in guest mode",
@@ -2832,7 +3145,7 @@ async def update_wallet_design(
     user_id: int,
     payload: WalletDesignRequest,
 ):
-    if user_id == 32650:
+    if user_id == GUEST_USER_ID:
         raise HTTPException(
             status_code=403,
             detail="Wallet is unavailable in guest mode",
@@ -2907,6 +3220,28 @@ async def update_wallet_design(
         "serial_number": serial_number,
         "update_tag": updated_wallet["update_tag"],
     }
+
+
+@app.get("/me/wallet")
+async def download_my_wallet_pass(
+    current_user=Depends(get_current_user),
+):
+    return await download_wallet_pass(
+        current_user["user_id"]
+    )
+
+
+@app.post("/me/wallet/design")
+async def update_my_wallet_design(
+    payload: WalletDesignRequest,
+    current_user=Depends(get_current_user),
+):
+    return await update_wallet_design(
+        user_id=current_user["user_id"],
+        payload=payload,
+    )
+
+
 # ---------------------------------------------------------
 # APPLE WALLET WEB SERVICE
 #
