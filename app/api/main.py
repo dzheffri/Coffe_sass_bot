@@ -2213,47 +2213,47 @@ async def verify_code(data: VerifyCodeRequest):
     if not saved:
         return {
             "ok": False,
-            "message": "Код не знайдено"
+            "message": "Код не знайдено",
         }
 
     if datetime.utcnow() > saved["expires_at"]:
         return {
             "ok": False,
-            "message": "Код протух"
+            "message": "Код протух",
         }
 
     if code != saved["code"]:
         return {
             "ok": False,
-            "message": "Невірний код"
+            "message": "Невірний код",
         }
 
     del codes_storage[telegram_id]
 
-telegram_user = get_user_by_identity(
-    "telegram",
-    telegram_id,
-)
-
-if not telegram_user:
-    raise HTTPException(
-        status_code=404,
-        detail="Користувача Telegram не знайдено",
+    telegram_user = get_user_by_identity(
+        "telegram",
+        telegram_id,
     )
 
-session_data = _create_login_response_session(
-    telegram_user["id"]
-)
+    if not telegram_user:
+        raise HTTPException(
+            status_code=404,
+            detail="Користувача Telegram не знайдено",
+        )
 
-return {
-    "ok": True,
-    "telegram_id": int(telegram_id),
-    "is_superadmin": (
-        int(telegram_id)
-        in SUPERADMIN_TELEGRAM_IDS
-    ),
-    **session_data,
-}
+    session_data = _create_login_response_session(
+        telegram_user["id"]
+    )
+
+    return {
+        "ok": True,
+        "telegram_id": int(telegram_id),
+        "is_superadmin": (
+            int(telegram_id)
+            in SUPERADMIN_TELEGRAM_IDS
+        ),
+        **session_data,
+    }
 
 
 # =========================================================
