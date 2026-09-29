@@ -177,7 +177,8 @@ class UpdateShopRequest(BaseModel):
     logo_url: str = ""
     cover_url: str = ""
     news: list[ShopNewsItem] = []
-
+class ModerationRejectRequest(BaseModel):
+    reason: str = ""
 
 class ReminderSettingsRequest(BaseModel):
     one_left_enabled: bool
@@ -262,7 +263,24 @@ def get_current_user(
         )
 
     return session
+def require_superadmin(
+    current_user=Depends(get_current_user),
+):
+    telegram_id = current_user.get("telegram_user_id")
 
+    if not telegram_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Telegram не підключено",
+        )
+
+    if int(telegram_id) not in SUPERADMIN_TELEGRAM_IDS:
+        raise HTTPException(
+            status_code=403,
+            detail="Недостатньо прав",
+        )
+
+    return current_user
 
 def _create_login_response_session(user_id: int) -> dict:
     return {
@@ -2739,7 +2757,241 @@ def owner_analytics_clients(owner_telegram_id: int):
 def owner_analytics_details(owner_telegram_id: int):
     return get_owner_details_stats(owner_telegram_id)
 
+# =========================================================
+# SUPERADMIN MODERATION
+# =========================================================
 
+@app.get("/superadmin/moderation/pending")
+def superadmin_pending_requests(
+    current_user=Depends(require_superadmin),
+):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    scr.id,
+                    scr.shop_id,
+                    scr.submitted_by_telegram_id,
+                    scr.status,
+                    scr.payload,
+                    scr.created_at,
+                    cs.name AS shop_name
+                FROM shop_change_requests scr
+                LEFT JOIN coffee_shops cs
+                    ON cs.id = scr.shop_id
+                WHERE scr.status = 'pending'
+                ORDER BY scr.created_at ASC
+                """
+            )
+
+            rows = cur.fetchall()
+
+    requests = []
+
+    for row in rows:
+        requests.append({
+            "id": row["id"],
+            "shop_id": row["shop_id"],
+            "shop_name": row["shop_name"] or "",
+            "submitted_by_telegram_id": (
+                row["submitted_by_telegram_id"]
+            ),
+            "status": row["status"],
+            "payload": row["payload"],
+            "created_at": (
+                row["created_at"].isoformat()
+                if row["created_at"]
+                else None
+            ),
+        })
+
+    return {
+        "ok": True,
+        "count": len(requests),
+        "requests": requests,
+    }
+
+
+@app.post(
+    "/superadmin/moderation/{request_id}/approve"
+)
+async def superadmin_approve_request(
+    request_id: int,
+    current_user=Depends(require_superadmin),
+):
+    reviewer_telegram_id = int(
+        current_user["telegram_user_id"]
+    )
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    scr.id,
+                    scr.shop_id,
+                    scr.status,
+                    scr.payload,
+                    owner.telegram_user_id AS owner_telegram_id
+                FROM shop_change_requests scr
+
+                LEFT JOIN shop_admins sa
+                    ON sa.shop_id = scr.shop_id
+                   AND sa.role = 'owner'
+
+                LEFT JOIN users owner
+                    ON owner.id = sa.user_id
+
+                WHERE scr.id = %s
+                LIMIT 1
+                """,
+                (request_id,),
+            )
+
+            request_row = cur.fetchone()
+
+    if not request_row:
+        raise HTTPException(
+            status_code=404,
+            detail="Заявку не знайдено",
+        )
+
+    if request_row["status"] != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail="Заявка вже оброблена",
+        )
+
+    owner_telegram_id = request_row[
+        "owner_telegram_id"
+    ]
+
+    if not owner_telegram_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Власника кавʼярні не знайдено",
+        )
+
+    payload = request_row["payload"] or {}
+
+    news_payload = payload.get("news") or []
+
+    result = update_shop_profile(
+        owner_telegram_id=owner_telegram_id,
+        name=payload.get("name", ""),
+        subtitle=payload.get("subtitle", ""),
+        address=payload.get("address", ""),
+        work_from=payload.get("work_from", ""),
+        work_to=payload.get("work_to", ""),
+        instagram=payload.get("instagram", ""),
+        description=payload.get("description", ""),
+        logo_url=payload.get("logo_url", ""),
+        cover_url=payload.get("cover_url", ""),
+        news=news_payload,
+    )
+
+    if not result or not result.get("ok"):
+        raise HTTPException(
+            status_code=500,
+            detail="Не вдалося застосувати зміни",
+        )
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE shop_change_requests
+                SET
+                    status = 'approved',
+                    reviewed_at = NOW(),
+                    reviewed_by_telegram_id = %s,
+                    reject_reason = NULL
+                WHERE id = %s
+                  AND status = 'pending'
+                """,
+                (
+                    reviewer_telegram_id,
+                    request_id,
+                ),
+            )
+
+    return {
+        "ok": True,
+        "status": "approved",
+        "request_id": request_id,
+        "shop_id": request_row["shop_id"],
+    }
+
+
+@app.post(
+    "/superadmin/moderation/{request_id}/reject"
+)
+def superadmin_reject_request(
+    request_id: int,
+    data: ModerationRejectRequest,
+    current_user=Depends(require_superadmin),
+):
+    reviewer_telegram_id = int(
+        current_user["telegram_user_id"]
+    )
+
+    reason = (data.reason or "").strip()
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    shop_id,
+                    status
+                FROM shop_change_requests
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (request_id,),
+            )
+
+            request_row = cur.fetchone()
+
+            if not request_row:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Заявку не знайдено",
+                )
+
+            if request_row["status"] != "pending":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Заявка вже оброблена",
+                )
+
+            cur.execute(
+                """
+                UPDATE shop_change_requests
+                SET
+                    status = 'rejected',
+                    reject_reason = %s,
+                    reviewed_at = NOW(),
+                    reviewed_by_telegram_id = %s
+                WHERE id = %s
+                  AND status = 'pending'
+                """,
+                (
+                    reason,
+                    reviewer_telegram_id,
+                    request_id,
+                ),
+            )
+
+    return {
+        "ok": True,
+        "status": "rejected",
+        "request_id": request_id,
+        "shop_id": request_row["shop_id"],
+        "reason": reason,
+    }
 # =========================================================
 # REMINDER SETTINGS
 # =========================================================
