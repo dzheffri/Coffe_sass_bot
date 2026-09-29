@@ -2993,6 +2993,273 @@ def superadmin_reject_request(
         "reason": reason,
     }
 # =========================================================
+# SUPERADMIN SHOPS MANAGEMENT
+# =========================================================
+
+@app.get("/superadmin/shops")
+def superadmin_get_shops(
+    current_user=Depends(require_superadmin),
+):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    cs.id,
+                    cs.name,
+                    cs.city,
+                    cs.address,
+                    cs.subtitle,
+                    cs.work_from,
+                    cs.work_to,
+                    cs.instagram,
+                    cs.description,
+                    cs.logo_url,
+                    cs.cover_url,
+                    cs.is_active,
+                    cs.pending_owner_telegram_id,
+
+                    (
+                        SELECT u.telegram_user_id
+                        FROM shop_admins sa
+                        JOIN users u
+                            ON u.id = sa.user_id
+                        WHERE sa.shop_id = cs.id
+                          AND sa.role = 'owner'
+                        ORDER BY sa.id
+                        LIMIT 1
+                    ) AS owner_telegram_id
+
+                FROM coffee_shops cs
+                ORDER BY cs.name ASC, cs.id ASC
+                """
+            )
+
+            rows = cur.fetchall()
+
+    shops = []
+
+    for row in rows:
+        shops.append(
+            {
+                "shop_id": row["id"],
+                "name": row["name"] or "",
+                "city": row["city"] or "",
+                "address": row["address"] or "",
+                "subtitle": row["subtitle"] or "",
+                "work_from": row["work_from"] or "",
+                "work_to": row["work_to"] or "",
+                "instagram": row["instagram"] or "",
+                "description": row["description"] or "",
+                "logo_url": row["logo_url"] or "",
+                "cover_url": row["cover_url"] or "",
+                "is_active": bool(row["is_active"]),
+                "owner_telegram_id": (
+                    row["owner_telegram_id"]
+                    or row["pending_owner_telegram_id"]
+                ),
+            }
+        )
+
+    return {
+        "ok": True,
+        "count": len(shops),
+        "shops": shops,
+    }
+
+
+@app.get("/superadmin/shops/{shop_id}")
+def superadmin_get_shop(
+    shop_id: int,
+    current_user=Depends(require_superadmin),
+):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    cs.id,
+                    cs.name,
+                    cs.city,
+                    cs.address,
+                    cs.subtitle,
+                    cs.work_from,
+                    cs.work_to,
+                    cs.instagram,
+                    cs.description,
+                    cs.logo_url,
+                    cs.cover_url,
+                    cs.is_active,
+                    cs.pending_owner_telegram_id,
+
+                    (
+                        SELECT u.telegram_user_id
+                        FROM shop_admins sa
+                        JOIN users u
+                            ON u.id = sa.user_id
+                        WHERE sa.shop_id = cs.id
+                          AND sa.role = 'owner'
+                        ORDER BY sa.id
+                        LIMIT 1
+                    ) AS owner_telegram_id
+
+                FROM coffee_shops cs
+                WHERE cs.id = %s
+                LIMIT 1
+                """,
+                (shop_id,),
+            )
+
+            shop = cur.fetchone()
+
+            if not shop:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Кавʼярню не знайдено",
+                )
+
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    title,
+                    price,
+                    image_url,
+                    sort_order
+                FROM shop_news
+                WHERE shop_id = %s
+                ORDER BY sort_order ASC, id ASC
+                """,
+                (shop_id,),
+            )
+
+            news_rows = cur.fetchall()
+
+    return {
+        "ok": True,
+        "shop": {
+            "shop_id": shop["id"],
+            "name": shop["name"] or "",
+            "city": shop["city"] or "",
+            "address": shop["address"] or "",
+            "subtitle": shop["subtitle"] or "",
+            "work_from": shop["work_from"] or "",
+            "work_to": shop["work_to"] or "",
+            "instagram": shop["instagram"] or "",
+            "description": shop["description"] or "",
+            "logo_url": shop["logo_url"] or "",
+            "cover_url": shop["cover_url"] or "",
+            "is_active": bool(shop["is_active"]),
+            "owner_telegram_id": (
+                shop["owner_telegram_id"]
+                or shop["pending_owner_telegram_id"]
+            ),
+            "news": [
+                {
+                    "id": item["id"],
+                    "title": item["title"] or "",
+                    "price": item["price"] or "",
+                    "image_url": item["image_url"] or "",
+                    "sort_order": item["sort_order"] or 0,
+                }
+                for item in news_rows
+            ],
+        },
+    }
+
+
+@app.put("/superadmin/shops/{shop_id}")
+def superadmin_update_shop(
+    shop_id: int,
+    data: UpdateShopRequest,
+    current_user=Depends(require_superadmin),
+):
+    with get_connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM coffee_shops
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (shop_id,),
+                )
+
+                existing_shop = cur.fetchone()
+
+                if not existing_shop:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Кавʼярню не знайдено",
+                    )
+
+                cur.execute(
+                    """
+                    UPDATE coffee_shops
+                    SET
+                        name = %s,
+                        subtitle = %s,
+                        address = %s,
+                        work_from = %s,
+                        work_to = %s,
+                        instagram = %s,
+                        description = %s,
+                        logo_url = %s,
+                        cover_url = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        data.name,
+                        data.subtitle,
+                        data.address,
+                        data.work_from,
+                        data.work_to,
+                        data.instagram,
+                        data.description,
+                        data.logo_url,
+                        data.cover_url,
+                        shop_id,
+                    ),
+                )
+
+                cur.execute(
+                    """
+                    DELETE FROM shop_news
+                    WHERE shop_id = %s
+                    """,
+                    (shop_id,),
+                )
+
+                for index, item in enumerate(data.news):
+                    cur.execute(
+                        """
+                        INSERT INTO shop_news (
+                            shop_id,
+                            title,
+                            price,
+                            image_url,
+                            sort_order
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            shop_id,
+                            item.title,
+                            item.price,
+                            item.image_url,
+                            index,
+                        ),
+                    )
+
+    return {
+        "ok": True,
+        "shop_id": shop_id,
+        "status": "updated",
+        "message": "Кавʼярню оновлено супер-адміністратором",
+    }    
+# =========================================================
 # REMINDER SETTINGS
 # =========================================================
 
