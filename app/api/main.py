@@ -218,7 +218,9 @@ codes_storage: dict[str, dict] = {}
 # =========================================================
 
 GUEST_USER_ID = 32650
-
+SUPERADMIN_TELEGRAM_IDS = {
+    566408696,
+}
 
 def _get_bearer_token_or_401(
     authorization: str | None,
@@ -2228,8 +2230,30 @@ async def verify_code(data: VerifyCodeRequest):
 
     del codes_storage[telegram_id]
 
-    return {"ok": True}
+telegram_user = get_user_by_identity(
+    "telegram",
+    telegram_id,
+)
 
+if not telegram_user:
+    raise HTTPException(
+        status_code=404,
+        detail="Користувача Telegram не знайдено",
+    )
+
+session_data = _create_login_response_session(
+    telegram_user["id"]
+)
+
+return {
+    "ok": True,
+    "telegram_id": int(telegram_id),
+    "is_superadmin": (
+        int(telegram_id)
+        in SUPERADMIN_TELEGRAM_IDS
+    ),
+    **session_data,
+}
 
 
 # =========================================================
