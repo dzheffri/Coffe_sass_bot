@@ -2410,7 +2410,118 @@ def unregister_my_push_token(
 @app.get("/owner/shop/{owner_telegram_id}")
 def owner_get_shop(owner_telegram_id: int):
     return get_shop_profile(owner_telegram_id)
+@app.post("/owner/shop/{owner_telegram_id}/submit-changes")
+def owner_submit_shop_changes(
+    owner_telegram_id: int,
+    data: UpdateShopRequest,
+):
+    shop_id = get_owner_shop_id(owner_telegram_id)
 
+    if not shop_id:
+        raise HTTPException(
+            status_code=403,
+            detail="У вас немає доступу до цієї кавʼярні",
+        )
+
+    payload = {
+        "name": data.name,
+        "subtitle": data.subtitle,
+        "address": data.address,
+        "work_from": data.work_from,
+        "work_to": data.work_to,
+        "instagram": data.instagram,
+        "description": data.description,
+        "logo_url": data.logo_url,
+        "cover_url": data.cover_url,
+        "news": [
+            item.dict()
+            for item in data.news
+        ],
+    }
+
+    payload_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+    )
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+
+            # Если у этой кофейни уже есть заявка,
+            # которая ещё не проверена,
+            # просто обновляем её.
+            # Так не будет 10 pending-заявок подряд.
+            cur.execute(
+                """
+                SELECT id
+                FROM shop_change_requests
+                WHERE shop_id = %s
+                  AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (shop_id,),
+            )
+
+            pending_request = cur.fetchone()
+
+            if pending_request:
+                request_id = pending_request["id"]
+
+                cur.execute(
+                    """
+                    UPDATE shop_change_requests
+                    SET
+                        submitted_by_telegram_id = %s,
+                        payload = %s::jsonb,
+                        reject_reason = NULL,
+                        created_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        owner_telegram_id,
+                        payload_json,
+                        request_id,
+                    ),
+                )
+
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO shop_change_requests (
+                        shop_id,
+                        submitted_by_telegram_id,
+                        status,
+                        payload
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        'pending',
+                        %s::jsonb
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        shop_id,
+                        owner_telegram_id,
+                        payload_json,
+                    ),
+                )
+
+                created = cur.fetchone()
+                request_id = created["id"]
+
+    return {
+        "ok": True,
+        "status": "pending",
+        "request_id": request_id,
+        "shop_id": shop_id,
+        "message": (
+            "Зміни збережено та надіслано "
+            "на перевірку"
+        ),
+    }
 
 @app.put("/owner/shop/{owner_telegram_id}")
 async def owner_update_shop(
