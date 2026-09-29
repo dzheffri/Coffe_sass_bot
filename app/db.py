@@ -570,13 +570,15 @@ def get_app_session(token: str):
                 return None
 
             cur.execute(
-                """
-                UPDATE app_sessions
-                SET last_used_at = NOW()
-                WHERE id = %s
-                """,
-                (session["session_id"],),
-            )
+    """
+    UPDATE app_sessions
+    SET
+        last_used_at = NOW(),
+        expires_at = NOW() + INTERVAL '30 days'
+    WHERE id = %s
+    """,
+    (session["session_id"],),
+)
 
             return session
 
