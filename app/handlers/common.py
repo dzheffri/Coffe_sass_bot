@@ -2,7 +2,7 @@ from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-import httpx
+import asyncio
 
 from app.db import (
     ensure_user,
@@ -15,12 +15,10 @@ from app.db import (
 )
 from app.keyboards import user_main_keyboard, admin_main_keyboard
 from app.config import SUPER_ADMIN_IDS, SCANNER_URL, ADMIN_PANEL_URL
+from app.telegram_link import bind_telegram_link_session, confirm_telegram_link_session
 
 
 router = Router()
-
-BACKEND_URL = "https://coffesassbot-production.up.railway.app"
-
 
 def get_personal_admin_panel_url(user_id: int) -> str:
     ticket = create_admin_login_ticket(user_id)
@@ -140,9 +138,26 @@ async def start_handler(
     if args.startswith("link_"):
         token = args.removeprefix("link_").strip()
 
-        if not token:
+        if (not token or not message.from_user
+                or message.chat.type != "private"
+                or message.chat.id != message.from_user.id):
             await message.answer(
                 "❌ Посилання для підключення некоректне.\n"
+                "Поверніться в застосунок «Наші» та спробуйте ще раз."
+            )
+            return
+
+        try:
+            binding = await asyncio.to_thread(
+                bind_telegram_link_session, token, message.from_user.id
+            )
+        except Exception as error:
+            print("TELEGRAM LINK BIND ERROR:", repr(error))
+            binding = {"ok": False}
+
+        if not binding.get("ok"):
+            await message.answer(
+                "❌ Посилання для підключення недійсне.\n"
                 "Поверніться в застосунок «Наші» та спробуйте ще раз."
             )
             return
@@ -169,7 +184,10 @@ async def start_handler(
 
 @router.callback_query(F.data.startswith("tg_link_confirm:"))
 async def confirm_telegram_link(callback: types.CallbackQuery):
-    if not callback.data or not callback.from_user:
+    if (not callback.data or not callback.from_user
+            or not callback.message
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
         return
 
     token = callback.data.split(":", 1)[1].strip()
@@ -184,16 +202,9 @@ async def confirm_telegram_link(callback: types.CallbackQuery):
     await callback.answer("Підтверджуємо...")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                f"{BACKEND_URL}/auth/telegram-link/confirm",
-                json={
-                    "token": token,
-                    "telegram_id": callback.from_user.id,
-                },
-            )
-
-        data = response.json()
+        data = await asyncio.to_thread(
+            confirm_telegram_link_session, token, callback.from_user.id
+        )
 
     except Exception as error:
         print("TELEGRAM LINK CONFIRM ERROR:", repr(error))

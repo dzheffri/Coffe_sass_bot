@@ -432,10 +432,22 @@ def init_db():
 
                     token_hash VARCHAR(64) NOT NULL UNIQUE,
 
+                    purpose TEXT NOT NULL DEFAULT 'client'
+                        CONSTRAINT app_sessions_purpose_check
+                        CHECK (purpose IN ('client', 'barista')),
+                    selected_membership_id BIGINT NULL
+                        CONSTRAINT app_sessions_selected_membership_fkey
+                        REFERENCES shop_admins(id) ON DELETE CASCADE,
+
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     expires_at TIMESTAMPTZ NOT NULL,
                     last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    revoked_at TIMESTAMPTZ NULL
+                    revoked_at TIMESTAMPTZ NULL,
+                    CONSTRAINT app_sessions_context_check CHECK (
+                        (purpose = 'client' AND selected_membership_id IS NULL)
+                        OR
+                        (purpose = 'barista' AND selected_membership_id IS NOT NULL)
+                    )
                 )
             """)
 
@@ -491,34 +503,75 @@ def _hash_app_session_token(token: str) -> str:
     ).hexdigest()
 
 
-def create_app_session(user_id: int) -> str:
+def _hash_barista_session_token(token: str) -> str:
+    """Separate hash namespace: even old client-only code cannot match staff tokens."""
+    clean_token = (token or "").strip()
+    if not clean_token:
+        return ""
+    # The binary 0xff marker cannot be produced by the legacy UTF-8 encoder.
+    # A holder cannot turn this into a legacy credential by prepending a label.
+    return hashlib.sha256(
+        b"\xffnashi.barista.session.v1\0" + clean_token.encode("utf-8")
+    ).hexdigest()
+
+
+def create_app_session(
+    user_id: int,
+    *,
+    purpose: str = "client",
+    selected_membership_id: int | None = None,
+) -> str:
     """
     Создаёт новую session для пользователя и возвращает
     настоящий opaque token для iPhone.
 
     В БД сохраняется только SHA-256 hash.
     """
+    if purpose not in ("client", "barista"):
+        raise ValueError("Unsupported session purpose")
+    if (purpose == "client") != (selected_membership_id is None):
+        raise ValueError("Session context does not match its purpose")
+
     token = secrets.token_urlsafe(32)
-    token_hash = _hash_app_session_token(token)
+    token_hash = (
+        _hash_barista_session_token(token) if purpose == "barista"
+        else _hash_app_session_token(token)
+    )
     expires_at = utc_now() + timedelta(days=APP_SESSION_TTL_DAYS)
 
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO app_sessions (
-                    user_id,
-                    token_hash,
-                    expires_at
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if purpose == "barista":
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM shop_admins
+                        WHERE id = %s AND user_id = %s
+                          AND role IN ('admin', 'owner')
+                        FOR SHARE
+                        """,
+                        (selected_membership_id, user_id),
+                    )
+                    if cur.fetchone() is None:
+                        raise ValueError("STAFF_ACCESS_REQUIRED")
+
+                cur.execute(
+                    """
+                    INSERT INTO app_sessions (
+                        user_id, token_hash, expires_at,
+                        purpose, selected_membership_id
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        user_id,
+                        token_hash,
+                        expires_at,
+                        purpose,
+                        selected_membership_id,
+                    ),
                 )
-                VALUES (%s, %s, %s)
-                """,
-                (
-                    user_id,
-                    token_hash,
-                    expires_at,
-                ),
-            )
 
     return token
 
@@ -557,6 +610,7 @@ def get_app_session(token: str):
                 JOIN users u
                     ON u.id = s.user_id
                 WHERE s.token_hash = %s
+                  AND s.purpose = 'client'
                   AND s.revoked_at IS NULL
                   AND s.expires_at > NOW()
                 LIMIT 1
@@ -570,24 +624,37 @@ def get_app_session(token: str):
                 return None
 
             cur.execute(
-    """
-    UPDATE app_sessions
-    SET
-        last_used_at = NOW(),
-        expires_at = NOW() + INTERVAL '30 days'
-    WHERE id = %s
-    """,
-    (session["session_id"],),
-)
+                """
+                UPDATE app_sessions
+                SET last_used_at = NOW(),
+                    expires_at = NOW() + INTERVAL '30 days'
+                WHERE id = %s
+                  AND purpose = 'client'
+                  AND revoked_at IS NULL
+                  AND expires_at > NOW()
+                RETURNING expires_at AS session_expires_at,
+                          last_used_at AS session_last_used_at
+                """,
+                (session["session_id"],),
+            )
+            updated = cur.fetchone()
+            if updated is None:
+                return None
+            session.update(updated)
 
             return session
 
 
-def revoke_app_session(token: str) -> bool:
+def revoke_app_session(token: str, *, purpose: str = "client") -> bool:
     """
     Logout только текущей session.
     """
-    token_hash = _hash_app_session_token(token)
+    if purpose not in ("client", "barista"):
+        raise ValueError("Unsupported session purpose")
+    token_hash = (
+        _hash_barista_session_token(token) if purpose == "barista"
+        else _hash_app_session_token(token)
+    )
 
     if not token_hash:
         return False
@@ -599,20 +666,23 @@ def revoke_app_session(token: str) -> bool:
                 UPDATE app_sessions
                 SET revoked_at = NOW()
                 WHERE token_hash = %s
+                  AND purpose = %s
                   AND revoked_at IS NULL
                 RETURNING id
                 """,
-                (token_hash,),
+                (token_hash, purpose),
             )
 
             return cur.fetchone() is not None
 
 
-def revoke_all_user_sessions(user_id: int) -> int:
+def revoke_all_user_sessions(user_id: int, *, purpose: str | None = None) -> int:
     """
     Отзывает все активные sessions пользователя.
     Пригодится для security reset и перед удалением аккаунта.
     """
+    if purpose is not None and purpose not in ("client", "barista"):
+        raise ValueError("Unsupported session purpose")
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -620,9 +690,10 @@ def revoke_all_user_sessions(user_id: int) -> int:
                 UPDATE app_sessions
                 SET revoked_at = NOW()
                 WHERE user_id = %s
+                  AND (%s::text IS NULL OR purpose = %s)
                   AND revoked_at IS NULL
                 """,
-                (user_id,),
+                (user_id, purpose, purpose),
             )
 
             return cur.rowcount

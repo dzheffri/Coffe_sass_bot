@@ -76,6 +76,8 @@ from app.wallet_pass import (
 
 from app.wallet_push import send_wallet_pushes
 from app.app_push import send_app_pushes
+from app.api.barista import build_barista_router
+from app.telegram_link import confirm_telegram_link_session
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = "/data/uploads"
 SKIN_ASSETS_DIR = os.path.join(
@@ -263,6 +265,51 @@ def get_current_user(
         )
 
     return session
+
+
+def get_verified_telegram_actor(authorization: str | None, init_data: str | None):
+    """Resolve an actor from an existing verified session or Telegram WebApp proof."""
+    if authorization:
+        current = get_current_user(authorization)
+        telegram_id = current.get("telegram_user_id")
+        if telegram_id is None:
+            raise HTTPException(403, detail={"code": "TELEGRAM_PROFILE_REQUIRED"})
+        return {"telegram_id": int(telegram_id), "user_id": current["user_id"]}
+    if init_data:
+        validated = validate_telegram_init_data(init_data)
+        if not validated:
+            raise HTTPException(401, detail={"code": "INVALID_TELEGRAM_CONTEXT"})
+        user = get_user_by_identity("telegram", str(validated["telegram_id"]))
+        if not user:
+            raise HTTPException(403, detail={"code": "TELEGRAM_PROFILE_REQUIRED"})
+        return {"telegram_id": validated["telegram_id"], "user_id": user["id"]}
+    raise HTTPException(401, detail={"code": "AUTHENTICATION_REQUIRED"})
+
+
+def require_owner_for_path(
+    owner_telegram_id: int,
+    authorization: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+):
+    actor = get_verified_telegram_actor(authorization, x_telegram_init_data)
+    if actor["telegram_id"] != owner_telegram_id:
+        raise HTTPException(403, detail={"code": "OWNER_ACCESS_REQUIRED"})
+    with get_connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT sa.shop_id
+                    FROM shop_admins sa
+                    WHERE sa.user_id = %s AND sa.role = 'owner'
+                    ORDER BY sa.id
+                    FOR SHARE
+                """, (actor["user_id"],))
+                memberships = cur.fetchall()
+                if not memberships:
+                    raise HTTPException(403, detail={"code": "OWNER_ACCESS_REQUIRED"})
+                yield {**actor, "owner_shop_ids": [row["shop_id"] for row in memberships]}
+
+
 def require_superadmin(
     current_user=Depends(get_current_user),
 ):
@@ -289,7 +336,7 @@ def _create_login_response_session(user_id: int) -> dict:
     }
 
 
-def verify_google_id_token(token: str):
+def verify_google_id_token(token: str, *, audience: str | None = None):
     if not token:
         return None
 
@@ -297,7 +344,7 @@ def verify_google_id_token(token: str):
         payload = id_token.verify_oauth2_token(
             token,
             google_requests.Request(),
-            audience=os.getenv("GOOGLE_CLIENT_ID"),
+            audience=audience or os.getenv("GOOGLE_CLIENT_ID"),
         )
 
         if payload.get("iss") not in {
@@ -358,9 +405,11 @@ def _load_apple_keys():
     return keys
 
 
-def verify_apple_id_token(token: str):
+def verify_apple_id_token(token: str, *, audience: str | None = None):
     if not token:
         return None
+
+    expected_audience = audience or APPLE_CLIENT_ID
 
     try:
         parts = token.split(".")
@@ -444,12 +493,12 @@ def verify_apple_id_token(token: str):
         if payload.get("iss") != APPLE_ISSUER:
             return None
 
-        audience = payload.get("aud")
+        token_audience = payload.get("aud")
 
-        if isinstance(audience, list):
-            if APPLE_CLIENT_ID not in audience:
+        if isinstance(token_audience, list):
+            if expected_audience not in token_audience:
                 return None
-        elif audience != APPLE_CLIENT_ID:
+        elif token_audience != expected_audience:
             return None
 
         exp = payload.get("exp")
@@ -468,6 +517,14 @@ def verify_apple_id_token(token: str):
     except Exception as e:
         print("APPLE TOKEN VERIFY ERROR:", e)
         return None
+
+
+app.include_router(build_barista_router(
+    verify_google=verify_google_id_token,
+    verify_apple=verify_apple_id_token,
+    find_user=get_user_by_identity,
+    parse_bearer=_get_bearer_token_or_401,
+))
 
 
 def validate_telegram_init_data(init_data: str, max_age_seconds: int = 86400):
@@ -975,51 +1032,10 @@ def test_identity_auth(data: TestIdentityAuthRequest):
     # -------------------------------------------------
 
     if action == "link_telegram":
-
-        if data.telegram_id is None:
-            return {
-                "ok": False,
-                "message": "Telegram ID is required",
-            }
-
-        telegram_user = get_user_by_identity(
-            "telegram",
-            str(data.telegram_id),
-        )
-
-        if not telegram_user:
-            return {
-                "ok": False,
-                "message": "Telegram користувача не знайдено",
-            }
-
-        link_result = link_user_identity(
-            telegram_user["id"],
-            provider,
-            provider_user_id,
-        )
-
-        if link_result["status"] not in {
-            "linked",
-            "already_linked",
-        }:
-            return {
-                "ok": False,
-                "message": "Не вдалося прив'язати акаунт",
-                "status": link_result["status"],
-            }
-
-        session_data = _create_login_response_session(
-            telegram_user["id"]
-        )
-
         return {
-            "ok": True,
-            "status": "linked",
-            "user_id": telegram_user["id"],
-            "telegram_user_id": telegram_user["telegram_user_id"],
-            "personal_qr_token": telegram_user["personal_qr_token"],
-            **session_data,
+            "ok": False,
+            "status": "requires_verified_link",
+            "message": "Підтвердіть підключення через Telegram link flow",
         }
 
     # -------------------------------------------------
@@ -1064,7 +1080,8 @@ class TelegramLinkStartRequest(BaseModel):
 
 class TelegramLinkConfirmRequest(BaseModel):
     token: str
-    telegram_id: int
+    telegram_id: int | None = None
+    init_data: str | None = None
 
 
 class TelegramMergeStartRequest(BaseModel):
@@ -1354,174 +1371,20 @@ def telegram_link_status(token: str):
 
 
 @app.post("/auth/telegram-link/confirm")
-def telegram_link_confirm(data: TelegramLinkConfirmRequest):
-    token = data.token.strip()
-
-    if not token:
-        return {
-            "ok": False,
-            "status": "not_found",
-            "message": "Сесію не знайдено",
-        }
-
-    token_hash = _telegram_link_token_hash(token)
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    provider,
-                    provider_user_id,
-                    mode,
-                    current_user_id,
-                    status,
-                    expires_at,
-                    telegram_user_id,
-                    user_id,
-                    personal_qr_token
-                FROM telegram_link_sessions
-                WHERE token_hash = %s
-                LIMIT 1
-                """,
-                (token_hash,),
-            )
-            session = cur.fetchone()
-
-    if not session:
-        return {
-            "ok": False,
-            "status": "not_found",
-            "message": "Сесію не знайдено",
-        }
-
-    if session["status"] == "confirmed":
-        return {
-            "ok": True,
-            "status": "confirmed",
-            "user_id": session["user_id"],
-            "telegram_user_id": session["telegram_user_id"],
-            "personal_qr_token": session["personal_qr_token"],
-        }
-
-    if datetime.now(timezone.utc) > session["expires_at"]:
-        return {
-            "ok": False,
-            "status": "expired",
-            "message": "Час підтвердження завершився",
-        }
-
-    telegram_user = get_user_by_identity(
-        "telegram",
-        str(data.telegram_id),
+def telegram_link_confirm(
+    data: TelegramLinkConfirmRequest,
+    authorization: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+):
+    actor = get_verified_telegram_actor(
+        authorization, x_telegram_init_data or data.init_data,
     )
-
-    if not telegram_user:
-        return {
-            "ok": False,
-            "status": "telegram_not_found",
-            "message": "Профіль Telegram у «Наші» не знайдено",
-        }
-
-    session_mode = session["mode"] or "link"
-
-    if session_mode == "merge":
-        current_user_id = session["current_user_id"]
-
-        if not current_user_id:
-            return {
-                "ok": False,
-                "status": "merge_error",
-                "message": "Не вдалося визначити поточний профіль",
-            }
-
-        target_user_id = telegram_user["id"]
-
-        if current_user_id == target_user_id:
-            action_status = "already_merged"
-        else:
-            try:
-                merge_result = merge_users(
-                    source_user_id=current_user_id,
-                    target_user_id=target_user_id,
-                )
-            except Exception as e:
-                print("TELEGRAM DEEPLINK MERGE ERROR:", e)
-                return {
-                    "ok": False,
-                    "status": "merge_error",
-                    "message": "Не вдалося об’єднати профілі",
-                }
-
-            action_status = merge_result["status"]
-
-            if action_status not in {
-                "merged",
-                "already_merged",
-            }:
-                return {
-                    "ok": False,
-                    "status": action_status,
-                    "message": (
-                        "Не вдалося об’єднати профілі"
-                        if action_status != "provider_conflict"
-                        else "Ці профілі мають різні способи входу одного типу"
-                    ),
-                }
-
-    else:
-        link_result = link_user_identity(
-            telegram_user["id"],
-            session["provider"],
-            session["provider_user_id"],
-        )
-
-        action_status = link_result["status"]
-
-        if action_status not in {
-            "linked",
-            "already_linked",
-        }:
-            return {
-                "ok": False,
-                "status": action_status,
-                "message": "Не вдалося прив’язати профіль",
-            }
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE telegram_link_sessions
-                SET
-                    status = 'confirmed',
-                    telegram_user_id = %s,
-                    user_id = %s,
-                    personal_qr_token = %s,
-                    confirmed_at = NOW()
-                WHERE token_hash = %s
-                """,
-                (
-                    telegram_user["telegram_user_id"],
-                    telegram_user["id"],
-                    telegram_user["personal_qr_token"],
-                    token_hash,
-                ),
-            )
-
-    return {
-        "ok": True,
-        "status": "confirmed",
-        "action_status": action_status,
-        "message": (
-            "Профілі успішно об’єднано"
-            if session_mode == "merge"
-            else "Профіль успішно підключено"
-        ),
-        "user_id": telegram_user["id"],
-        "telegram_user_id": telegram_user["telegram_user_id"],
-        "personal_qr_token": telegram_user["personal_qr_token"],
-    }
+    if data.telegram_id is not None and data.telegram_id != actor["telegram_id"]:
+        raise HTTPException(403, detail={"code": "TELEGRAM_ACTOR_MISMATCH"})
+    result = confirm_telegram_link_session(data.token, actor["telegram_id"])
+    if result.get("status") in {"actor_mismatch", "unbound", "not_bound"}:
+        raise HTTPException(403, detail={"code": "TELEGRAM_ACTOR_MISMATCH"})
+    return result
 
 
 # =========================================================
@@ -1728,7 +1591,12 @@ class UnlinkIdentityRequest(BaseModel):
 
 
 @app.post("/auth/unlink-identity")
-def unlink_identity(data: UnlinkIdentityRequest):
+def unlink_identity(
+    data: UnlinkIdentityRequest,
+    current_user=Depends(get_current_user),
+):
+    if data.user_id != current_user["user_id"]:
+        raise HTTPException(403, detail={"code": "IDENTITY_OWNER_REQUIRED"})
     provider = data.provider.strip().lower()
 
     if provider not in {"apple", "google"}:
@@ -1739,7 +1607,7 @@ def unlink_identity(data: UnlinkIdentityRequest):
         }
 
     result = unlink_user_identity(
-        user_id=data.user_id,
+        user_id=current_user["user_id"],
         provider=provider,
     )
 
@@ -3394,7 +3262,7 @@ def owner_update_reminder_settings(
 # =========================================================
 
 @app.get("/owner/settings/{owner_telegram_id}/admins")
-def owner_get_admins(owner_telegram_id: int):
+def owner_get_admins(owner_telegram_id: int, owner=Depends(require_owner_for_path)):
     shop_id = get_owner_shop_id(owner_telegram_id)
 
     if not shop_id:
@@ -3425,7 +3293,8 @@ def owner_get_admins(owner_telegram_id: int):
 @app.post("/owner/settings/{owner_telegram_id}/admins")
 def owner_add_admin(
     owner_telegram_id: int,
-    data: AddAdminRequest
+    data: AddAdminRequest,
+    owner=Depends(require_owner_for_path),
 ):
     shop_id = get_owner_shop_id(owner_telegram_id)
 
@@ -3490,7 +3359,8 @@ def owner_add_admin(
 )
 def owner_delete_admin(
     owner_telegram_id: int,
-    admin_telegram_id: int
+    admin_telegram_id: int,
+    owner=Depends(require_owner_for_path),
 ):
     shop_id = get_owner_shop_id(owner_telegram_id)
 
