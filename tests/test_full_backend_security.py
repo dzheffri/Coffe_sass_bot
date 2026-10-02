@@ -140,6 +140,7 @@ def full_backend_audit(local_connection):
     "cannot_self_grant_admin_and_authorized_owner_flows_work",
     "cannot_unlink_foreign_identity_and_own_unlink_works",
     "session_purpose_isolation_real_routes_and_issuance_gate",
+    "real_barista_qr_operations_readonly_atomic_and_delivery_isolated",
     "unmodified_old_backend_rejects_barista",
     "real_bot_private_actor_binding_and_confirmation",
     "real_bot_existing_merge_preserves_balance_and_revokes_source",

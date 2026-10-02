@@ -14,7 +14,9 @@ import sys
 import types
 import uuid
 from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import psycopg
 import pytest
@@ -74,20 +76,35 @@ def safe_db(local_connection):
     module.__dict__.update({
         "hashlib": hashlib, "secrets": secrets, "datetime": datetime,
         "timedelta": timedelta, "timezone": timezone,
-        "APP_SESSION_TTL_DAYS": 30, "get_connection": connect,
+        "nullcontext": nullcontext,
+        "APP_SESSION_TTL_DAYS": 30, "LOYALTY_TARGET": 7, "get_connection": connect,
     })
     extract_definitions(PROJECT / "app/db.py", {
         "utc_now", "_hash_app_session_token", "_hash_barista_session_token", "create_app_session",
         "get_app_session", "revoke_app_session", "revoke_all_user_sessions",
-        "get_user_by_identity",
+        "get_user_by_identity", "get_user_by_qr_token",
+        "get_shop_client_balance_by_user_id", "add_cups_for_shop_client",
+        "redeem_free_for_shop_client", "get_last_marketing_touch", "save_return_log",
+        "get_subscription", "subscription_is_active",
     }, module.__dict__)
     previous = sys.modules.get("app.db")
+    previous_notifications = sys.modules.get("app.loyalty_notifications")
+    notifications = types.ModuleType("app.loyalty_notifications")
+    notifications.notify_cups_added = AsyncMock()
+    notifications.notify_free_redeemed = AsyncMock()
     sys.modules["app.db"] = module
+    # API integration tests exercise the actual router and PostgreSQL operations;
+    # external delivery is replaced before importing bot/config startup modules.
+    sys.modules["app.loyalty_notifications"] = notifications
     yield module
     if previous is None:
         sys.modules.pop("app.db", None)
     else:
         sys.modules["app.db"] = previous
+    if previous_notifications is None:
+        sys.modules.pop("app.loyalty_notifications", None)
+    else:
+        sys.modules["app.loyalty_notifications"] = previous_notifications
 
 
 LEGACY_SCHEMA = """

@@ -356,7 +356,65 @@ def _security_scenarios(main, db, client, query, auth, state, report):
     assert client.get("/barista/me", headers=auth(other_barista)).status_code == 401
     report["session_purpose_isolation_real_routes_and_issuance_gate"] = True
 
+    _real_barista_operations(db, client, query, auth, report)
     _real_bot_regressions(main, db, client, query, auth, jwt, report)
+
+
+def _real_barista_operations(db, client, query, auth, report):
+    """Exercise the actual Stage 2 router/imports with only delivery mocked."""
+    from app.api import barista
+    from unittest.mock import patch
+
+    os.environ["BARISTA_LOGIN_ENABLED"] = "false"
+    token = db.create_app_session(1, purpose="barista", selected_membership_id=1)
+    headers = auth(token)
+    body = {"qr_token": "coffee:guest-qr"}
+    paths = ("/barista/scan", "/barista/add-cup", "/barista/redeem")
+    for path in paths:
+        assert client.post(path, json=body).status_code == 401
+        assert client.post(path, headers=auth("legacy-active"), json=body).status_code == 401
+        assert client.post(path, headers=headers, json={**body, "shop_id": 2}).status_code == 422
+        assert client.post(path, headers=headers,
+            json={"qr_token": "coffee:unknown-qr"}).status_code == 404
+
+    session_before = query("SELECT * FROM app_sessions WHERE token_hash=%s",
+                          (db._hash_barista_session_token(token),))
+    balance_before = query("SELECT * FROM shop_clients WHERE user_id=32650")
+    scan = client.post("/barista/scan", headers=headers, json=body)
+    assert scan.status_code == 200, scan.text
+    assert scan.json()["client"]["cups"] == 0
+    assert scan.json()["shop"] == {"id": 1, "name": "Local cafe"}
+    assert query("SELECT * FROM shop_clients WHERE user_id=32650") == balance_before == []
+    assert query("SELECT * FROM app_sessions WHERE token_hash=%s",
+                 (db._hash_barista_session_token(token),)) == session_before
+
+    query("""INSERT INTO subscriptions(shop_id,plan,status,expires_at)
+        VALUES(1,'basic','active',NOW()+INTERVAL '30 days')
+        ON CONFLICT(shop_id) DO UPDATE SET status='active',expires_at=EXCLUDED.expires_at""")
+    query("INSERT INTO shop_clients(shop_id,user_id,cups) VALUES(1,32650,6)")
+    with patch.object(barista, "notify_cups_added", AsyncMock()) as added, \
+         patch.object(barista, "notify_free_redeemed", AsyncMock()) as redeemed:
+        response = client.post("/barista/add-cup", headers=headers, json=body)
+        assert response.status_code == 200, response.text
+        assert response.json()["client"]["cups"] == 0
+        assert response.json()["client"]["free_coffee_balance"] == 1
+        assert response.json()["operation"]["free_coffee_earned"] == 1
+        added.assert_awaited_once()
+        response = client.post("/barista/redeem", headers=headers, json=body)
+        assert response.status_code == 200, response.text
+        assert response.json()["client"]["free_coffee_balance"] == 0
+        redeemed.assert_awaited_once()
+        response = client.post("/barista/redeem", headers=headers, json=body)
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "NO_FREE_COFFEE"
+        # A delivery failure happens after the shared loyalty transaction commits.
+        added.side_effect = RuntimeError("offline delivery unavailable")
+        response = client.post("/barista/add-cup", headers=headers, json=body)
+        assert response.status_code == 200
+        assert query("SELECT cups FROM shop_clients WHERE shop_id=1 AND user_id=32650")[0]["cups"] == 1
+    assert query("SELECT COUNT(*) AS n FROM transactions WHERE shop_id=1 AND user_id=32650")[0]["n"] == 3
+    assert os.environ["BARISTA_LOGIN_ENABLED"] == "false"
+    report["real_barista_qr_operations_readonly_atomic_and_delivery_isolated"] = True
 
 
 def _real_bot_regressions(main, db, client, query, auth, jwt, report):

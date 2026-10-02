@@ -1,6 +1,7 @@
 import uuid
 import secrets
 import hashlib
+from contextlib import nullcontext
 from math import ceil
 from datetime import datetime, timezone, timedelta
 from app.skin_catalog import SKIN_CATALOG
@@ -15,6 +16,7 @@ TOUCH_TYPE_BROADCAST = "broadcast"
 TOUCH_TYPE_SERVICE = "service"
 
 VALID_TOUCH_TYPES = (TOUCH_TYPE_AUTO, TOUCH_TYPE_BROADCAST, TOUCH_TYPE_SERVICE)
+LOYALTY_TARGET = 7
 
 
 def utc_now():
@@ -1704,8 +1706,8 @@ def create_user_with_identity(
                 "user": user,
                 "identity": identity,
             }
-def get_user_by_qr_token(token: str):
-    with get_connection() as conn:
+def get_user_by_qr_token(token: str, *, connection=None):
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM users WHERE personal_qr_token = %s",
@@ -1992,8 +1994,8 @@ def save_touch_log(shop_id: int, user_id: int, touch_type: str, sent_at=None):
             return cur.fetchone()
 
 
-def get_last_marketing_touch(shop_id: int, user_id: int, days: int = 7):
-    with get_connection() as conn:
+def get_last_marketing_touch(shop_id: int, user_id: int, days: int = 7, *, connection=None):
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT *
@@ -2008,11 +2010,11 @@ def get_last_marketing_touch(shop_id: int, user_id: int, days: int = 7):
             return cur.fetchone()
 
 
-def save_return_log(shop_id: int, user_id: int, touch_log_id: int, touch_type: str):
+def save_return_log(shop_id: int, user_id: int, touch_log_id: int, touch_type: str, *, connection=None):
     if touch_type not in ("auto", "broadcast"):
         return None
 
-    with get_connection() as conn:
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO return_logs (user_id, shop_id, touch_log_id, touch_type)
@@ -2023,160 +2025,181 @@ def save_return_log(shop_id: int, user_id: int, touch_log_id: int, touch_type: s
             return cur.fetchone()
 
 
-def add_cups_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: int, count: int):
+def add_cups_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: int, count: int, *, connection=None):
     if count <= 0:
         raise ValueError("count must be > 0")
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT *
-                FROM shop_clients
-                WHERE shop_id = %s AND user_id = %s
-            """, (shop_id, client_user_id))
-            row = cur.fetchone()
-
-            if not row:
+    # A caller transaction keeps authorization and loyalty writes together.
+    # Nested transactions are savepoints; this never commits the caller scope.
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO shop_clients (shop_id, user_id, last_activity_at)
-                    VALUES (%s, %s, NOW())
-                    RETURNING *
+                    SELECT *
+                    FROM shop_clients
+                    WHERE shop_id = %s AND user_id = %s
+                    FOR UPDATE
                 """, (shop_id, client_user_id))
                 row = cur.fetchone()
 
-            last_touch = get_last_marketing_touch(shop_id=shop_id, user_id=client_user_id, days=7)
+                if not row:
+                    cur.execute("""
+                        INSERT INTO shop_clients (shop_id, user_id, last_activity_at)
+                        VALUES (%s, %s, NOW())
+                        ON CONFLICT (shop_id, user_id) DO NOTHING
+                    """, (shop_id, client_user_id))
+                    # Concurrent first purchases share the existing unique key.
+                    # Re-read and lock the winner's row before applying the rule.
+                    cur.execute("""
+                        SELECT *
+                        FROM shop_clients
+                        WHERE shop_id = %s AND user_id = %s
+                        FOR UPDATE
+                    """, (shop_id, client_user_id))
+                    row = cur.fetchone()
 
-            total_cups = row["cups"] + count
-            earned_free = total_cups // 7
-            remaining_cups = total_cups % 7
+                last_touch = get_last_marketing_touch(
+                    shop_id=shop_id, user_id=client_user_id, days=7, connection=conn
+                )
 
-            cur.execute("""
-                UPDATE shop_clients
-                SET cups = %s,
-                    total_scans = total_scans + %s,
-                    free_coffee_balance = free_coffee_balance + %s,
-                    total_free_coffee_earned = total_free_coffee_earned + %s,
-                    last_activity_at = NOW()
-                WHERE shop_id = %s AND user_id = %s
-                RETURNING *
-            """, (
-                remaining_cups,
-                count,
-                earned_free,
-                earned_free,
-                shop_id,
-                client_user_id,
-            ))
-            updated = cur.fetchone()
+                total_cups = row["cups"] + count
+                earned_free = total_cups // LOYALTY_TARGET
+                remaining_cups = total_cups % LOYALTY_TARGET
 
-            cur.execute("""
-                INSERT INTO transactions (
-                    shop_id, user_id, admin_user_id, type, cups_added, free_redeemed
-                ) VALUES (%s, %s, %s, 'add_cups', %s, 0)
-            """, (shop_id, client_user_id, admin_user_id, count))
+                cur.execute("""
+                    UPDATE shop_clients
+                    SET cups = %s,
+                        total_scans = total_scans + %s,
+                        free_coffee_balance = free_coffee_balance + %s,
+                        total_free_coffee_earned = total_free_coffee_earned + %s,
+                        last_activity_at = NOW()
+                    WHERE shop_id = %s AND user_id = %s
+                    RETURNING *
+                """, (
+                    remaining_cups,
+                    count,
+                    earned_free,
+                    earned_free,
+                    shop_id,
+                    client_user_id,
+                ))
+                updated = cur.fetchone()
 
-            cur.execute("""
-                INSERT INTO touch_logs (user_id, shop_id, type)
-                VALUES (%s, %s, 'service')
-            """, (client_user_id, shop_id))
+                cur.execute("""
+                    INSERT INTO transactions (
+                        shop_id, user_id, admin_user_id, type, cups_added, free_redeemed
+                    ) VALUES (%s, %s, %s, 'add_cups', %s, 0)
+                """, (shop_id, client_user_id, admin_user_id, count))
 
-            saved_return = None
-            if last_touch:
-                saved_return = save_return_log(
+                cur.execute("""
+                    INSERT INTO touch_logs (user_id, shop_id, type)
+                    VALUES (%s, %s, 'service')
+                """, (client_user_id, shop_id))
+
+                saved_return = None
+                if last_touch:
+                    saved_return = save_return_log(
+                        shop_id=shop_id,
+                        user_id=client_user_id,
+                        touch_log_id=last_touch["id"],
+                        touch_type=last_touch["type"],
+                        connection=conn,
+                    )
+
+                return {
+                    "shop_client": updated,
+                    "earned_free": earned_free,
+                    "last_touch": last_touch,
+                    "return_source": last_touch["type"] if saved_return else None,
+                    "saved_return": saved_return,
+                }
+
+
+def redeem_free_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: int, *, connection=None):
+    # A caller transaction keeps authorization and loyalty writes together.
+    # Nested transactions are savepoints; this never commits the caller scope.
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT *
+                    FROM shop_clients
+                    WHERE shop_id = %s AND user_id = %s
+                    FOR UPDATE
+                """, (shop_id, client_user_id))
+
+                row = cur.fetchone()
+
+                if not row:
+                    return "NOT_FOUND"
+
+                if row["free_coffee_balance"] <= 0:
+                    return "EMPTY"
+
+                # Ищем последнее маркетинговое сообщение клиенту
+                # за последние 7 дней.
+                last_touch = get_last_marketing_touch(
                     shop_id=shop_id,
                     user_id=client_user_id,
-                    touch_log_id=last_touch["id"],
-                    touch_type=last_touch["type"],
+                    days=7,
+                    connection=conn,
                 )
 
-            return {
-                "shop_client": updated,
-                "earned_free": earned_free,
-                "last_touch": last_touch,
-                "return_source": last_touch["type"] if saved_return else None,
-                "saved_return": saved_return,
-            }
+                # Списываем бесплатный кофе
+                cur.execute("""
+                    UPDATE shop_clients
+                    SET free_coffee_balance = free_coffee_balance - 1,
+                        total_free_coffee_redeemed = total_free_coffee_redeemed + 1,
+                        last_activity_at = NOW()
+                    WHERE shop_id = %s AND user_id = %s
+                    RETURNING *
+                """, (shop_id, client_user_id))
 
+                updated = cur.fetchone()
 
-def redeem_free_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: int):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT *
-                FROM shop_clients
-                WHERE shop_id = %s AND user_id = %s
-            """, (shop_id, client_user_id))
-
-            row = cur.fetchone()
-
-            if not row:
-                return "NOT_FOUND"
-
-            if row["free_coffee_balance"] <= 0:
-                return "EMPTY"
-
-            # Ищем последнее маркетинговое сообщение клиенту
-            # за последние 7 дней.
-            last_touch = get_last_marketing_touch(
-                shop_id=shop_id,
-                user_id=client_user_id,
-                days=7
-            )
-
-            # Списываем бесплатный кофе
-            cur.execute("""
-                UPDATE shop_clients
-                SET free_coffee_balance = free_coffee_balance - 1,
-                    total_free_coffee_redeemed = total_free_coffee_redeemed + 1,
-                    last_activity_at = NOW()
-                WHERE shop_id = %s AND user_id = %s
-                RETURNING *
-            """, (shop_id, client_user_id))
-
-            updated = cur.fetchone()
-
-            # Сохраняем операцию списания
-            cur.execute("""
-                INSERT INTO transactions (
+                # Сохраняем операцию списания
+                cur.execute("""
+                    INSERT INTO transactions (
+                        shop_id,
+                        user_id,
+                        admin_user_id,
+                        type,
+                        cups_added,
+                        free_redeemed
+                    )
+                    VALUES (%s, %s, %s, 'redeem_free', 0, 1)
+                """, (
                     shop_id,
-                    user_id,
-                    admin_user_id,
-                    type,
-                    cups_added,
-                    free_redeemed
-                )
-                VALUES (%s, %s, %s, 'redeem_free', 0, 1)
-            """, (
-                shop_id,
-                client_user_id,
-                admin_user_id
-            ))
+                    client_user_id,
+                    admin_user_id
+                ))
 
-            # Сам визит тоже фиксируем как service-touch
-            cur.execute("""
-                INSERT INTO touch_logs (
-                    user_id,
-                    shop_id,
-                    type
-                )
-                VALUES (%s, %s, 'service')
-            """, (
-                client_user_id,
-                shop_id
-            ))
+                # Сам визит тоже фиксируем как service-touch
+                cur.execute("""
+                    INSERT INTO touch_logs (
+                        user_id,
+                        shop_id,
+                        type
+                    )
+                    VALUES (%s, %s, 'service')
+                """, (
+                    client_user_id,
+                    shop_id
+                ))
 
-            # Если перед визитом была авто-рассылка
-            # или собственная рассылка владельца,
-            # считаем этот визит возвратом.
-            if last_touch:
-                save_return_log(
-                    shop_id=shop_id,
-                    user_id=client_user_id,
-                    touch_log_id=last_touch["id"],
-                    touch_type=last_touch["type"],
-                )
+                # Если перед визитом была авто-рассылка
+                # или собственная рассылка владельца,
+                # считаем этот визит возвратом.
+                if last_touch:
+                    save_return_log(
+                        shop_id=shop_id,
+                        user_id=client_user_id,
+                        touch_log_id=last_touch["id"],
+                        touch_type=last_touch["type"],
+                        connection=conn,
+                    )
 
-            return updated
+                return updated
 
 
 def get_shop_client_balance(shop_id: int, telegram_user_id: int):
@@ -2192,8 +2215,8 @@ def get_shop_client_balance(shop_id: int, telegram_user_id: int):
             return cur.fetchone()
 
 
-def get_shop_client_balance_by_user_id(shop_id: int, user_id: int):
-    with get_connection() as conn:
+def get_shop_client_balance_by_user_id(shop_id: int, user_id: int, *, connection=None):
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT sc.*, cs.name AS shop_name
@@ -2375,8 +2398,8 @@ def get_super_admin_clients_stats():
     }
 
 
-def get_subscription(shop_id: int):
-    with get_connection() as conn:
+def get_subscription(shop_id: int, *, connection=None):
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT *
@@ -2386,8 +2409,8 @@ def get_subscription(shop_id: int):
             return cur.fetchone()
 
 
-def subscription_is_active(shop_id: int):
-    sub = get_subscription(shop_id)
+def subscription_is_active(shop_id: int, *, connection=None):
+    sub = get_subscription(shop_id, connection=connection)
     if not sub:
         return False
     if sub["status"] != "active":

@@ -1,5 +1,7 @@
 """Opaque staff sessions; no client token can enter this authorization path."""
 
+from contextlib import nullcontext
+
 from app.db import _hash_barista_session_token, get_connection
 
 
@@ -31,6 +33,8 @@ def resolve_barista_session(
     *,
     shop_id: int | None = None,
     logout: bool = False,
+    connection=None,
+    touch: bool = True,
 ) -> dict:
     """Authorize current membership before extending, selecting context or logout.
 
@@ -38,13 +42,19 @@ def resolve_barista_session(
     membership deletion followed by the session FK cascade. Context changes and
     revocations are re-read under the session lock; a stale read cannot revive
     an expired/revoked session or overwrite an unchecked shop context.
+
+    A supplied connection keeps these locks until the caller's outer transaction
+    commits, so loyalty operations can use the same verified membership. Pure
+    read-only callers can set touch=False: no locks or session writes occur.
     """
+    if not touch and (shop_id is not None or logout):
+        raise ValueError("Read-only authorization cannot change session context")
     token_hash = _hash_barista_session_token(token)
     if not token_hash:
         raise BaristaSessionError("INVALID_SESSION")
 
-    with get_connection() as conn:
-        with conn.transaction():
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
+        with (conn.transaction() if touch else nullcontext()):
             with conn.cursor() as cur:
                 # This lookup does not extend the session or lock it before staff.
                 cur.execute(
@@ -68,8 +78,7 @@ def resolve_barista_session(
                     JOIN coffee_shops cs ON cs.id = sa.shop_id
                     WHERE sa.user_id = %s AND sa.role IN ('admin', 'owner')
                     ORDER BY sa.id
-                    FOR SHARE OF sa
-                    """,
+                    """ + (" FOR SHARE OF sa" if touch else ""),
                     (candidate["user_id"],),
                 )
                 memberships = cur.fetchall()
@@ -84,8 +93,7 @@ def resolve_barista_session(
                     WHERE s.token_hash = %s AND s.user_id = %s
                       AND s.purpose = 'barista' AND s.revoked_at IS NULL
                       AND s.expires_at > statement_timestamp()
-                    FOR UPDATE OF s
-                    """,
+                    """ + (" FOR UPDATE OF s" if touch else ""),
                     (token_hash, candidate["user_id"]),
                 )
                 session = cur.fetchone()
@@ -115,6 +123,10 @@ def resolve_barista_session(
                     )
                     if selected is None:
                         raise BaristaSessionError("SHOP_ACCESS_DENIED")
+
+                if not touch:
+                    session["memberships"] = memberships
+                    return session
 
                 if logout:
                     cur.execute(
