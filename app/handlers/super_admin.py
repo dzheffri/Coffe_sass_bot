@@ -335,7 +335,7 @@ async def global_broadcast_start(message: types.Message, state: FSMContext):
 
     await state.set_state(SuperAdminStates.waiting_global_broadcast_text)
     await message.answer(
-        "📢 Надішли текст розсилки для всіх користувачів бота.\n\n"
+        "📢 Надішли текст, фото, відео, GIF або документ для всіх користувачів бота.\n\n"
         "Щоб скасувати — напиши: скасувати"
     )
     
@@ -378,9 +378,10 @@ async def global_broadcast_send(message: types.Message, state: FSMContext):
 
     for telegram_id in telegram_ids:
         try:
-            await message.bot.send_message(
+            await message.bot.copy_message(
                 chat_id=int(telegram_id),
-                text=text
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
             )
             sent += 1
         except Exception as e:

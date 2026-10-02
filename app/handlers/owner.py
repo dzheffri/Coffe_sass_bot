@@ -257,11 +257,12 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
 
     await state.set_state(OwnerStates.waiting_broadcast_text)
     await message.answer(
-        "Надішли текст, фото або відео для розсилки.\n\n"
+        "Надішли текст, фото, відео, GIF або документ для розсилки.\n\n"
         "Можна:\n"
         "• просто текст\n"
         "• фото з текстом або без тексту\n"
-        "• відео з текстом або без тексту\n\n"
+        "• відео з текстом або без тексту\n"
+        "• GIF або документ із підписом чи без нього\n\n"
         "Спочатку я покажу передперегляд, і тільки після підтвердження розсилка піде клієнтам.\n\n"
         "Щоб скасувати, натисни кнопку нижче.",
         reply_markup=broadcast_cancel_keyboard()
@@ -297,40 +298,23 @@ async def broadcast_preview_handler(message: types.Message, state: FSMContext):
         return
 
     text = (message.text or message.caption or "").strip()
-    photo_id = message.photo[-1].file_id if message.photo else None
-    video_id = message.video.file_id if message.video else None
 
-    if not text and not photo_id and not video_id:
-        await message.answer("❌ Надішли текст, фото або відео.")
+    if not (message.text or message.photo or message.video or message.animation or message.document):
+        await message.answer("❌ Надішли текст, фото, відео, GIF або документ.")
         return
 
     await state.update_data(
         broadcast_text=text,
-        broadcast_photo=photo_id,
-        broadcast_video=video_id,
+        broadcast_from_chat_id=message.chat.id,
+        broadcast_message_id=message.message_id,
     )
 
-    preview_caption = f"📣 Передперегляд розсилки\n\n🏪 {admin_shop['name']}"
-    if text:
-        preview_caption += f"\n\n{text}"
-
-    if photo_id:
-        await message.answer_photo(
-            photo=photo_id,
-            caption=preview_caption,
-            reply_markup=broadcast_preview_keyboard()
-        )
-    elif video_id:
-        await message.answer_video(
-            video=video_id,
-            caption=preview_caption,
-            reply_markup=broadcast_preview_keyboard()
-        )
-    else:
-        await message.answer(
-            preview_caption,
-            reply_markup=broadcast_preview_keyboard()
-        )
+    await message.bot.copy_message(
+        chat_id=message.chat.id,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+        reply_markup=broadcast_preview_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "broadcast_cancel")
@@ -358,13 +342,18 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
 
     data = await state.get_data()
     text = (data.get("broadcast_text") or "").strip()
-    photo_id = data.get("broadcast_photo")
-    video_id = data.get("broadcast_video")
+    from_chat_id = data.get("broadcast_from_chat_id")
+    message_id = data.get("broadcast_message_id")
 
     admin_shop = get_admin_shop_and_role(callback.from_user.id)
     if not admin_shop:
         await state.clear()
         await callback.answer("❌ Не вдалося визначити кав’ярню.", show_alert=True)
+        return
+
+    if from_chat_id is None or message_id is None:
+        await state.clear()
+        await callback.answer("❌ Надішли повідомлення для розсилки ще раз.", show_alert=True)
         return
 
     recipients = get_broadcast_recipients(admin_shop["id"])
@@ -391,27 +380,11 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
 
     for row in recipients:
         try:
-            final_caption = f"🏪 {admin_shop['name']}"
-            if text:
-                final_caption += f"\n\n{text}"
-
-            if photo_id:
-                await callback.bot.send_photo(
-                    chat_id=row["telegram_user_id"],
-                    photo=photo_id,
-                    caption=final_caption
-                )
-            elif video_id:
-                await callback.bot.send_video(
-                    chat_id=row["telegram_user_id"],
-                    video=video_id,
-                    caption=final_caption
-                )
-            else:
-                await callback.bot.send_message(
-                    chat_id=row["telegram_user_id"],
-                    text=final_caption
-                )
+            await callback.bot.copy_message(
+                chat_id=row["telegram_user_id"],
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+            )
 
             sent += 1
             touched_user_ids.append(row["user_id"])
