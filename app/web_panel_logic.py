@@ -187,16 +187,9 @@ def update_shop_profile(
     }
 
 
-def get_owner_overview_stats(owner_telegram_id: int):
-    shop = get_admin_shop_and_role(owner_telegram_id)
-
-    if not shop:
-        return {
-            "ok": False,
-            "message": "Кав’ярню власника не знайдено"
-        }
-
-    shop_id = shop["id"]
+def get_owner_overview_stats(owner_telegram_id: int, *, authorized_shop_id: int):
+    # Every caller must provide a current server-authorized owner context.
+    shop_id = authorized_shop_id
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -235,16 +228,9 @@ def get_owner_overview_stats(owner_telegram_id: int):
     }
 
 
-def get_owner_activity_stats(owner_telegram_id: int):
-    shop = get_admin_shop_and_role(owner_telegram_id)
-
-    if not shop:
-        return {
-            "ok": False,
-            "message": "Кав’ярню власника не знайдено"
-        }
-
-    shop_id = shop["id"]
+def get_owner_activity_stats(owner_telegram_id: int, *, authorized_shop_id: int):
+    # Every caller must provide a current server-authorized owner context.
+    shop_id = authorized_shop_id
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -348,16 +334,9 @@ def get_owner_activity_stats(owner_telegram_id: int):
     }
 
 
-def get_owner_clients(owner_telegram_id: int):
-    shop = get_admin_shop_and_role(owner_telegram_id)
-
-    if not shop:
-        return {
-            "ok": False,
-            "message": "Кав’ярню власника не знайдено"
-        }
-
-    shop_id = shop["id"]
+def get_owner_clients(owner_telegram_id: int, *, authorized_shop_id: int):
+    # Every caller must provide a current server-authorized owner context.
+    shop_id = authorized_shop_id
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -408,16 +387,9 @@ def get_owner_clients(owner_telegram_id: int):
     }
 
 
-def get_owner_details_stats(owner_telegram_id: int):
-    shop = get_admin_shop_and_role(owner_telegram_id)
-
-    if not shop:
-        return {
-            "ok": False,
-            "message": "Кав’ярню власника не знайдено"
-        }
-
-    shop_id = shop["id"]
+def get_owner_details_stats(owner_telegram_id: int, *, authorized_shop_id: int):
+    # Every caller must provide a current server-authorized owner context.
+    shop_id = authorized_shop_id
 
     with get_connection() as conn:
         with conn.cursor() as cur:

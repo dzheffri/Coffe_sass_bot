@@ -310,6 +310,33 @@ def require_owner_for_path(
                 yield {**actor, "owner_shop_ids": [row["shop_id"] for row in memberships]}
 
 
+def require_owner_analytics_context(
+    request: Request,
+    owner=Depends(require_owner_for_path),
+):
+    """Verify the selected analytics shop against the actor's current ownership.
+
+    A sole owner membership retains legacy compatibility. Multiple memberships
+    require explicit selection, so an absent context never silently picks a cafe.
+    """
+    if set(request.query_params) - {"shop_id"}:
+        raise HTTPException(403, detail={"code": "ANALYTICS_CONTEXT_NOT_ALLOWED"})
+    contexts = request.query_params.getlist("shop_id")
+    if not contexts:
+        if len(owner["owner_shop_ids"]) != 1:
+            raise HTTPException(409, detail={"code": "SHOP_CONTEXT_REQUIRED"})
+        shop_id = owner["owner_shop_ids"][0]
+    else:
+        raw = contexts[0]
+        if (len(contexts) != 1 or not raw.isascii() or not raw.isdigit()
+                or len(raw) > 19 or not 0 < int(raw) <= 9223372036854775807):
+            raise HTTPException(422, detail={"code": "INVALID_SHOP_CONTEXT"})
+        shop_id = int(raw)
+        if shop_id not in owner["owner_shop_ids"]:
+            raise HTTPException(403, detail={"code": "OWNER_ACCESS_REQUIRED"})
+    return {**owner, "shop_id": shop_id}
+
+
 def require_superadmin(
     current_user=Depends(get_current_user),
 ):
@@ -2606,24 +2633,66 @@ async def owner_update_shop(
     return result
 
 
+@app.get("/owner/shops/{owner_telegram_id}")
+def owner_accessible_shops(
+    owner_telegram_id: int,
+    owner=Depends(require_owner_for_path),
+):
+    """List only current owner memberships using the established web auth proof."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id AS shop_id, name
+                FROM coffee_shops
+                WHERE id = ANY(%s)
+                ORDER BY id
+            """, (owner["owner_shop_ids"],))
+            shops = cur.fetchall()
+    return {
+        "ok": True,
+        "shops": [{"shop_id": row["shop_id"], "name": row["name"]} for row in shops],
+        "selected_shop_id": shops[0]["shop_id"] if len(shops) == 1 else None,
+    }
+
+
 @app.get("/owner/analytics/{owner_telegram_id}/overview")
-def owner_analytics_overview(owner_telegram_id: int):
-    return get_owner_overview_stats(owner_telegram_id)
+def owner_analytics_overview(
+    owner_telegram_id: int,
+    owner=Depends(require_owner_analytics_context),
+):
+    return get_owner_overview_stats(
+        owner["telegram_id"], authorized_shop_id=owner["shop_id"]
+    )
 
 
 @app.get("/owner/analytics/{owner_telegram_id}/activity")
-def owner_analytics_activity(owner_telegram_id: int):
-    return get_owner_activity_stats(owner_telegram_id)
+def owner_analytics_activity(
+    owner_telegram_id: int,
+    owner=Depends(require_owner_analytics_context),
+):
+    return get_owner_activity_stats(
+        owner["telegram_id"], authorized_shop_id=owner["shop_id"]
+    )
 
 
 @app.get("/owner/analytics/{owner_telegram_id}/clients")
-def owner_analytics_clients(owner_telegram_id: int):
-    return get_owner_clients(owner_telegram_id)
+def owner_analytics_clients(
+    owner_telegram_id: int,
+    owner=Depends(require_owner_analytics_context),
+):
+    return get_owner_clients(
+        owner["telegram_id"], authorized_shop_id=owner["shop_id"]
+    )
 
 
 @app.get("/owner/analytics/{owner_telegram_id}/details")
-def owner_analytics_details(owner_telegram_id: int):
-    return get_owner_details_stats(owner_telegram_id)
+def owner_analytics_details(
+    owner_telegram_id: int,
+    owner=Depends(require_owner_analytics_context),
+):
+    return get_owner_details_stats(
+        owner["telegram_id"], authorized_shop_id=owner["shop_id"]
+    )
 
 # =========================================================
 # SUPERADMIN MODERATION
