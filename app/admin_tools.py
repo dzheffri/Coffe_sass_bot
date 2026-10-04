@@ -51,13 +51,16 @@ def remove_member(shop, membership_id, connection):
         raise HTTPException(409, detail={"code": "MEMBERSHIP_CHANGED"})
 
 
-def read_statistics(shop, days, connection):
-    """Reuse the existing web/bot definitions, scoped by verified shop ID.
+def read_statistics(shop, days, connection, *, actor_user_id: int):
+    """Use the verified shop and session actor; admins see their own operations.
 
     cups_added is a purchase count, not QR scans. Exact scan events and gifts
     earned within a historical window are not persisted, so remain unavailable.
     """
     shop_id = shop["shop_id"]
+    is_admin = shop["role"] == "admin"
+    actor_filter = " AND admin_user_id=%s" if is_admin else ""
+    transaction_parameters = (shop_id, days, actor_user_id) if is_admin else (shop_id, days)
     metrics = dict(connection.execute("""
         SELECT COALESCE(SUM(cups_added),0) AS cups_added,
                COALESCE(SUM(free_redeemed),0) AS free_redeemed,
@@ -65,7 +68,9 @@ def read_statistics(shop, days, connection):
                COUNT(*) FILTER (WHERE type='redeem_free') AS redeem_operations
         FROM transactions WHERE shop_id=%s
           AND created_at >= NOW()-(%s * INTERVAL '1 day')
-    """, (shop_id, days)).fetchone())
+    """ + actor_filter, transaction_parameters).fetchone())
+    if is_admin:
+        metrics["operations"] = metrics["add_operations"] + metrics["redeem_operations"]
     metrics.update(scans=None, free_earned=None)
     owner_keys = ("active_clients", "new_clients", "inactive_gt_7d", "inactive_gt_30d",
                   "returns_after_broadcast", "total_clients", "free_balance",
@@ -98,8 +103,9 @@ def read_statistics(shop, days, connection):
                COALESCE(SUM(free_redeemed),0) AS free_redeemed
         FROM transactions WHERE shop_id=%s
           AND created_at >= NOW()-(%s*INTERVAL '1 day')
+    """ + actor_filter + """
         GROUP BY weekday ORDER BY weekday
-    """, (shop_id, days)).fetchall()
+    """, transaction_parameters).fetchall()
     by_day = {row["weekday"]: dict(row) for row in rows}
     weekdays = [by_day.get(day, {"weekday": day, "operations": 0, "cups_added": 0,
                                 "free_redeemed": 0}) for day in range(1, 8)]
@@ -108,8 +114,9 @@ def read_statistics(shop, days, connection):
                t.type,t.cups_added,t.free_redeemed,t.created_at
         FROM transactions t JOIN users u ON u.id=t.user_id
         WHERE t.shop_id=%s AND t.created_at >= NOW()-(%s*INTERVAL '1 day')
+    """ + (" AND t.admin_user_id=%s" if is_admin else "") + """
         ORDER BY t.created_at DESC,t.id DESC LIMIT 20
-    """, (shop_id, days)).fetchall()
+    """, transaction_parameters).fetchall()
     return {"metrics": metrics, "activity_by_weekday": weekdays,
             "recent_actions": recent,
             "unavailable_metrics": [key for key, value in metrics.items() if value is None]}

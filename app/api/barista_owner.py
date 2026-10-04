@@ -139,7 +139,7 @@ def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
                 shop = selected_shop(session)
                 if shop["role"] != "owner" and days != 7:
                     raise HTTPException(403, detail={"code": "OWNER_REQUIRED"})
-                result = read_statistics(shop, days, connection)
+                result = read_statistics(shop, days, connection, actor_user_id=session["user_id"])
                 return {"ok": True, "shop": shop_response(shop), "role": shop["role"],
                         "days": days, **result}
 

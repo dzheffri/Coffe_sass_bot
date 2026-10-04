@@ -156,6 +156,143 @@ def test_admin_can_read_only_operational_seven_day_stats(owner_api, owner_databa
     assert client.get("/barista/statistics?days=7&shop_id=2", headers=bearer(token)).status_code == 422
 
 
+@pytest.fixture
+def personal_statistics_database(owner_database):
+    database = owner_database
+    database.query("""
+        INSERT INTO shop_admins(id,shop_id,user_id,role)
+            VALUES(4,1,4,'admin'),(5,2,2,'admin');
+        SELECT setval(pg_get_serial_sequence('shop_admins','id'),5);
+        INSERT INTO transactions(shop_id,user_id,admin_user_id,type,cups_added,free_redeemed,created_at)
+            VALUES(1,4,2,'add_cups',2,0,NOW()-INTERVAL '1 day'),
+                  (1,4,2,'redeem_free',0,1,NOW()),
+                  (1,4,4,'add_cups',5,0,NOW()-INTERVAL '2 days'),
+                  (1,4,4,'redeem_free',0,2,NOW()),
+                  (1,4,1,'add_cups',7,0,NOW()),
+                  (1,4,2,'add_cups',3,0,NOW()-INTERVAL '9 days'),
+                  (2,5,2,'add_cups',99,0,NOW()),
+                  (2,5,2,'redeem_free',0,4,NOW());
+    """)
+    return database
+
+
+@pytest.mark.parametrize("user_id,membership_id,cups,free,action_ids", [
+    (2,3,2,1,{1,2}), (4,4,5,2,{3,4}),
+])
+def test_admin_statistics_is_personal_for_every_metric_bucket_and_action(
+    owner_api, personal_statistics_database, user_id, membership_id, cups, free, action_ids,
+):
+    client, _ = owner_api
+    database = personal_statistics_database
+    token = database.staff_token(user_id=user_id, membership_id=membership_id)
+    session_before = database.session(token)
+    ledger_before = database.query("SELECT * FROM transactions ORDER BY id")
+    response = client.get("/barista/statistics?days=7", headers=bearer(token))
+    assert response.status_code == 200
+    data = response.json()
+    assert data["shop"]["id"] == 1 and data["role"] == "admin"
+    assert data["metrics"]["cups_added"] == cups
+    assert data["metrics"]["free_redeemed"] == free
+    assert data["metrics"]["add_operations"] == data["metrics"]["redeem_operations"] == 1
+    assert data["metrics"]["operations"] == 2
+    assert data["metrics"]["scans"] is None and "scans" in data["unavailable_metrics"]
+    assert data["metrics"]["active_clients"] is None
+    assert {item["id"] for item in data["recent_actions"]} == action_ids
+    assert sum(item["cups_added"] for item in data["activity_by_weekday"]) == cups
+    assert sum(item["free_redeemed"] for item in data["activity_by_weekday"]) == free
+    assert sum(item["operations"] for item in data["activity_by_weekday"]) == 2
+    assert database.session(token) == session_before
+    assert database.query("SELECT * FROM transactions ORDER BY id") == ledger_before
+
+
+@pytest.mark.parametrize("days,cups,action_ids", [
+    (7,14,{1,2,3,4,5}), (30,17,{1,2,3,4,5,6}),
+])
+def test_owner_statistics_keeps_selected_shop_aggregate_for_all_employees(
+    owner_api, personal_statistics_database, days, cups, action_ids,
+):
+    client, _ = owner_api
+    token = personal_statistics_database.staff_token()
+    response = client.get(f"/barista/statistics?days={days}", headers=bearer(token))
+    assert response.status_code == 200
+    data = response.json()
+    assert data["role"] == "owner" and data["shop"]["id"] == 1
+    assert data["metrics"]["cups_added"] == cups and data["metrics"]["free_redeemed"] == 3
+    assert "operations" not in data["metrics"]
+    assert data["metrics"]["scans"] is None
+    assert {item["id"] for item in data["recent_actions"]} == action_ids
+    assert sum(item["operations"] for item in data["activity_by_weekday"]) == len(action_ids)
+    assert sum(item["cups_added"] for item in data["activity_by_weekday"]) == cups
+
+
+def test_admin_statistics_uses_only_selected_membership_shop(owner_api, personal_statistics_database):
+    client, _ = owner_api
+    token = personal_statistics_database.staff_token(user_id=2, membership_id=5)
+    response = client.get("/barista/statistics?days=7", headers=bearer(token))
+    assert response.status_code == 200
+    data = response.json()
+    assert data["shop"]["id"] == 2
+    assert data["metrics"]["cups_added"] == 99 and data["metrics"]["free_redeemed"] == 4
+    assert data["metrics"]["operations"] == 2
+    assert {item["id"] for item in data["recent_actions"]} == {7,8}
+    assert sum(item["cups_added"] for item in data["activity_by_weekday"]) == 99
+    assert sum(item["free_redeemed"] for item in data["activity_by_weekday"]) == 4
+
+
+@pytest.mark.parametrize("key", ["admin_user_id", "employee_id", "owner_id", "user_id", "shop_id", "role"])
+def test_statistics_rejects_forged_actor_or_context_selectors(
+    owner_api, personal_statistics_database, key,
+):
+    client, _ = owner_api
+    database = personal_statistics_database
+    token = database.staff_token(user_id=2, membership_id=3)
+    before = database.session(token)
+    response = client.get(f"/barista/statistics?days=7&{key}=4", headers=bearer(token))
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "UNEXPECTED_PARAMETER"
+    assert database.session(token) == before
+
+
+def test_removed_admin_membership_cannot_read_personal_statistics(owner_api, personal_statistics_database):
+    client, _ = owner_api
+    database = personal_statistics_database
+    token = database.staff_token(user_id=2, membership_id=3)
+    database.query("DELETE FROM shop_admins WHERE id=3")
+    # Membership in shop 2 cannot rescue this removed shop 1 session.
+    response = client.get("/barista/statistics?days=7", headers=bearer(token))
+    assert response.status_code == 401
+
+
+def test_admin_cannot_switch_statistics_to_inaccessible_shop(owner_api, personal_statistics_database):
+    client, _ = owner_api
+    database = personal_statistics_database
+    token = database.staff_token(user_id=4, membership_id=4)
+    before = database.session(token)
+    headers = bearer(token)
+    denied = client.post("/barista/context", headers=headers, json={"shop_id": 2})
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "SHOP_ACCESS_DENIED"
+    assert database.session(token) == before
+    response = client.get("/barista/statistics?days=7", headers=headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["shop"]["id"] == 1
+    assert data["metrics"]["cups_added"] == 5 and data["metrics"]["operations"] == 2
+    assert {item["id"] for item in data["recent_actions"]} == {3,4}
+
+
+def test_admin_role_revocation_immediately_denies_personal_statistics(owner_api, personal_statistics_database):
+    client, _ = owner_api
+    database = personal_statistics_database
+    token = database.staff_token(user_id=2, membership_id=3)
+    before = database.session(token)
+    database.query("UPDATE shop_admins SET role='client' WHERE id=3")
+    response = client.get("/barista/statistics?days=7", headers=bearer(token))
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "STAFF_ACCESS_REQUIRED"
+    assert database.session(token) == before
+
+
 def test_role_downgrade_and_deleted_membership_apply_to_every_owner_request(owner_api, owner_database):
     client, delivery = owner_api
     database = owner_database
