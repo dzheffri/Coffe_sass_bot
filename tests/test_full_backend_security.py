@@ -31,6 +31,8 @@ MIGRATIONS = (
     "20260930_barista_sessions.sql",
     "20260930_barista_sessions_index.sql",
     "20260930_barista_sessions_validate.sql",
+    "20261004_admin_invites.sql",
+    "20261004_admin_broadcast.sql",
 )
 
 
@@ -97,6 +99,8 @@ def full_backend_audit(local_connection):
             """))
         migration(MIGRATIONS[1])
         migration(MIGRATIONS[2])
+        for filename in MIGRATIONS[3:]:
+            migration(filename)
         with connect() as conn:
             after = conn.execute("""SELECT id,user_id,token_hash,created_at,
                 expires_at,last_used_at,revoked_at FROM app_sessions ORDER BY id""").fetchall()
@@ -141,6 +145,13 @@ def full_backend_audit(local_connection):
     "cannot_unlink_foreign_identity_and_own_unlink_works",
     "session_purpose_isolation_real_routes_and_issuance_gate",
     "real_barista_qr_operations_readonly_atomic_and_delivery_isolated",
+    "real_admin_invites_verified_existing_identity_and_atomic_session",
+    "real_native_owner_tools_shop_scope_role_and_broadcast_isolation",
+    "owner_analytics_complete_real_route_inventory",
+    "real_owner_analytics_overview_authentication_and_shop_isolation",
+    "real_owner_analytics_activity_authentication_and_shop_isolation",
+    "real_owner_analytics_clients_authentication_and_shop_isolation",
+    "real_owner_analytics_details_authentication_and_shop_isolation",
     "unmodified_old_backend_rejects_barista",
     "real_bot_private_actor_binding_and_confirmation",
     "real_bot_existing_merge_preserves_balance_and_revokes_source",

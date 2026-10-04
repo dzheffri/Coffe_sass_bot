@@ -203,6 +203,11 @@ def _security_scenarios(main, db, client, query, auth, state, report):
     attacker_token = db.create_app_session(2)
     admin_token = db.create_app_session(3)
 
+    _real_owner_analytics_security(
+        main, db, client, query, auth, telegram_init_data,
+        owner_token, attacker_token, admin_token, report,
+    )
+
     # Normal check/login/create keep their established response contract.
     response = client.post("/auth/test-identity", json={
         "provider": "google", "id_token": jwt("honest-owner"), "action": "check"})
@@ -357,7 +362,112 @@ def _security_scenarios(main, db, client, query, auth, state, report):
     report["session_purpose_isolation_real_routes_and_issuance_gate"] = True
 
     _real_barista_operations(db, client, query, auth, report)
+    _real_native_admin_tools(db, client, query, auth, jwt, report)
     _real_bot_regressions(main, db, client, query, auth, jwt, report)
+
+
+def _real_owner_analytics_security(
+    main, db, client, query, auth, telegram_init_data,
+    owner_token, attacker_token, admin_token, report,
+):
+    """All actual legacy routes authenticate actor and lock current owner scope."""
+    suffixes = ("overview", "activity", "clients", "details")
+    expected_routes = {
+        f"/owner/analytics/{{owner_telegram_id}}/{suffix}" for suffix in suffixes
+    }
+    actual_routes = {
+        route.path: route.methods for route in main.app.routes
+        if getattr(route, "path", "").startswith("/owner/analytics/")
+    }
+    assert set(actual_routes) == expected_routes, actual_routes
+    assert all(methods == {"GET"} for methods in actual_routes.values())
+    report["owner_analytics_complete_real_route_inventory"] = True
+
+    other_token = db.create_app_session(4)
+    barista_token = db.create_app_session(1, purpose="barista", selected_membership_id=1)
+    query("""INSERT INTO users(id,telegram_user_id,full_name,personal_qr_token)
+        VALUES(8,71008,'Mixed role owner','mixed-owner-qr'),
+              (9,566408696,'Local superadmin only','local-superadmin-qr')""")
+    query("""INSERT INTO user_identities(user_id,provider,provider_user_id)
+        VALUES(8,'telegram','71008'),(9,'telegram','566408696')""")
+    # Earlier admin membership used to select a foreign shop in all four helpers.
+    query("""INSERT INTO shop_admins(shop_id,user_id,role)
+        VALUES(2,8,'admin'),(1,8,'owner')""")
+    mixed_token = db.create_app_session(8)
+    superadmin_token = db.create_app_session(9)
+    query("""INSERT INTO shop_clients(shop_id,user_id,cups,free_coffee_balance,total_scans)
+        VALUES(2,4,444,444,444)""")
+    query("""INSERT INTO transactions(shop_id,user_id,admin_user_id,type,cups_added)
+        VALUES(2,4,4,'add_cups',444)""")
+    other_membership = query("SELECT * FROM shop_admins WHERE user_id=4 AND shop_id=2")[0]
+
+    for suffix in suffixes:
+        own_path = f"/owner/analytics/71001/{suffix}"
+        foreign_path = f"/owner/analytics/71004/{suffix}"
+        for headers in (
+            {}, auth("garbage"), {"Authorization": "Basic legacy-active"},
+            auth("legacy-expired"), auth("legacy-revoked"), auth(barista_token),
+            {"X-Telegram-Init-Data": "unverified-data"},
+            {"X-Telegram-Init-Data": telegram_init_data(71001, forged=True)},
+            {**auth("garbage"), "X-Telegram-Init-Data": telegram_init_data(71001)},
+        ):
+            response = client.get(own_path, headers=headers)
+            assert response.status_code == 401, (suffix, response.status_code, response.text)
+        for headers in (auth(attacker_token), auth(admin_token), auth(other_token),
+                        {"X-Telegram-Init-Data": telegram_init_data(71002)},
+                        {"X-Telegram-Init-Data": telegram_init_data(71003)}):
+            response = client.get(own_path, headers=headers)
+            assert response.status_code == 403, (suffix, response.text)
+        assert client.get(foreign_path, headers=auth(owner_token)).status_code == 403
+        assert client.get(f"/owner/analytics/566408696/{suffix}",
+                          headers=auth(superadmin_token)).status_code == 403
+
+        expected = client.get(own_path, headers=auth(owner_token))
+        assert expected.status_code == 200 and expected.json()["ok"] is True, expected.text
+        assert expected.json()["shop_id"] == 1
+        for headers in (
+            auth("legacy-active"), {"X-Telegram-Init-Data": telegram_init_data(71001)},
+            {**auth(owner_token), "X-Telegram-Init-Data": "invalid-ignored-secondary-proof"},
+        ):
+            response = client.get(own_path, headers=headers)
+            assert response.status_code == 200 and response.json() == expected.json(), response.text
+        for selector, value in (
+            ("shop_id", 2), ("owner_id", 4), ("owner_telegram_id", 71004),
+            ("telegram_id", 71004), ("admin_user_id", 4), ("user_id", 4), ("role", "owner"),
+        ):
+            response = client.get(own_path, params={selector: value}, headers=auth(owner_token))
+            assert response.status_code == 403, (suffix, selector, response.text)
+        # GET bodies are never consumed as a context. No body field selects a shop.
+        response = client.request("GET", own_path, headers=auth(owner_token),
+            json={"shop_id": 2, "owner_id": 4, "telegram_id": 71004, "role": "owner"})
+        assert response.status_code == 200 and response.json() == expected.json(), response.text
+
+        mixed = client.get(f"/owner/analytics/71008/{suffix}", headers=auth(mixed_token))
+        assert mixed.status_code == 200 and mixed.json() == expected.json(), mixed.text
+        foreign = client.get(foreign_path, headers=auth(other_token))
+        assert foreign.status_code == 200 and foreign.json()["shop_id"] == 2, foreign.text
+
+        query("UPDATE shop_admins SET role='admin' WHERE id=%s", (other_membership["id"],))
+        assert client.get(foreign_path, headers=auth(other_token)).status_code == 403
+        query("UPDATE shop_admins SET role='owner' WHERE id=%s", (other_membership["id"],))
+        query("DELETE FROM shop_admins WHERE id=%s", (other_membership["id"],))
+        assert client.get(foreign_path, headers=auth(other_token)).status_code == 403
+        assert client.get(foreign_path, headers={
+            "X-Telegram-Init-Data": telegram_init_data(71004)}).status_code == 403
+        query("""INSERT INTO shop_admins(id,shop_id,user_id,role,created_at)
+            VALUES(%s,%s,%s,%s,%s)""", tuple(other_membership[key] for key in
+                ("id", "shop_id", "user_id", "role", "created_at")))
+        report[f"real_owner_analytics_{suffix}_authentication_and_shop_isolation"] = True
+
+    assert client.get("/owner/analytics/71001/overview", headers=auth(owner_token)).json()["stats"]["free_coffees_now"] == 1
+    assert client.get("/owner/analytics/71001/activity", headers=auth(owner_token)).json()["scans_today"] == 0
+    own_clients = client.get("/owner/analytics/71001/clients", headers=auth(owner_token)).json()["clients"]
+    assert [item["name"] for item in own_clients] == ["Local owner"]
+    assert client.get("/owner/analytics/71001/details", headers=auth(owner_token)).json()["loyalty"]["free_now"] == 1
+    # Restore the fixture's original memberships/data for subsequent real flows.
+    query("DELETE FROM transactions WHERE shop_id=2 AND user_id=4 AND cups_added=444")
+    query("DELETE FROM shop_clients WHERE shop_id=2 AND user_id=4")
+    query("DELETE FROM users WHERE id IN (8,9)")
 
 
 def _real_barista_operations(db, client, query, auth, report):
@@ -417,6 +527,87 @@ def _real_barista_operations(db, client, query, auth, report):
     report["real_barista_qr_operations_readonly_atomic_and_delivery_isolated"] = True
 
 
+def _real_native_admin_tools(db, client, query, auth, jwt, report):
+    """Execute complete imported invite/owner modules and actual DB helpers."""
+    from app.api import barista, barista_owner
+    from unittest.mock import patch
+
+    client_before = query("SELECT * FROM app_sessions WHERE purpose='client' ORDER BY id")
+    owner = db.create_app_session(1, purpose="barista", selected_membership_id=1)
+    admin_membership = query("SELECT id FROM shop_admins WHERE user_id=3 AND shop_id=1")[0]["id"]
+    admin = db.create_app_session(3, purpose="barista", selected_membership_id=admin_membership)
+    other_membership = query("SELECT id FROM shop_admins WHERE user_id=4 AND shop_id=2")[0]["id"]
+    other_owner = db.create_app_session(4, purpose="barista", selected_membership_id=other_membership)
+    os.environ["BARISTA_LOGIN_ENABLED"] = "true"
+    os.environ["BARISTA_INVITE_PEPPER"] = "offline-isolated-invites-only-secret-32bytes-minimum"
+    assert db.link_user_identity(32650, "google", "native-guest")["status"] == "linked"
+    memberless_body = {"provider": "google", "id_token": jwt("native-guest", barista=True)}
+    before = query("SELECT COUNT(*) AS n FROM app_sessions")[0]["n"]
+    response = client.post("/barista/auth/identity", json=memberless_body)
+    assert response.status_code == 403 and response.json()["detail"]["code"] == "NEEDS_INVITE"
+    assert query("SELECT COUNT(*) AS n FROM app_sessions")[0]["n"] == before
+    unknown = client.post("/barista/auth/identity", json={
+        "provider": "google", "id_token": jwt("native-not-linked", barista=True)})
+    assert unknown.status_code == 403 and unknown.json()["detail"]["code"] == "IDENTITY_NOT_LINKED"
+    assert client.post("/barista/owner/invites", headers=auth(admin), json={}).status_code == 403
+    created = client.post("/barista/owner/invites", headers=auth(owner), json={})
+    assert created.status_code == 201, created.text
+    invitation = created.json()["invite"]
+    listed = client.get("/barista/owner/invites", headers=auth(owner))
+    assert listed.status_code == 200 and len(listed.json()["invites"]) == 1
+    assert "code" not in listed.json()["invites"][0]
+    assert client.delete(f"/barista/owner/invites/{invitation['id']}",
+                         headers=auth(other_owner)).status_code == 404
+    response = client.post("/barista/auth/accept-invite", json={
+        **memberless_body, "invite_code": invitation["code"]})
+    assert response.status_code == 200, response.text
+    accepted = response.json()
+    assert accepted["employee"]["user_id"] == 32650
+    assert accepted["selected_context"]["role"] == "admin" and accepted["selected_context"]["shop_id"] == 1
+    assert client.get("/barista/me", headers=auth(accepted["access_token"])).status_code == 200
+    assert client.get("/me", headers=auth(accepted["access_token"])).status_code == 401
+    consumed = query("SELECT used_at,used_by_user_id FROM barista_admin_invites WHERE id=%s",
+                     (invitation["id"],))[0]
+    assert consumed["used_at"] is not None and consumed["used_by_user_id"] == 32650
+    assert client.post("/barista/auth/accept-invite", json={
+        **memberless_body, "invite_code": invitation["code"]}).status_code == 400
+    report["real_admin_invites_verified_existing_identity_and_atomic_session"] = True
+
+    members = client.get("/barista/owner/members", headers=auth(owner))
+    assert members.status_code == 200 and members.json()["shop"]["id"] == 1
+    assert all(item["user_id"] != 4 for item in members.json()["members"])
+    assert client.get("/barista/owner/members", headers=auth(admin)).status_code == 403
+    assert client.delete("/barista/owner/members/1", headers=auth(owner)).status_code == 409
+    assert client.get("/barista/statistics?days=30", headers=auth(admin)).status_code == 403
+    stats = client.get("/barista/statistics?days=7", headers=auth(admin))
+    assert stats.status_code == 200 and stats.json()["metrics"]["active_clients"] is None
+    with patch.object(barista, "notify_cups_added", AsyncMock()):
+        result = client.post("/barista/add-cup", headers=auth(owner),
+                             json={"qr_token": "coffee:guest-qr", "count": 3})
+        assert result.status_code == 200 and result.json()["operation"]["cups_added"] == 3
+    assert client.post("/barista/owner/broadcast/preview", headers=auth(admin), json={"text": "local"}).status_code == 403
+    preview = client.post("/barista/owner/broadcast/preview", headers=auth(owner), json={"text": "Offline only"})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["recipients_count"] == 1
+    confirmation = preview.json()["confirmation_token"]
+    assert client.post("/barista/owner/broadcast", headers=auth(other_owner),
+                       json={"confirmation_token": confirmation}).status_code == 403
+
+    async def offline_delivery(broadcast):
+        assert broadcast["recipients"] == [{"telegram_user_id": 71001, "user_id": 1}]
+        return [1], 0
+
+    with patch.object(barista_owner, "deliver_owner_broadcast", AsyncMock(side_effect=offline_delivery)) as delivery:
+        sent = client.post("/barista/owner/broadcast", headers=auth(owner), json={"confirmation_token": confirmation})
+        assert sent.status_code == 200 and sent.json()["sent"] == 1, sent.text
+        assert client.post("/barista/owner/broadcast", headers=auth(owner),
+                           json={"confirmation_token": confirmation}).status_code == 409
+        delivery.assert_awaited_once()
+    assert query("SELECT * FROM app_sessions WHERE purpose='client' ORDER BY id") == client_before
+    os.environ["BARISTA_LOGIN_ENABLED"] = "false"
+    report["real_native_owner_tools_shop_scope_role_and_broadcast_isolation"] = True
+
+
 def _real_bot_regressions(main, db, client, query, auth, jwt, report):
     """Execute real trusted Telegram entry handlers; mock only outbound replies."""
     from app.handlers import common
@@ -438,7 +629,10 @@ def _real_bot_regressions(main, db, client, query, auth, jwt, report):
 
     def start(token, actor, *, chat_id=None, chat_type="private"):
         incoming = message(actor, chat_id=chat_id, chat_type=chat_type)
-        asyncio.run(common.start_handler(incoming, SimpleNamespace(args="link_" + token)))
+        asyncio.run(common.start_handler(
+            incoming, SimpleNamespace(args="link_" + token),
+            SimpleNamespace(set_state=AsyncMock()),
+        ))
         return incoming
 
     def confirm(token, actor, *, chat_id=None, chat_type="private"):

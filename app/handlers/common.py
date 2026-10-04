@@ -1,6 +1,7 @@
 from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
+from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import asyncio
 
@@ -16,6 +17,7 @@ from app.db import (
 from app.keyboards import user_main_keyboard, admin_main_keyboard
 from app.config import SUPER_ADMIN_IDS, SCANNER_URL, ADMIN_PANEL_URL
 from app.telegram_link import bind_telegram_link_session, confirm_telegram_link_session
+from app.handlers.support import support_start
 
 
 router = Router()
@@ -130,8 +132,14 @@ def telegram_link_keyboard(token: str) -> InlineKeyboardMarkup:
 async def start_handler(
     message: types.Message,
     command: CommandObject,
+    state: FSMContext,
 ):
     args = (command.args or "").strip()
+
+    if args == "barista_support":
+        # The native app opens the existing support conversation, not a new flow.
+        await support_start(message, state)
+        return
 
     # Новый сценарий:
     # /start link_<одноразовый_token>

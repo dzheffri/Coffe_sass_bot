@@ -522,6 +522,7 @@ def create_app_session(
     *,
     purpose: str = "client",
     selected_membership_id: int | None = None,
+    connection=None,
 ) -> str:
     """
     Создаёт новую session для пользователя и возвращает
@@ -541,7 +542,7 @@ def create_app_session(
     )
     expires_at = utc_now() + timedelta(days=APP_SESSION_TTL_DAYS)
 
-    with get_connection() as conn:
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.transaction():
             with conn.cursor() as cur:
                 if purpose == "barista":
@@ -1922,17 +1923,26 @@ def assign_pending_owner_if_exists(owner_telegram_user_id: int):
     return assigned_shop_ids
 
 
-def remove_shop_admin(shop_id: int, admin_telegram_user_id: int):
-    user = get_user_by_telegram_id(admin_telegram_user_id)
-    if not user:
-        return False
+def remove_shop_admin(shop_id: int, admin_telegram_user_id: int | None = None, *, membership_id: int | None = None, connection=None):
+    # Native staff memberships can exist without Telegram. Existing bot/web
+    # callers keep their original Telegram-ID lookup and behavior.
+    if membership_id is None:
+        user = get_user_by_telegram_id(admin_telegram_user_id)
+        if not user:
+            return False
 
-    with get_connection() as conn:
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM shop_admins
-                WHERE shop_id = %s AND user_id = %s
-            """, (shop_id, user["id"]))
+            if membership_id is None:
+                cur.execute("""
+                    DELETE FROM shop_admins
+                    WHERE shop_id = %s AND user_id = %s
+                """, (shop_id, user["id"]))
+            else:
+                cur.execute("""
+                    DELETE FROM shop_admins
+                    WHERE shop_id = %s AND id = %s AND role = 'admin'
+                """, (shop_id, membership_id))
             return cur.rowcount > 0
 
 
@@ -1960,11 +1970,12 @@ def is_any_shop_admin(admin_telegram_user_id: int):
     return get_admin_shop_and_role(admin_telegram_user_id) is not None
 
 
-def get_shop_admins(shop_id: int):
-    with get_connection() as conn:
+def get_shop_admins(shop_id: int, *, include_membership: bool = False, connection=None):
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
+            fields = "sa.id AS membership_id, sa.user_id, " if include_membership else ""
             cur.execute("""
-                SELECT u.telegram_user_id, u.full_name, u.username, sa.role
+                SELECT """ + fields + """u.telegram_user_id, u.full_name, u.username, sa.role
                 FROM shop_admins sa
                 JOIN users u ON u.id = sa.user_id
                 WHERE sa.shop_id = %s
@@ -2447,8 +2458,8 @@ def extend_subscription(shop_id: int, days: int, plan: str = "basic"):
             return cur.fetchone()
 
 
-def can_send_broadcast(shop_id: int):
-    with get_connection() as conn:
+def can_send_broadcast(shop_id: int, *, connection=None):
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT COUNT(*) AS cnt
@@ -2460,8 +2471,8 @@ def can_send_broadcast(shop_id: int):
             return row["cnt"] < 8
 
 
-def get_broadcast_recipients(shop_id: int):
-    with get_connection() as conn:
+def get_broadcast_recipients(shop_id: int, *, connection=None):
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT u.telegram_user_id, sc.user_id
@@ -2489,11 +2500,11 @@ def save_broadcast(shop_id: int, sender_telegram_user_id: int, text: str, recipi
             return cur.fetchone()
 
 
-def log_broadcast_touches(shop_id: int, user_ids: list[int]):
+def log_broadcast_touches(shop_id: int, user_ids: list[int], *, connection=None):
     if not user_ids:
         return
 
-    with get_connection() as conn:
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             for user_id in user_ids:
                 cur.execute("""

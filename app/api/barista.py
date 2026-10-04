@@ -53,6 +53,12 @@ class QRRequest(BaseModel):
         extra = "forbid"
 
 
+class AddCupRequest(QRRequest):
+    # Existing clients omit count and keep the original single-cup behavior.
+    # Strict validation also rejects booleans and numeric strings/floats.
+    count: int = Field(default=1, strict=True, ge=1, le=10)
+
+
 def _qr_token(value: str) -> str:
     token = value.strip()
     if token.startswith("coffee:"):
@@ -138,7 +144,7 @@ def build_barista_router(
             raise HTTPException(404, detail={"code": "CLIENT_NOT_FOUND"})
         return user
 
-    def write_operation(token: str, qr: str, operation: str) -> tuple[dict, dict]:
+    def write_operation(token: str, qr: str, operation: str, count: int = 1) -> tuple[dict, dict]:
         # Membership/session locks acquired by authorization live until this
         # outer transaction commits, including the shared loyalty write/logs.
         with get_connection() as connection:
@@ -156,11 +162,11 @@ def build_barista_router(
                     "connection": connection,
                 }
                 if operation == "add_cup":
-                    result = add_cups_for_shop_client(**values, count=1)
+                    result = add_cups_for_shop_client(**values, count=count)
                     balance = result["shop_client"]
                     earned_free = result["earned_free"]
                     operation_response = {
-                        "type": "add_cup", "cups_added": 1,
+                        "type": "add_cup", "cups_added": count,
                         "free_coffee_earned": earned_free,
                     }
                 else:
@@ -183,13 +189,13 @@ def build_barista_router(
                     "shop_client": balance,
                 }
                 if operation == "add_cup":
-                    notification.update(count=1, earned_free=earned_free)
+                    notification.update(count=count, earned_free=earned_free)
         return response, notification
 
-    async def perform_operation(token: str, qr: str, operation: str) -> dict:
+    async def perform_operation(token: str, qr: str, operation: str, count: int = 1) -> dict:
         # Synchronous PostgreSQL work runs off the event loop. Notifications
         # happen after commit and cannot turn a saved purchase into a failure.
-        response, notification = await run_in_threadpool(write_operation, token, qr, operation)
+        response, notification = await run_in_threadpool(write_operation, token, qr, operation, count)
         notifier = notify_cups_added if operation == "add_cup" else notify_free_redeemed
         try:
             await notifier(**notification)
@@ -197,32 +203,37 @@ def build_barista_router(
             logger.warning("Barista notification delivery failed (%s)", type(exc).__name__)
         return response
 
-    @router.post("/auth/identity")
-    def identity_login(body: IdentityRequest):
+    def verified_identity(provider: str, id_token: str) -> tuple[dict, str]:
         if os.getenv("BARISTA_LOGIN_ENABLED", "false").strip().lower() != "true":
             raise HTTPException(503, detail={"code": "BARISTA_LOGIN_DISABLED"})
         env_name = (
-            "BARISTA_GOOGLE_CLIENT_ID" if body.provider == "google"
+            "BARISTA_GOOGLE_CLIENT_ID" if provider == "google"
             else "BARISTA_APPLE_CLIENT_ID"
         )
         audience = (os.getenv(env_name) or "").strip()
         if not audience:
             raise HTTPException(503, detail={"code": "IDENTITY_PROVIDER_NOT_CONFIGURED"})
 
-        verifier = verify_google if body.provider == "google" else verify_apple
-        identity = verifier(body.id_token, audience=audience)
+        verifier = verify_google if provider == "google" else verify_apple
+        identity = verifier(id_token, audience=audience)
         subject = identity.get("sub") if identity else None
         if not isinstance(subject, str) or not subject:
             raise HTTPException(401, detail={"code": "INVALID_IDENTITY"})
 
-        user = find_user(body.provider, subject)
+        user = find_user(provider, subject)
         if not user:
             # Linking an old Telegram account requires a separate verified flow.
             raise HTTPException(403, detail={"code": "IDENTITY_NOT_LINKED"})
 
+        return user, subject
+
+    @router.post("/auth/identity")
+    def identity_login(body: IdentityRequest):
+        user, _ = verified_identity(body.provider, body.id_token)
+
         memberships = get_barista_memberships(user["id"])
         if not memberships:
-            raise HTTPException(403, detail={"code": "STAFF_ACCESS_REQUIRED"})
+            raise HTTPException(403, detail={"code": "NEEDS_INVITE"})
 
         if body.shop_id is None:
             if len(memberships) != 1:
@@ -275,11 +286,20 @@ def build_barista_router(
                 return _client_response(user, balance, shop)
 
     @router.post("/add-cup")
-    async def add_cup(body: QRRequest, authorization: str | None = Header(default=None)):
-        return await perform_operation(parse_bearer(authorization), body.qr_token, "add_cup")
+    async def add_cup(body: AddCupRequest, authorization: str | None = Header(default=None)):
+        return await perform_operation(parse_bearer(authorization), body.qr_token, "add_cup", body.count)
 
     @router.post("/redeem")
     async def redeem(body: QRRequest, authorization: str | None = Header(default=None)):
         return await perform_operation(parse_bearer(authorization), body.qr_token, "redeem")
+
+    from app.api.barista_invites import build_invite_router
+    from app.api.barista_owner import build_owner_router
+
+    router.include_router(build_invite_router(
+        authorize=authorize, parse_bearer=parse_bearer,
+        verify_identity=verified_identity, me_response=_me_response,
+    ))
+    router.include_router(build_owner_router(authorize=authorize, parse_bearer=parse_bearer))
 
     return router

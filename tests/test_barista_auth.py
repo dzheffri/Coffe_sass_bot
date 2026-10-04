@@ -62,7 +62,7 @@ def test_identity_uses_verified_subject_existing_user_and_native_audience(api, d
 @pytest.mark.parametrize("token,expected,status", [
     ("forged-subject", "INVALID_IDENTITY", 401),
     ("valid-unknown", "IDENTITY_NOT_LINKED", 403),
-    ("valid-client", "STAFF_ACCESS_REQUIRED", 403),
+    ("valid-client", "NEEDS_INVITE", 403),
 ])
 def test_no_auto_creation_or_staff_elevation(api, database, token, expected, status):
     client, _ = api

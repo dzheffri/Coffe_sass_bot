@@ -247,7 +247,7 @@ def test_inactive_subscription_rejects_without_balance_or_session_writes(operati
 
 
 @pytest.mark.parametrize("existing", [False, True])
-def test_add_always_one_and_records_server_actor(operations_api, operations_database, existing):
+def test_add_defaults_to_one_and_records_server_actor(operations_api, operations_database, existing):
     client, added, redeemed = operations_api
     database = operations_database
     if existing:
@@ -268,6 +268,73 @@ def test_add_always_one_and_records_server_actor(operations_api, operations_data
     assert database.query("SELECT COUNT(*) AS n FROM app_sessions")[0]["n"] == sessions_before
     added.assert_awaited_once()
     redeemed.assert_not_awaited()
+
+
+@pytest.mark.parametrize("cups,count,expected_cups,earned_free", [
+    (0, 1, 1, 0),
+    (0, 2, 2, 0),
+    (0, 7, 0, 1),
+    (6, 2, 1, 1),
+    (6, 7, 6, 1),
+    (6, 10, 2, 2),
+])
+def test_add_validated_count_reuses_loyalty_cycles_and_records_one_operation(
+    operations_api, operations_database, cups, count, expected_cups, earned_free,
+):
+    client, added, redeemed = operations_api
+    database = operations_database
+    seed_balance(database, cups=cups, free=1)
+    response = post(client, database.staff_token(), body={**BODY, "count": count})
+    assert response.status_code == 200
+    assert response.json()["operation"] == {
+        "type": "add_cup", "cups_added": count, "free_coffee_earned": earned_free,
+    }
+    assert response.json()["client"]["cups"] == expected_cups
+    assert response.json()["client"]["progress"] == expected_cups / 7
+    assert response.json()["client"]["free_coffee_balance"] == 1 + earned_free
+    current = balance(database)
+    assert current["cups"] == expected_cups
+    assert current["free_coffee_balance"] == 1 + earned_free
+    assert current["total_scans"] == count
+    assert current["total_free_coffee_earned"] == earned_free
+    transactions = ledger(database)["transactions"]
+    assert len(transactions) == 1
+    assert (transactions[0]["cups_added"], transactions[0]["admin_user_id"],
+            transactions[0]["shop_id"], transactions[0]["user_id"]) == (count, 1, 1, 2)
+    assert len(ledger(database)["touch_logs"]) == 1
+    added.assert_awaited_once()
+    assert added.await_args.kwargs["count"] == count
+    assert added.await_args.kwargs["earned_free"] == earned_free
+    redeemed.assert_not_awaited()
+
+
+@pytest.mark.parametrize("count", [0, -1, 11, 2.0, 2.5, "2", True, False, None])
+def test_invalid_count_rejected_before_session_or_loyalty_changes(
+    operations_api, operations_database, count,
+):
+    client, added, redeemed = operations_api
+    database = operations_database
+    seed_balance(database, cups=6, free=1)
+    token = database.staff_token()
+    before, session_before = ledger(database), database.session(token)
+    response = post(client, token, body={**BODY, "count": count})
+    assert response.status_code == 422
+    assert ledger(database) == before
+    assert database.session(token) == session_before
+    added.assert_not_awaited()
+    redeemed.assert_not_awaited()
+
+
+@pytest.mark.parametrize("path", ["/barista/scan", "/barista/redeem"])
+def test_count_is_not_accepted_for_scan_or_redeem(operations_api, operations_database, path):
+    client, _, _ = operations_api
+    database = operations_database
+    seed_balance(database, cups=6, free=1)
+    token = database.staff_token()
+    before, session_before = ledger(database), database.session(token)
+    assert post(client, token, path, {**BODY, "count": 1}).status_code == 422
+    assert ledger(database) == before
+    assert database.session(token) == session_before
 
 
 def test_seventh_purchase_preserves_existing_loyalty_rule(operations_api, operations_database):
@@ -387,7 +454,7 @@ def test_legacy_count_and_marketing_return_logic_remain_atomic(operations_databa
     assert len(ledger(database)["touch_logs"]) == 3
 
 
-def parallel_requests(client, database, monkeypatch, function_name, path):
+def parallel_requests(client, database, monkeypatch, function_name, path, bodies=None):
     router = importlib.import_module("app.api.barista")
     original = getattr(router, function_name)
     entered = threading.Barrier(2)
@@ -400,8 +467,10 @@ def parallel_requests(client, database, monkeypatch, function_name, path):
     # Separate sessions prevent the session lock from serializing these tests;
     # both requests must contend on the actual loyalty row/unique constraint.
     tokens = (database.staff_token(), database.staff_token())
+    bodies = bodies if bodies is not None else (BODY, BODY)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(post, client, token, path) for token in tokens]
+        futures = [executor.submit(post, client, token, path, body)
+                   for token, body in zip(tokens, bodies)]
         return [future.result(timeout=8) for future in futures]
 
 
@@ -419,6 +488,32 @@ def test_two_concurrent_adds_preserve_both_purchases_and_one_reward(operations_a
     assert row["total_scans"] == 2
     assert row["total_free_coffee_earned"] == (1 if existing else 0)
     assert len(ledger(database)["transactions"]) == 2
+    assert len(ledger(database)["touch_logs"]) == 2
+    assert added.await_count == 2
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_two_concurrent_counted_adds_preserve_every_cup_and_reward(
+    operations_api, operations_database, monkeypatch, existing,
+):
+    client, added, _ = operations_api
+    database = operations_database
+    if existing:
+        seed_balance(database, cups=6)
+    counts = (2, 7)
+    responses = parallel_requests(
+        client, database, monkeypatch, "add_cups_for_shop_client", "/barista/add-cup",
+        bodies=tuple({**BODY, "count": count} for count in counts),
+    )
+    assert [result.status_code for result in responses] == [200, 200]
+    assert [result.json()["operation"]["cups_added"] for result in responses] == list(counts)
+    total = (6 if existing else 0) + sum(counts)
+    row = balance(database)
+    assert row["cups"] == total % 7
+    assert row["free_coffee_balance"] == total // 7
+    assert row["total_scans"] == sum(counts)
+    assert row["total_free_coffee_earned"] == total // 7
+    assert sorted(item["cups_added"] for item in ledger(database)["transactions"]) == list(counts)
     assert len(ledger(database)["touch_logs"]) == 2
     assert added.await_count == 2
 
