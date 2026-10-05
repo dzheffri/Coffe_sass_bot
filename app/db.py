@@ -2238,6 +2238,43 @@ def get_shop_client_balance_by_user_id(shop_id: int, user_id: int, *, connection
             return cur.fetchone()
 
 
+def get_shop_marketing_efficiency(shop_id: int, days: int = 30, *, connection=None) -> dict:
+    """Preserve Web's recorded-return definition for a rolling shop period.
+
+    Returns count recorded attributed return events, not distinct clients or
+    total visits; legacy touch types remain included. Only auto/broadcast
+    messages enter the sent denominator.
+    """
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE type = 'auto') AS auto_sent,
+                    COUNT(*) FILTER (WHERE type = 'broadcast') AS own_sent,
+                    COUNT(*) FILTER (WHERE type IN ('auto', 'broadcast')) AS total_sent
+                FROM touch_logs
+                WHERE shop_id = %s
+                  AND sent_at >= NOW() - (%s * INTERVAL '1 day')
+            """, (shop_id, days))
+            mailings = cur.fetchone()
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE touch_type = 'auto') AS auto_returns,
+                    COUNT(*) FILTER (WHERE touch_type = 'broadcast') AS own_returns,
+                    COUNT(*) AS total_returns
+                FROM return_logs
+                WHERE shop_id = %s
+                  AND returned_at >= NOW() - (%s * INTERVAL '1 day')
+            """, (shop_id, days))
+            returns = cur.fetchone()
+    result = {key: int(value or 0) for key, value in {**mailings, **returns}.items()}
+    result["percent"] = (
+        round((result["total_returns"] / result["total_sent"]) * 100, 2)
+        if result["total_sent"] > 0 else 0.0
+    )
+    return result
+
+
 def get_shop_detailed_stats(shop_id: int):
     with get_connection() as conn:
         with conn.cursor() as cur:

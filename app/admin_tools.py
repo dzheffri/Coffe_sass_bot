@@ -6,7 +6,8 @@ import secrets
 
 from fastapi import HTTPException
 
-from app.db import can_send_broadcast, get_broadcast_recipients, get_shop_admins, remove_shop_admin
+from app.db import (can_send_broadcast, get_broadcast_recipients, get_shop_admins,
+                    get_shop_marketing_efficiency, remove_shop_admin)
 
 MAX_PENDING_PREVIEWS_PER_SHOP = 5
 MAX_PREVIEWS_PER_SHOP_PER_HOUR = 10
@@ -87,13 +88,10 @@ def read_statistics(shop, days, connection, *, actor_user_id: int):
                    COALESCE(SUM(total_free_coffee_redeemed),0) AS free_redeemed_total
             FROM shop_clients WHERE shop_id=%s
         """, (days, days, shop_id)).fetchone()))
-        # Same attributed-return definition as get_shop_detailed_stats, not a
-        # claim that a marketing message caused the purchase.
-        metrics["returns_after_broadcast"] = connection.execute("""
-            SELECT COUNT(*) AS count FROM return_logs
-            WHERE shop_id=%s AND touch_type='broadcast'
-              AND returned_at >= NOW()-(%s*INTERVAL '1 day')
-        """, (shop_id, days)).fetchone()["count"]
+        # Retain the response key but use Web's exact recorded-return total,
+        # including auto/broadcast and legacy types, for the selected period.
+        marketing = get_shop_marketing_efficiency(shop_id, days=days, connection=connection)
+        metrics["returns_after_broadcast"] = marketing["total_returns"]
     else:
         metrics.update({key: None for key in owner_keys})
 
