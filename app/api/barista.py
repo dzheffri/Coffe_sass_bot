@@ -25,6 +25,7 @@ from app.db import (
     subscription_is_active,
 )
 from app.loyalty_notifications import notify_cups_added, notify_free_redeemed
+from app.account_deletion import account_deletion_state, delete_personal_account
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,11 @@ class AddCupRequest(QRRequest):
     # Existing clients omit count and keep the original single-cup behavior.
     # Strict validation also rejects booleans and numeric strings/floats.
     count: int = Field(default=1, strict=True, ge=1, le=10)
+
+
+class DeleteAccountRequest(BaseModel):
+    class Config:
+        extra = "forbid"
 
 
 def _qr_token(value: str) -> str:
@@ -260,6 +266,32 @@ def build_barista_router(
     @router.get("/me")
     def me(session=Depends(current_barista)):
         return _me_response(session)
+
+    @router.get("/account/deletion")
+    def deletion_eligibility(authorization: str | None = Header(default=None)):
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                session = authorize(parse_bearer(authorization), connection=connection, touch=False)
+                return account_deletion_state(session["user_id"], connection)
+
+    @router.delete("/account")
+    def delete_account(body: DeleteAccountRequest,
+                       authorization: str | None = Header(default=None)):
+        token = parse_bearer(authorization)
+        with get_connection() as connection:
+            with connection.transaction():
+                session = authorize(token, connection=connection, touch=False)
+                try:
+                    result = delete_personal_account(
+                        session["user_id"], connection=connection, barista_token=token,
+                    )
+                except BaristaSessionError as exc:
+                    raise _session_error(exc) from exc
+        if result["status"] == "user_not_found":
+            raise HTTPException(404, detail={"code": "ACCOUNT_NOT_FOUND"})
+        return {"ok": True, "status": "deleted",
+                "apple_revocation": result["apple_revocation"]}
 
     @router.post("/context")
     def select_context(body: ContextRequest,

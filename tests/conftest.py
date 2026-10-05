@@ -89,6 +89,7 @@ def safe_db(local_connection):
         "get_shop_admins", "remove_shop_admin", "get_broadcast_recipients",
         "can_send_broadcast", "log_broadcast_touches",
         "get_shop_marketing_efficiency", "get_admin_shop_and_role",
+        "delete_user_account",
     }, module.__dict__)
     previous = sys.modules.get("app.db")
     previous_notifications = sys.modules.get("app.loyalty_notifications")

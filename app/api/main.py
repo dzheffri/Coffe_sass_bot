@@ -1534,8 +1534,11 @@ def delete_me(
 
     try:
         result = delete_user_account(user_id)
+    except HTTPException:
+        # Shared-account safeguards (e.g. sole shop owner) stay actionable.
+        raise
     except Exception as exc:
-        print("DELETE ACCOUNT ERROR:", repr(exc))
+        print("DELETE ACCOUNT ERROR:", type(exc).__name__)
         raise HTTPException(
             status_code=500,
             detail="Unable to delete account",
