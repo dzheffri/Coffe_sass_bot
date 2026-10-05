@@ -22,6 +22,15 @@ from app.broadcast_media import JSON_LIMIT, bounded_body, multipart_media, valid
 logger = logging.getLogger(__name__)
 
 
+def _broadcast_shop_is_active(shop_id):
+    with get_connection() as connection:
+        with connection.transaction():
+            connection.execute("SET TRANSACTION READ ONLY")
+            return connection.execute(
+                "SELECT id FROM coffee_shops WHERE id=%s AND is_active IS TRUE", (shop_id,),
+            ).fetchone() is not None
+
+
 class BroadcastPreviewRequest(BaseModel):
     text: str = Field(strict=True, min_length=1, max_length=4096)
 
@@ -45,8 +54,13 @@ async def deliver_owner_broadcast(broadcast):
     failed = 0
     telegram_media_id = None
     try:
-        for row in broadcast["recipients"]:
+        for index, row in enumerate(broadcast["recipients"]):
             try:
+                # Sending happens after claim commits. Recheck between sends
+                # so shop closure also stops the pending portion of delivery.
+                if not await run_in_threadpool(_broadcast_shop_is_active, broadcast["shop_id"]):
+                    failed += len(broadcast["recipients"]) - index
+                    break
                 media = broadcast.get("media")
                 if media is None:
                     await bot.send_message(chat_id=row["telegram_user_id"], text=broadcast["text"])

@@ -457,6 +457,7 @@ def test_plain_text_delivery_uses_only_saved_recipient_ids_and_closes_bot_sessio
     monkeypatch.setitem(sys.modules, "app.config", SimpleNamespace(BOT_TOKEN="offline-token"))
     monkeypatch.setattr(module, "Bot", lambda token:bot)
     touched, failed = asyncio.run(owner_api[1].original({
+        "shop_id": 1,
         "text":"<b>Ordinary text</b>",
         "recipients":[{"user_id":4,"telegram_user_id":1004},{"user_id":6,"telegram_user_id":1006}],
     }))

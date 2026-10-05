@@ -178,7 +178,7 @@ def cleanup_broadcast_previews(connection, shop_id=None):
 
 
 def make_broadcast_preview(session, shop, text, connection, media=None):
-    connection.execute("SELECT id FROM coffee_shops WHERE id=%s FOR NO KEY UPDATE", (shop["shop_id"],))
+    _lock_active_shop(shop["shop_id"], connection)
     cleanup_broadcast_previews(connection, shop["shop_id"])
     preview_limits(session, shop, connection)
     # One pending preview per session. Replaced bytes disappear immediately;
@@ -206,7 +206,7 @@ def make_broadcast_preview(session, shop, text, connection, media=None):
 
 def claim_broadcast(session, shop, token, connection):
     # Same shop-before-preview order as preview creation/replacement.
-    connection.execute("SELECT id FROM coffee_shops WHERE id=%s FOR NO KEY UPDATE", (shop["shop_id"],))
+    _lock_active_shop(shop["shop_id"], connection)
     preview = connection.execute("""
         SELECT *,media_bytes FROM admin_broadcast_previews WHERE token_hash=%s FOR UPDATE
     """, (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
@@ -249,5 +249,14 @@ def claim_broadcast(session, shop, token, connection):
     """, (preview["token_hash"],)).fetchone()
     if claimed is None:
         raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
-    return {"broadcast_id": broadcast["id"], "text": preview["text"], "recipients": recipients,
+    return {"broadcast_id": broadcast["id"], "shop_id": shop["shop_id"],
+            "text": preview["text"], "recipients": recipients,
             "media": media}
+
+
+def _lock_active_shop(shop_id, connection):
+    if connection.execute(
+        "SELECT id FROM coffee_shops WHERE id=%s AND is_active IS TRUE FOR NO KEY UPDATE",
+        (shop_id,),
+    ).fetchone() is None:
+        raise HTTPException(403, detail={"code": "SHOP_ACCESS_DENIED"})

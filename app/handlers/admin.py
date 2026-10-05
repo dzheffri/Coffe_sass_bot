@@ -143,11 +143,18 @@ async def handle_scanner_data(message: types.Message, state: FSMContext):
         return
 
     if mode == "redeem":
-        result = redeem_free_for_shop_client(
-            shop_id=shop["id"],
-            client_user_id=user["id"],
-            admin_user_id=admin_user["id"],
-        )
+        try:
+            result = redeem_free_for_shop_client(
+                shop_id=shop["id"],
+                client_user_id=user["id"],
+                admin_user_id=admin_user["id"],
+            )
+        except ValueError as error:
+            if str(error) != "SHOP_CLOSED":
+                raise
+            await state.clear()
+            await message.answer("❌ Кав’ярню закрито. Операція недоступна.")
+            return
 
         if result == "NOT_FOUND":
             await message.answer(
@@ -200,12 +207,18 @@ async def handle_cups_count(message: types.Message, state: FSMContext):
     data = pending_scan.pop(message.from_user.id)
     await state.clear()
 
-    result = add_cups_for_shop_client(
-        shop_id=data["shop_id"],
-        client_user_id=data["client_user_id"],
-        admin_user_id=data["admin_user_id"],
-        count=count,
-    )
+    try:
+        result = add_cups_for_shop_client(
+            shop_id=data["shop_id"],
+            client_user_id=data["client_user_id"],
+            admin_user_id=data["admin_user_id"],
+            count=count,
+        )
+    except ValueError as error:
+        if str(error) != "SHOP_CLOSED":
+            raise
+        await message.answer("❌ Кав’ярню закрито. Операція недоступна.")
+        return
 
     shop_client = result["shop_client"]
     earned_free = result["earned_free"]

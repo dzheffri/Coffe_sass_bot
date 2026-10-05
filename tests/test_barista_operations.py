@@ -456,16 +456,18 @@ def test_legacy_count_and_marketing_return_logic_remain_atomic(operations_databa
 
 def parallel_requests(client, database, monkeypatch, function_name, path, bodies=None):
     router = importlib.import_module("app.api.barista")
-    original = getattr(router, function_name)
+    original = router.resolve_barista_session
     entered = threading.Barrier(2)
 
     def synchronized(*args, **kwargs):
         entered.wait(timeout=4)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(router, function_name, synchronized)
-    # Separate sessions prevent the session lock from serializing these tests;
-    # both requests must contend on the actual loyalty row/unique constraint.
+    monkeypatch.setattr(router, "resolve_barista_session", synchronized)
+    # Both requests arrive concurrently BEFORE authorization acquires shop locks.
+    # A barrier inside loyalty would wait for a second request that is correctly
+    # blocked by the shop closure lock. Verify the committed ledger, not bypass
+    # the production lock order, using independent existing staff sessions.
     tokens = (database.staff_token(), database.staff_token())
     bodies = bodies if bodies is not None else (BODY, BODY)
     with ThreadPoolExecutor(max_workers=2) as executor:

@@ -47,7 +47,9 @@ def create_invite(connection, *, owner: dict, user_id: int) -> dict:
     with connection.cursor() as cur:
         # Authorization already holds a shared membership lock. Serializing
         # creation on the shop prevents the active-invitation limit racing.
-        cur.execute("SELECT id FROM coffee_shops WHERE id=%s FOR NO KEY UPDATE", (owner["shop_id"],))
+        cur.execute("SELECT id FROM coffee_shops WHERE id=%s AND is_active IS TRUE FOR NO KEY UPDATE", (owner["shop_id"],))
+        if cur.fetchone() is None:
+            raise InviteError("SHOP_ACCESS_DENIED", 403)
         cur.execute(
             """UPDATE barista_admin_invites SET closed_at=expires_at
                WHERE shop_id=%s AND expires_at<=statement_timestamp() AND closed_at IS NULL""",
@@ -155,8 +157,8 @@ def accept_invite(*, provider: str, subject: str, user_id: int, code: str) -> tu
             with connection.cursor() as cur:
                 cur.execute(
                     """SELECT ui.user_id FROM user_identities ui JOIN users u ON u.id=ui.user_id
-                       WHERE ui.provider=%s AND ui.provider_user_id=%s AND ui.user_id=%s
-                       FOR SHARE OF ui,u""", (provider, subject, user_id)
+                       WHERE ui.provider=%s AND ui.provider_user_id=%s AND ui.user_id=%s""",
+                    (provider, subject, user_id)
                 )
                 if cur.fetchone() is None:
                     raise InviteError("IDENTITY_NOT_LINKED", 403)
@@ -170,18 +172,33 @@ def accept_invite(*, provider: str, subject: str, user_id: int, code: str) -> tu
                     candidate = cur.fetchone()
                     owner = None
                     if candidate is not None:
-                        # Lock membership before invitation, matching owner
-                        # authorization/revocation and membership FK deletion.
+                        # Closing a shop must win before a new membership can
+                        # be created. Match shop→membership→invite lock order.
                         cur.execute(
-                            """SELECT id FROM shop_admins WHERE id=%s AND user_id=%s
-                               AND shop_id=%s AND role='owner' FOR SHARE""",
-                            (candidate["creator_membership_id"], candidate["creator_user_id"],
-                             candidate["shop_id"]),
+                            """SELECT id FROM coffee_shops WHERE id=%s
+                               AND is_active IS TRUE FOR NO KEY UPDATE""",
+                            (candidate["shop_id"],),
                         )
-                        owner = cur.fetchone()
+                        if cur.fetchone() is not None:
+                            cur.execute(
+                                """SELECT id FROM shop_admins WHERE id=%s AND user_id=%s
+                                   AND shop_id=%s AND role='owner' FOR SHARE""",
+                                (candidate["creator_membership_id"], candidate["creator_user_id"],
+                                 candidate["shop_id"]),
+                            )
+                            owner = cur.fetchone()
                     if candidate is None or owner is None:
                         error = InviteError("INVALID_INVITE")
                     else:
+                        # Identity still belongs to the verified actor. Lock it
+                        # after the shop, matching account deletion lock order.
+                        cur.execute(
+                            """SELECT ui.user_id FROM user_identities ui JOIN users u ON u.id=ui.user_id
+                               WHERE ui.provider=%s AND ui.provider_user_id=%s AND ui.user_id=%s
+                               FOR SHARE OF ui,u""", (provider, subject, user_id),
+                        )
+                        if cur.fetchone() is None:
+                            raise InviteError("IDENTITY_NOT_LINKED", 403)
                         cur.execute(
                             """SELECT * FROM barista_admin_invites WHERE id=%s
                                AND closed_at IS NULL AND used_at IS NULL AND revoked_at IS NULL

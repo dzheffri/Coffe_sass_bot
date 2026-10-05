@@ -14,6 +14,7 @@ import pytest
     "test_owner_preview_preserves_media_and_caption_without_overrides",
     "test_owner_confirmation_uses_only_server_shop_and_saved_original",
     "test_owner_confirmation_without_original_ids_cannot_send",
+    "test_owner_confirmation_cannot_send_to_closed_shop",
     "test_owner_confirmation_rechecks_role_before_recipient_query",
 ])
 def test_real_broadcast_media_regression(scenario):

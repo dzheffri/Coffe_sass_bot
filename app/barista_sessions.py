@@ -21,6 +21,7 @@ def get_barista_memberships(user_id: int) -> list[dict]:
                 FROM shop_admins sa
                 JOIN coffee_shops cs ON cs.id = sa.shop_id
                 WHERE sa.user_id = %s AND sa.role IN ('admin', 'owner')
+                  AND cs.is_active IS TRUE
                 ORDER BY sa.id
                 """,
                 (user_id,),
@@ -38,8 +39,8 @@ def resolve_barista_session(
 ) -> dict:
     """Authorize current membership before extending, selecting context or logout.
 
-    Membership rows are locked before the session row, matching the order of
-    membership deletion followed by the session FK cascade. Context changes and
+    Active shops, membership rows and the session row are locked in that order,
+    matching account/shop closure and membership FK deletion. Context changes and
     revocations are re-read under the session lock; a stale read cannot revive
     an expired/revoked session or overwrite an unchecked shop context.
 
@@ -71,12 +72,30 @@ def resolve_barista_session(
                 if candidate is None:
                     raise BaristaSessionError("INVALID_SESSION")
 
+                if touch:
+                    # Hold shop status stable throughout a write operation.
+                    # NO KEY UPDATE matches invitation/preview serialization;
+                    # using SHARE then upgrading would deadlock two creators.
+                    cur.execute(
+                        """
+                        SELECT cs.id FROM coffee_shops cs
+                        WHERE cs.is_active IS TRUE AND EXISTS (
+                            SELECT 1 FROM shop_admins sa WHERE sa.shop_id=cs.id
+                              AND sa.user_id=%s AND sa.role IN ('admin','owner')
+                        )
+                        ORDER BY cs.id FOR NO KEY UPDATE OF cs
+                        """,
+                        (candidate["user_id"],),
+                    )
+                    cur.fetchall()
+
                 cur.execute(
                     """
                     SELECT sa.id AS membership_id, sa.shop_id, cs.name, sa.role
                     FROM shop_admins sa
                     JOIN coffee_shops cs ON cs.id = sa.shop_id
                     WHERE sa.user_id = %s AND sa.role IN ('admin', 'owner')
+                      AND cs.is_active IS TRUE
                     ORDER BY sa.id
                     """ + (" FOR SHARE OF sa" if touch else ""),
                     (candidate["user_id"],),

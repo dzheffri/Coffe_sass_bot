@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi import HTTPException
 
-from conftest import bearer
+from conftest import PROJECT, bearer
 from test_barista_operations import operations_database
 
 
@@ -31,6 +31,8 @@ def deletion_database(operations_database):
             user_id BIGINT REFERENCES users(id) ON DELETE CASCADE);
         INSERT INTO users(telegram_user_id,full_name,personal_qr_token)
             VALUES(1004,'Інший клієнт','other-client-qr');
+        INSERT INTO user_identities(user_id,provider,provider_user_id)
+            VALUES(4,'apple','other-client-apple');
         INSERT INTO shop_clients(shop_id,user_id,cups,free_coffee_balance)
             VALUES(1,2,6,2),(1,4,4,1);
         INSERT INTO wallet_passes VALUES(2,'deleted-wallet'),(4,'other-wallet');
@@ -120,39 +122,135 @@ def test_admin_deletion_removes_shared_profile_balances_identities_all_access_bu
         db.db.create_app_session(2)
 
 
-def test_sole_owner_has_actionable_transfer_blocker_without_any_mutation(deletion_database, api):
+def test_sole_owner_delete_closes_shop_without_removing_clients_or_history(deletion_database, api):
     db = deletion_database
     client, _ = api
     token = db.staff_token()
-    before = {table: db.query(f"SELECT * FROM {table} ORDER BY id")
-              for table in ("users", "app_sessions", "user_identities", "shop_admins", "shop_clients", "transactions")}
+    staff = db.staff_token(2, 3)
+    ordinary_client = db.db.create_app_session(2)
+    db.query("INSERT INTO shop_clients(shop_id,user_id,cups,free_coffee_balance) VALUES(2,2,5,3)")
+    clients_before = db.query("SELECT * FROM users WHERE id IN(2,4) ORDER BY id")
+    identities_before = db.query("SELECT * FROM user_identities WHERE user_id IN(2,4) ORDER BY id")
+    balances_before = db.query("SELECT * FROM shop_clients WHERE user_id IN(2,4) ORDER BY id")
+    ledger_before = db.query("SELECT id,shop_id,type,cups_added,free_redeemed,created_at FROM transactions ORDER BY id")
     state = client.get("/barista/account/deletion", headers=bearer(token))
     assert state.status_code == 200
-    assert state.json() == {"ok": True, "can_delete": False,
-                            "blocking_shops": [{"id": 1, "name": "Наші", "has_other_admin": True}],
+    assert state.json() == {"ok": True, "can_delete": True, "blocking_shops": [],
+                            "closing_shops": [{"id": 1, "name": "Наші"}],
                             "apple_revocation": "manual_required"}
     response = delete(client, token)
-    assert response.status_code == 409
-    assert response.json()["detail"] == {"code": "LAST_OWNER_TRANSFER_REQUIRED",
-                                         "shops": [{"id": 1, "name": "Наші", "has_other_admin": True}]}
-    assert {table: db.query(f"SELECT * FROM {table} ORDER BY id") for table in before} == before
+    assert response.status_code == 200, response.text
+    assert db.query("SELECT id,is_active FROM coffee_shops ORDER BY id") == [
+        {"id": 1, "is_active": False}, {"id": 2, "is_active": True}]
+    assert db.query("SELECT * FROM users WHERE id IN(2,4) ORDER BY id") == clients_before
+    assert db.query("SELECT * FROM user_identities WHERE user_id IN(2,4) ORDER BY id") == identities_before
+    assert db.query("SELECT * FROM shop_clients WHERE user_id IN(2,4) ORDER BY id") == balances_before
+    assert db.query("SELECT id,shop_id,type,cups_added,free_redeemed,created_at FROM transactions ORDER BY id") == ledger_before
+    assert db.query("SELECT * FROM shop_admins WHERE shop_id=1") == []
+    assert db.query("SELECT * FROM users WHERE id=1") == []
+    assert db.query("SELECT * FROM user_identities WHERE user_id=1") == []
+    assert db.query("SELECT * FROM app_sessions WHERE user_id=1") == []
+    assert db.db.get_app_session(ordinary_client) is not None
+    assert client.get("/barista/me", headers=bearer(staff)).status_code == 401
+    for path in ("/barista/scan", "/barista/add-cup", "/barista/redeem"):
+        assert client.post(path, headers=bearer(staff), json={"qr_token": "coffee:customer-qr"}).status_code == 401
+    assert db.query("SELECT * FROM wallet_passes WHERE user_id=2")
+    assert db.query("SELECT * FROM wallet_device_registrations WHERE serial_number='other-wallet'")
 
 
-def test_owner_with_no_other_staff_gets_clear_shop_metadata(deletion_database, api):
+def test_sole_owner_without_other_staff_still_can_delete(deletion_database, api):
     db = deletion_database
     db.query("DELETE FROM shop_admins WHERE id=3")
     response = api[0].get("/barista/account/deletion", headers=bearer(db.staff_token()))
-    assert response.json()["blocking_shops"] == [{"id": 1, "name": "Наші", "has_other_admin": False}]
+    assert response.json()["can_delete"] is True
+    assert response.json()["closing_shops"] == [{"id": 1, "name": "Наші"}]
 
 
-def test_owner_safety_checks_all_memberships_not_only_selected_shop(deletion_database, api):
+def test_coowner_delete_keeps_shop_and_other_owner_active(deletion_database, api):
+    db = deletion_database
+    db.query("UPDATE shop_admins SET role='owner' WHERE id=3")
+    other_token = db.staff_token(2, 3)
+    token = db.staff_token()
+    state = api[0].get("/barista/account/deletion", headers=bearer(token)).json()
+    assert state["closing_shops"] == []
+    assert delete(api[0], token).status_code == 200
+    assert db.query("SELECT is_active FROM coffee_shops WHERE id=1") == [{"is_active": True}]
+    assert db.query("SELECT user_id,role FROM shop_admins WHERE shop_id=1") == [{"user_id": 2, "role": "owner"}]
+    assert api[0].get("/barista/me", headers=bearer(other_token)).status_code == 200
+
+
+def test_global_owner_deletion_closes_all_sole_owned_shops_not_only_selected_context(deletion_database, api):
+    db = deletion_database
+    db.query("INSERT INTO shop_admins(shop_id,user_id,role) VALUES(2,1,'owner')")
+    state = api[0].get("/barista/account/deletion", headers=bearer(db.staff_token())).json()
+    assert state["closing_shops"] == [{"id": 1, "name": "Наші"}, {"id": 2, "name": "Інша кав’ярня"}]
+    response = delete(api[0], db.staff_token())
+    assert response.status_code == 200
+    assert db.query("SELECT is_active FROM coffee_shops ORDER BY id") == [{"is_active": False}, {"is_active": False}]
+    assert db.query("SELECT * FROM shop_admins") == []
+    assert db.query("SELECT id FROM users WHERE id IN(2,3,4) ORDER BY id") == [{"id": 2}, {"id": 3}, {"id": 4}]
+
+
+def test_multishop_closure_preserves_coowned_and_unrelated_shop_memberships_sessions(deletion_database, api):
     db = deletion_database
     db.query("UPDATE shop_admins SET role='owner' WHERE id=3")
     db.query("INSERT INTO shop_admins(shop_id,user_id,role) VALUES(2,1,'owner')")
-    response = delete(api[0], db.staff_token())
-    assert response.status_code == 409
-    assert response.json()["detail"]["shops"] == [{"id": 2, "name": "Інша кав’ярня", "has_other_admin": True}]
+    db.query("INSERT INTO coffee_shops(id,name) VALUES(3,'Чужа кав’ярня')")
+    membership = db.query("INSERT INTO shop_admins(shop_id,user_id,role) VALUES(3,3,'owner') RETURNING id")[0]["id"]
+    other_coowner = db.staff_token(2, 3)
+    other_staff = db.staff_token(3, 2)
+    unrelated_staff_session = db.staff_token(3, membership)
+    foreign_membership = db.query("SELECT * FROM shop_admins WHERE shop_id=3")
+    foreign_user = db.query("SELECT * FROM users WHERE id=3")
+    before_sessions = db.query("SELECT * FROM app_sessions WHERE user_id=2")
+    state = api[0].get("/barista/account/deletion", headers=bearer(db.staff_token())).json()
+    assert state["closing_shops"] == [{"id": 2, "name": "Інша кав’ярня"}]
+    assert delete(api[0], db.staff_token()).status_code == 200
+    assert db.query("SELECT id,is_active FROM coffee_shops ORDER BY id") == [
+        {"id": 1, "is_active": True}, {"id": 2, "is_active": False}, {"id": 3, "is_active": True}]
+    assert db.query("SELECT * FROM shop_admins WHERE shop_id=3") == foreign_membership
+    assert db.query("SELECT * FROM users WHERE id=3") == foreign_user
+    assert db.query("SELECT * FROM app_sessions WHERE user_id=2") == before_sessions
+    assert api[0].get("/barista/me", headers=bearer(other_coowner)).status_code == 200
+    assert api[0].get("/barista/me", headers=bearer(other_staff)).status_code == 401
+    assert api[0].get("/barista/me", headers=bearer(unrelated_staff_session)).status_code == 200
 
+
+def test_closed_shop_revokes_pending_invites_previews_and_only_scoped_staff_access(deletion_database, api):
+    db = deletion_database
+    db.query((PROJECT / "migrations/20261004_admin_invites.sql").read_text())
+    db.query((PROJECT / "migrations/20261004_admin_broadcast.sql").read_text())
+    db.query("UPDATE users SET telegram_user_id=2002 WHERE id=2")
+    extra_membership = db.query("INSERT INTO shop_admins(shop_id,user_id,role) VALUES(2,2,'admin') RETURNING id")[0]["id"]
+    db.query("INSERT INTO shop_admins(shop_id,user_id,role) VALUES(1,4,'admin')")
+    db.query("INSERT INTO admin_login_tickets VALUES(2002,'multi-shop-ticket'),(1004,'closed-only-ticket')")
+    staff_closed = db.staff_token(2, 3)
+    staff_other = db.staff_token(2, extra_membership)
+    retained_preview_session = db.session(staff_other)["id"]
+    db.query("""
+        INSERT INTO barista_admin_invites(shop_id,creator_user_id,creator_membership_id,code_hash,expires_at)
+        VALUES(1,2,3,%s,NOW()+INTERVAL '1 day'),(2,2,%s,%s,NOW()+INTERVAL '1 day')
+    """, ("a" * 64, extra_membership, "b" * 64))
+    # A preview may outlive a context change. Closure must invalidate it even
+    # when its session is currently selected to a different, still-active shop.
+    db.query("""
+        INSERT INTO admin_broadcast_previews(token_hash,shop_id,owner_user_id,session_id,text,
+            recipients_hash,expires_at,media_kind,media_filename,media_mime,media_bytes)
+        VALUES(%s,1,2,%s,'Фото',%s,NOW()+INTERVAL '1 hour','photo','photo.jpg','image/jpeg',%s)
+    """, ("c" * 64, retained_preview_session, "d" * 64, b"photo"))
+    client_sessions = db.query("SELECT * FROM app_sessions WHERE purpose='client' AND user_id<>1 ORDER BY id")
+    assert delete(api[0], db.staff_token()).status_code == 200
+    closed_invite = db.query("SELECT * FROM barista_admin_invites WHERE shop_id=1")[0]
+    assert closed_invite["revoked_at"] is not None and closed_invite["closed_at"] is not None
+    assert closed_invite["creator_membership_id"] is None
+    assert db.query("SELECT revoked_at,closed_at FROM barista_admin_invites WHERE shop_id=2") == [
+        {"revoked_at": None, "closed_at": None}]
+    preview = db.query("SELECT invalidated_at,media_bytes FROM admin_broadcast_previews")[0]
+    assert preview["invalidated_at"] is not None and preview["media_bytes"] is None
+    assert db.query("SELECT ticket FROM admin_login_tickets") == [{"ticket": "multi-shop-ticket"}]
+    assert db.query("SELECT * FROM app_sessions WHERE purpose='client' AND user_id<>1 ORDER BY id") == client_sessions
+    assert api[0].get("/barista/me", headers=bearer(staff_closed)).status_code == 401
+    assert api[0].get("/barista/me", headers=bearer(staff_other)).status_code == 200
 
 def test_apple_linked_account_deleted_with_honest_manual_revocation_result(deletion_database, api, monkeypatch):
     db = deletion_database
@@ -176,16 +274,29 @@ def test_removed_or_revoked_membership_cannot_delete_account(deletion_database, 
     assert db.query("SELECT id FROM users WHERE id=2")
 
 
-def test_legacy_client_helper_reuses_owner_safety_and_business_anonymization(deletion_database):
+def test_legacy_client_helper_reuses_owner_closure_and_business_anonymization(deletion_database):
     db = deletion_database
-    with pytest.raises(HTTPException) as error:
-        db.db.delete_user_account(1)
-    assert error.value.status_code == 409
-    assert error.value.detail["code"] == "LAST_OWNER_TRANSFER_REQUIRED"
+    assert db.db.delete_user_account(1)["status"] == "deleted"
+    assert db.query("SELECT is_active FROM coffee_shops WHERE id=1") == [{"is_active": False}]
+    assert db.query("SELECT * FROM users WHERE id=2")
     assert db.db.delete_user_account(2)["status"] == "deleted"
     assert db.query("SELECT COUNT(*) AS count FROM transactions")[0]["count"] == 2
     assert db.db.delete_user_account(2) == {"status": "user_not_found"}
 
+
+def test_owner_closure_and_personal_deletion_roll_back_atomically_on_failure(deletion_database, monkeypatch):
+    from psycopg.errors import UniqueViolation
+
+    db = deletion_database
+    db.staff_token()
+    db.staff_token(2, 3)
+    before = {table: db.query(f"SELECT * FROM {table} ORDER BY id")
+              for table in ("coffee_shops", "users", "shop_admins", "user_identities",
+                            "app_sessions", "shop_clients", "transactions")}
+    monkeypatch.setattr(module().secrets, "token_urlsafe", lambda length: "customer-qr")
+    with pytest.raises(UniqueViolation):
+        module().delete_personal_account(1)
+    assert {table: db.query(f"SELECT * FROM {table} ORDER BY id") for table in before} == before
 
 def test_deletion_clears_only_own_non_fk_pending_owner_reference(deletion_database, api):
     db = deletion_database
@@ -206,7 +317,7 @@ def test_deletion_clears_only_own_non_fk_pending_owner_reference(deletion_databa
     assert db.query("SELECT ticket FROM admin_login_tickets") == [{"ticket": "other-ticket"}]
 
 
-def test_two_coowners_deleting_simultaneously_leave_one_owner(deletion_database):
+def test_two_coowners_deleting_simultaneously_close_shop_when_final_owner_leaves(deletion_database):
     db = deletion_database
     db.query("UPDATE shop_admins SET role='owner' WHERE id=3")
     tokens = [db.staff_token(), db.staff_token(2, 3)]
@@ -222,5 +333,7 @@ def test_two_coowners_deleting_simultaneously_leave_one_owner(deletion_database)
 
     with ThreadPoolExecutor(max_workers=2) as workers:
         results = list(workers.map(lambda pair: remove(*pair), zip([1, 2], tokens)))
-    assert sorted(results) == ["LAST_OWNER_TRANSFER_REQUIRED", "deleted"]
-    assert db.query("SELECT COUNT(*) AS count FROM shop_admins WHERE shop_id=1 AND role='owner'")[0]["count"] == 1
+    assert results == ["deleted", "deleted"]
+    assert db.query("SELECT * FROM shop_admins WHERE shop_id=1") == []
+    assert db.query("SELECT is_active FROM coffee_shops WHERE id=1") == [{"is_active": False}]
+    assert db.query("SELECT id FROM users WHERE id=4") == [{"id": 4}]

@@ -43,6 +43,7 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
             self.owner, "get_broadcast_recipients",
             return_value=[{"telegram_user_id": 201, "user_id": 11}],
         ).start()
+        self.active_shop = patch.object(self.owner, "get_shop", return_value={"id": 73, "is_active": True}).start()
         self.save = patch.object(self.owner, "save_broadcast").start()
         self.touches = patch.object(self.owner, "log_broadcast_touches").start()
         self.all_users = patch.object(
@@ -151,6 +152,17 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         callback.bot.copy_message.assert_not_awaited()
         self.save.assert_not_called()
         self.touches.assert_not_called()
+
+    async def test_owner_confirmation_cannot_send_to_closed_shop(self):
+        self.active_shop.return_value = {"id": 73, "is_active": False}
+        callback = self.callback()
+        state = self.state({"broadcast_from_chat_id": 888, "broadcast_message_id": 55})
+        await self.owner.broadcast_confirm_callback(callback, state)
+        callback.bot.copy_message.assert_not_awaited()
+        self.save.assert_not_called()
+        self.touches.assert_not_called()
+        self.all_users.assert_not_called()
+        state.clear.assert_awaited_once()
 
     async def test_owner_confirmation_rechecks_role_before_recipient_query(self):
         self.owner_allowed.return_value = False

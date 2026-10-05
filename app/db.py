@@ -1631,7 +1631,7 @@ def get_active_shop_for_user(telegram_user_id: int):
                 SELECT cs.*
                 FROM users u
                 JOIN coffee_shops cs ON cs.id = u.active_shop_id
-                WHERE u.telegram_user_id = %s
+                WHERE u.telegram_user_id = %s AND cs.is_active
             """, (telegram_user_id,))
             return cur.fetchone()
 
@@ -1665,7 +1665,7 @@ def get_shop(shop_id: int):
 def get_all_shops():
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM coffee_shops ORDER BY id")
+            cur.execute("SELECT * FROM coffee_shops WHERE is_active ORDER BY id")
             return cur.fetchall()
 def get_all_shops_with_subscriptions():
     with get_connection() as conn:
@@ -1699,6 +1699,7 @@ def get_owners_for_subscription_last_day():
                 JOIN shop_admins sa ON sa.shop_id = cs.id AND sa.role = 'owner'
                 JOIN users u ON u.id = sa.user_id
                 WHERE s.status = 'active'
+                  AND cs.is_active
                   AND s.expires_at > NOW()
                   AND s.expires_at <= NOW() + INTERVAL '1 day'
                   AND NOT EXISTS (
@@ -1721,7 +1722,7 @@ def get_user_shops(telegram_user_id: int):
                 FROM shop_clients sc
                 JOIN users u ON u.id = sc.user_id
                 JOIN coffee_shops cs ON cs.id = sc.shop_id
-                WHERE u.telegram_user_id = %s
+                WHERE u.telegram_user_id = %s AND cs.is_active
                 ORDER BY cs.name
             """, (telegram_user_id,))
             return cur.fetchall()
@@ -1765,7 +1766,7 @@ def assign_pending_owner_if_exists(owner_telegram_user_id: int):
             cur.execute("""
                 SELECT id
                 FROM coffee_shops
-                WHERE pending_owner_telegram_id = %s
+                WHERE pending_owner_telegram_id = %s AND is_active
             """, (owner_telegram_user_id,))
             shops = cur.fetchall()
 
@@ -1819,7 +1820,7 @@ def get_admin_shop_and_role(admin_telegram_user_id: int):
                 FROM shop_admins sa
                 JOIN users u ON u.id = sa.user_id
                 JOIN coffee_shops cs ON cs.id = sa.shop_id
-                WHERE u.telegram_user_id = %s
+                WHERE u.telegram_user_id = %s AND cs.is_active
                 ORDER BY sa.id
                 LIMIT 1
             """, (admin_telegram_user_id,))
@@ -1910,6 +1911,9 @@ def add_cups_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: i
     with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                cur.execute("SELECT id FROM coffee_shops WHERE id=%s AND is_active FOR SHARE", (shop_id,))
+                if cur.fetchone() is None:
+                    raise ValueError("SHOP_CLOSED")
                 cur.execute("""
                     SELECT *
                     FROM shop_clients
@@ -1997,6 +2001,9 @@ def redeem_free_for_shop_client(shop_id: int, client_user_id: int, admin_user_id
     with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                cur.execute("SELECT id FROM coffee_shops WHERE id=%s AND is_active FOR SHARE", (shop_id,))
+                if cur.fetchone() is None:
+                    raise ValueError("SHOP_CLOSED")
                 cur.execute("""
                     SELECT *
                     FROM shop_clients
@@ -2364,13 +2371,14 @@ def can_send_broadcast(shop_id: int, *, connection=None):
     with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT COUNT(*) AS cnt
-                FROM broadcasts
-                WHERE shop_id = %s
-                  AND created_at >= NOW() - INTERVAL '7 days'
+                SELECT cs.is_active AND (
+                    SELECT COUNT(*) FROM broadcasts
+                    WHERE shop_id=cs.id AND created_at >= NOW() - INTERVAL '7 days'
+                ) < 8 AS allowed
+                FROM coffee_shops cs WHERE cs.id=%s
             """, (shop_id,))
             row = cur.fetchone()
-            return row["cnt"] < 8
+            return bool(row and row["allowed"])
 
 
 def get_broadcast_recipients(shop_id: int, *, connection=None):
@@ -2380,6 +2388,7 @@ def get_broadcast_recipients(shop_id: int, *, connection=None):
                 SELECT u.telegram_user_id, sc.user_id
                 FROM shop_clients sc
                 JOIN users u ON u.id = sc.user_id
+                JOIN coffee_shops cs ON cs.id = sc.shop_id AND cs.is_active
                 WHERE sc.shop_id = %s
                   AND sc.last_activity_at >= NOW() - INTERVAL '60 days'
                 ORDER BY u.telegram_user_id
@@ -2469,6 +2478,7 @@ def get_clients_for_one_left_reminder():
                 JOIN coffee_shops cs ON cs.id = sc.shop_id
                 JOIN subscriptions s ON s.shop_id = sc.shop_id
                 WHERE sc.cups = 6
+                  AND cs.is_active
                   AND sc.free_coffee_balance = 0
                   AND s.status = 'active'
                   AND s.expires_at > NOW()
@@ -2494,6 +2504,7 @@ def get_clients_with_free_coffee():
                 JOIN coffee_shops cs ON cs.id = sc.shop_id
                 JOIN subscriptions s ON s.shop_id = sc.shop_id
                 WHERE sc.free_coffee_balance > 0
+                  AND cs.is_active
                   AND s.status = 'active'
                   AND s.expires_at > NOW()
             """)
@@ -2519,6 +2530,7 @@ def get_clients_for_inactive_reminder(days_from: int, days_to: int | None = None
                     JOIN coffee_shops cs ON cs.id = sc.shop_id
                     JOIN subscriptions s ON s.shop_id = sc.shop_id
                     WHERE sc.last_activity_at < NOW() - (%s || ' days')::interval
+                      AND cs.is_active
                       AND s.status = 'active'
                       AND s.expires_at > NOW()
                 """, (days_from,))
@@ -2538,6 +2550,7 @@ def get_clients_for_inactive_reminder(days_from: int, days_to: int | None = None
                     JOIN coffee_shops cs ON cs.id = sc.shop_id
                     JOIN subscriptions s ON s.shop_id = sc.shop_id
                     WHERE sc.last_activity_at < NOW() - (%s || ' days')::interval
+                      AND cs.is_active
                       AND sc.last_activity_at >= NOW() - (%s || ' days')::interval
                       AND s.status = 'active'
                       AND s.expires_at > NOW()

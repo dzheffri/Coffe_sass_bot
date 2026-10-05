@@ -255,6 +255,7 @@ def test_native_delivery_passes_buffered_media_and_caption_only_to_verified_reci
     monkeypatch.setattr(module,"Bot",lambda token:bot)
     data = photo_data() if kind == "photo" else video_data()
     touched,failed = asyncio.run(owner_api[1].original({
+        "shop_id": 1,
         "text":"Caption", "recipients":[{"user_id":4,"telegram_user_id":1004}],
         "media":{"kind":kind,"filename":"attachment","bytes":data},
     }))
@@ -277,6 +278,7 @@ def test_native_delivery_reuses_only_telegram_returned_media_id(owner_api, monke
     monkeypatch.setattr(module, "Bot", lambda token: bot)
     data = photo_data() if kind == "photo" else video_data()
     touched, failed = asyncio.run(owner_api[1].original({
+        "shop_id": 1,
         "text": "Caption", "recipients": [{"user_id": 4, "telegram_user_id": 1004},
                                           {"user_id": 5, "telegram_user_id": 1005}],
         "media": {"kind": kind, "filename": "attachment", "bytes": data},

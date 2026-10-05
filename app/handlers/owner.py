@@ -10,6 +10,7 @@ from aiogram.types import (
 from app.db import (
     is_owner,
     get_admin_shop_and_role,
+    get_shop,
     get_shop_detailed_stats,
     get_shop_admins,
     add_shop_admin,
@@ -379,6 +380,13 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
     touched_user_ids = []
 
     for row in recipients:
+        current_shop = get_shop(admin_shop["id"])
+        if not current_shop or not current_shop["is_active"]:
+            if not sent:
+                await state.clear()
+                await callback.message.answer("❌ Кав’ярню закрито. Розсилка недоступна.")
+                return
+            break
         try:
             await callback.bot.copy_message(
                 chat_id=row["telegram_user_id"],

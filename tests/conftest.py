@@ -90,6 +90,7 @@ def safe_db(local_connection):
         "can_send_broadcast", "log_broadcast_touches",
         "get_shop_marketing_efficiency", "get_admin_shop_and_role",
         "delete_user_account",
+        "get_all_shops", "get_user_shops", "get_active_shop_for_user",
     }, module.__dict__)
     previous = sys.modules.get("app.db")
     previous_notifications = sys.modules.get("app.loyalty_notifications")
@@ -120,7 +121,7 @@ CREATE TABLE users (
     personal_qr_token TEXT UNIQUE NOT NULL,
     selected_card_design TEXT DEFAULT 'basic'
 );
-CREATE TABLE coffee_shops (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE coffee_shops (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, is_active BOOLEAN NOT NULL DEFAULT TRUE);
 CREATE TABLE shop_admins (
     id BIGSERIAL PRIMARY KEY,
     shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,

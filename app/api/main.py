@@ -300,9 +300,10 @@ def require_owner_for_path(
                 cur.execute("""
                     SELECT sa.shop_id
                     FROM shop_admins sa
-                    WHERE sa.user_id = %s AND sa.role = 'owner'
-                    ORDER BY sa.id
-                    FOR SHARE
+                    JOIN coffee_shops cs ON cs.id = sa.shop_id
+                    WHERE sa.user_id = %s AND sa.role = 'owner' AND cs.is_active
+                    ORDER BY cs.id, sa.id
+                    FOR SHARE OF cs, sa
                 """, (actor["user_id"],))
                 memberships = cur.fetchall()
                 if not memberships:
@@ -631,8 +632,9 @@ def get_owner_shop_id(owner_telegram_id: int):
                 SELECT sa.shop_id
                 FROM shop_admins sa
                 JOIN users u ON u.id = sa.user_id
+                JOIN coffee_shops cs ON cs.id = sa.shop_id
                 WHERE u.telegram_user_id = %s
-                  AND sa.role = 'owner'
+                  AND sa.role = 'owner' AND cs.is_active
                 ORDER BY sa.shop_id
                 LIMIT 1
                 """,
@@ -728,7 +730,7 @@ def user_shops(telegram_user_id: int):
                     ON sa.shop_id = cs.id AND sa.role = 'owner'
                 LEFT JOIN users owner
                     ON owner.id = sa.user_id
-                WHERE client.telegram_user_id = %s
+                WHERE client.telegram_user_id = %s AND cs.is_active
                 ORDER BY sc.last_activity_at DESC NULLS LAST, cs.name
                 """,
                 (telegram_user_id,)
@@ -796,7 +798,7 @@ def account_shops(user_id: int):
                     ON sa.shop_id = cs.id AND sa.role = 'owner'
                 LEFT JOIN users owner
                     ON owner.id = sa.user_id
-                WHERE client.id = %s
+                WHERE client.id = %s AND cs.is_active
                 ORDER BY sc.last_activity_at DESC NULLS LAST, cs.name
                 """,
                 (user_id,)
@@ -909,6 +911,7 @@ def all_shops():
                     ON sa.shop_id = cs.id AND sa.role = 'owner'
                 LEFT JOIN users owner
                     ON owner.id = sa.user_id
+                WHERE cs.is_active
                 ORDER BY cs.name
                 """
             )
@@ -2349,6 +2352,8 @@ def unregister_my_push_token(
 
 @app.get("/owner/shop/{owner_telegram_id}")
 def owner_get_shop(owner_telegram_id: int):
+    if get_owner_shop_id(owner_telegram_id) is None:
+        raise HTTPException(403, detail="Кав’ярню закрито або доступ відсутній")
     return get_shop_profile(owner_telegram_id)
 @app.post("/owner/shop/{owner_telegram_id}/submit-changes")
 def owner_submit_shop_changes(
@@ -2468,6 +2473,8 @@ async def owner_update_shop(
     owner_telegram_id: int,
     data: UpdateShopRequest
 ):
+    if get_owner_shop_id(owner_telegram_id) is None:
+        raise HTTPException(403, detail="Кав’ярню закрито або доступ відсутній")
     # До сохранения запоминаем текущие карточки "Новинки".
     # Сравниваем не количество карточек, а их содержимое.
     # Поэтому сценарий:

@@ -15,19 +15,21 @@ from app.db import get_connection
 
 
 def account_deletion_state(user_id: int, connection) -> dict:
-    """Eligibility is advisory; deletion repeats it with membership locks."""
-    blockers = connection.execute("""
-        SELECT cs.id,cs.name,
-               EXISTS(SELECT 1 FROM shop_admins other
-                   WHERE other.shop_id=cs.id AND other.user_id<>%s
-                     AND other.role='admin') AS has_other_admin
+    """Report every shop the global account deletion would close.
+
+    A session's selected shop does not restrict account deletion: the personal
+    account and its memberships are shared by both apps and all coffee shops.
+    Deletion repeats this advisory query while all affected memberships lock.
+    """
+    closing = connection.execute("""
+        SELECT cs.id,cs.name
         FROM shop_admins own JOIN coffee_shops cs ON cs.id=own.shop_id
-        WHERE own.user_id=%s AND own.role='owner'
+        WHERE own.user_id=%s AND own.role='owner' AND cs.is_active IS TRUE
           AND NOT EXISTS(SELECT 1 FROM shop_admins other
               WHERE other.shop_id=own.shop_id AND other.user_id<>%s
                 AND other.role='owner')
         ORDER BY cs.id
-    """, (user_id, user_id, user_id)).fetchall()
+    """, (user_id, user_id)).fetchall()
     apple = connection.execute(
         "SELECT 1 FROM user_identities WHERE user_id=%s AND provider='apple'",
         (user_id,),
@@ -35,15 +37,15 @@ def account_deletion_state(user_id: int, connection) -> dict:
     # Current Apple auth retains only id_token, not a revocable access/refresh
     # token or authorization code. TN3194 explicitly permits deletion followed
     # by instructions for manual revocation; never claim Apple was revoked.
-    return {"ok": True, "can_delete": not blockers,
-            "blocking_shops": [dict(row) for row in blockers],
+    return {"ok": True, "can_delete": True,
+            "blocking_shops": [], "closing_shops": [dict(row) for row in closing],
             "apple_revocation": "manual_required" if apple else "not_applicable"}
 
 
 def _lock_account(user_id: int, connection):
     # Follow staff's membership-before-session lock order. Lock every affected
     # shop/member, not merely the session's selected coffee shop: two co-owners
-    # deleting simultaneously must not leave a shop without an owner.
+    # deleting simultaneously must close the shop when the final owner leaves.
     shops = connection.execute(
         "SELECT shop_id FROM shop_admins WHERE user_id=%s ORDER BY shop_id",
         (user_id,),
@@ -79,6 +81,60 @@ def _exists(connection, table):
     return connection.execute("SELECT to_regclass(%s) AS name", (table,)).fetchone()["name"] is not None
 
 
+def _close_owned_shops(shop_ids: list[int], connection):
+    """Close shops without deleting client profiles, balances or their history.
+
+    Memberships/sessions are access records only. Deleting them cannot cascade
+    to users or shop_clients; those foreign keys point in the opposite direction.
+    The coffee_shops row remains, preserving every business-history shop FK.
+    The caller already holds the shop and all membership locks.
+    """
+    if not shop_ids:
+        return
+    staff = connection.execute("""
+        SELECT sa.id,sa.user_id,u.telegram_user_id
+        FROM shop_admins sa JOIN users u ON u.id=sa.user_id
+        WHERE sa.shop_id=ANY(%s)
+    """, (shop_ids,)).fetchall()
+    membership_ids = [row["id"] for row in staff]
+    connection.execute("UPDATE coffee_shops SET is_active=FALSE WHERE id=ANY(%s)", (shop_ids,))
+    if membership_ids:
+        # Explicit revoke precedes the selected_membership FK cascade. Sessions
+        # selected to other shops and ordinary client sessions remain untouched.
+        connection.execute("""
+            UPDATE app_sessions SET revoked_at=statement_timestamp()
+            WHERE purpose='barista' AND selected_membership_id=ANY(%s)
+              AND revoked_at IS NULL
+        """, (membership_ids,))
+    if _exists(connection, "barista_admin_invites"):
+        connection.execute("""
+            UPDATE barista_admin_invites
+            SET revoked_at=statement_timestamp(),closed_at=statement_timestamp()
+            WHERE shop_id=ANY(%s) AND used_at IS NULL AND revoked_at IS NULL
+        """, (shop_ids,))
+    if _exists(connection, "admin_broadcast_previews"):
+        connection.execute("""
+            UPDATE admin_broadcast_previews
+            SET invalidated_at=statement_timestamp(),media_bytes=NULL
+            WHERE shop_id=ANY(%s) AND used_at IS NULL AND invalidated_at IS NULL
+        """, (shop_ids,))
+    connection.execute("DELETE FROM shop_admins WHERE shop_id=ANY(%s)", (shop_ids,))
+    # Legacy login tickets have no shop column. Remove them only for staff with
+    # no remaining active shop access; do not break a multi-shop employee's login.
+    if _exists(connection, "admin_login_tickets"):
+        telegram_ids = [row["telegram_user_id"] for row in staff if row["telegram_user_id"] is not None]
+        if telegram_ids:
+            connection.execute("""
+                DELETE FROM admin_login_tickets ticket
+                WHERE ticket.telegram_user_id=ANY(%s)
+                  AND NOT EXISTS(
+                    SELECT 1 FROM users u JOIN shop_admins sa ON sa.user_id=u.id
+                    JOIN coffee_shops cs ON cs.id=sa.shop_id
+                    WHERE u.telegram_user_id=ticket.telegram_user_id
+                      AND cs.is_active IS TRUE AND sa.role IN ('owner','admin'))
+            """, (telegram_ids,))
+
+
 def delete_personal_account(user_id: int, *, connection=None, barista_token=None):
     """Only trusted session callers may supply user_id; no request actor fields.
 
@@ -99,11 +155,7 @@ def delete_personal_account(user_id: int, *, connection=None, barista_token=None
                     raise HTTPException(401, detail={"code": "INVALID_SESSION"})
 
             state = account_deletion_state(user_id, conn)
-            if not state["can_delete"]:
-                raise HTTPException(409, detail={
-                    "code": "LAST_OWNER_TRANSFER_REQUIRED",
-                    "shops": state["blocking_shops"],
-                })
+            _close_owned_shops([shop["id"] for shop in state["closing_shops"]], conn)
 
             # Preserve shop aggregates/audit amounts without the former profile
             # or credentials. Personal balances are NOT copied to this row.
