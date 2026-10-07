@@ -77,6 +77,7 @@ from app.wallet_pass import (
 from app.wallet_push import send_wallet_pushes
 from app.app_push import send_app_pushes
 from app.api.barista import build_barista_router
+from app.api.sales import build_sales_router
 from app.telegram_link import confirm_telegram_link_session
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = "/data/uploads"
@@ -356,6 +357,12 @@ def require_superadmin(
         )
 
     return current_user
+
+app.include_router(build_sales_router(
+    verify_actor=get_verified_telegram_actor,
+    superadmin_telegram_ids=SUPERADMIN_TELEGRAM_IDS,
+    connection_factory=get_connection,
+))
 
 def _create_login_response_session(user_id: int) -> dict:
     return {
