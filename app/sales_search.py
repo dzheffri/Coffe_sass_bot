@@ -68,6 +68,9 @@ class GooglePlacesProvider:
         "places.id",
         "places.displayName",
         "places.formattedAddress",
+        "places.addressComponents",
+        "places.primaryType",
+        "places.types",
         "places.rating",
         "places.userRatingCount",
         "places.websiteUri",
@@ -101,6 +104,22 @@ class GooglePlacesProvider:
 
     @staticmethod
     def _place(place: Mapping[str, Any]) -> dict[str, Any] | None:
+        # regionCode is a regional hint, not a country restriction. Fail closed
+        # unless Google's structured response confirms both country and type.
+        components = place.get("addressComponents")
+        in_ukraine = isinstance(components, list) and any(
+            isinstance(component, Mapping)
+            and isinstance(component.get("types"), list)
+            and "country" in component["types"]
+            and component.get("shortText") == "UA"
+            for component in components
+        )
+        types = place.get("types")
+        coffee_shop = place.get("primaryType") == "coffee_shop" or (
+            isinstance(types, list) and "coffee_shop" in types
+        )
+        if not in_ukraine or not coffee_shop:
+            return None
         place_id = _text(place.get("id"))
         display_name = place.get("displayName")
         if isinstance(display_name, Mapping):
@@ -127,13 +146,19 @@ class GooglePlacesProvider:
                 "SALES_SEARCH_PROVIDER_NOT_CONFIGURED", 503,
                 "Пошук Google Places не налаштовано на сервері.",
             )
-        terms = [query.name, query.category, query.city]
-        text_query = ", ".join(term for term in terms if term)
+        city = " ".join(query.city.split())
+        if city.casefold() == "самар":
+            city = "Самар, Дніпропетровська область"
+        text_query = f"{city} Україна кав'ярня"
+        if query.name:
+            text_query += f" {query.name}"
         payload: dict[str, Any] = {
             "textQuery": text_query,
-            "includedType": "cafe",
+            "includedType": "coffee_shop",
+            "strictTypeFiltering": True,
             "pageSize": query.limit,
             "languageCode": "uk",
+            "regionCode": "UA",
         }
         try:
             response = self._request(

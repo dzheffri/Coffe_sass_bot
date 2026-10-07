@@ -68,6 +68,7 @@ def worker(source, schema, audit_root):
         routes = {path: set(operations) for path, operations in main.app.openapi()["paths"].items()
                   if path.startswith("/sales")}
         assert routes == {
+            "/sales/search": {"get"},
             "/sales/me": {"get"}, "/sales/leads": {"get", "post"},
             "/sales/leads/{lead_id}": {"get", "patch"},
             "/sales/leads/{lead_id}/events": {"post"},

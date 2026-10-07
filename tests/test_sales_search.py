@@ -5,6 +5,8 @@ the router receives a deterministic provider and the Google adapter receives a
 fake response.
 """
 
+import pytest
+
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -84,6 +86,9 @@ def test_google_provider_maps_places_without_network_or_exposing_key():
                 "id": "ChIJgoogle",
                 "displayName": {"text": "Google Coffee"},
                 "formattedAddress": "Kyiv, 1 Main St",
+                "addressComponents": [{"shortText": "UA", "types": ["country"]}],
+                "primaryType": "coffee_shop",
+                "types": ["coffee_shop", "food"],
                 "rating": 4.7,
                 "userRatingCount": 88,
                 "websiteUri": "https://google.example",
@@ -102,9 +107,84 @@ def test_google_provider_maps_places_without_network_or_exposing_key():
     assert calls[0][0].endswith("places:searchText")
     assert calls[0][1]["X-Goog-Api-Key"] == "local-test-key"
     assert calls[0][2] == {
-        "textQuery": "cafe, Київ", "includedType": "cafe", "pageSize": 20,
-        "languageCode": "uk",
+        "textQuery": "Київ Україна кав'ярня", "includedType": "coffee_shop", "pageSize": 20,
+        "strictTypeFiltering": True, "languageCode": "uk", "regionCode": "UA",
     }
+    assert {"places.addressComponents", "places.primaryType", "places.types"} <= set(calls[0][1]["X-Goog-FieldMask"].split(","))
+
+
+def _google_place(country="UA", primary_type="coffee_shop", types=None, **overrides):
+    return {
+        "id": "ChIJtest", "displayName": {"text": "Test Coffee"},
+        "addressComponents": [{"shortText": country, "types": ["country"]}],
+        "primaryType": primary_type,
+        "types": [primary_type] if types is None else types,
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize("place,allowed", [
+    (_google_place(), True),
+    (_google_place(primary_type="cafe", types=["cafe", "coffee_shop"]), True),
+    (_google_place(country="RU"), False),
+    (_google_place(country="PL"), False),
+    (_google_place(primary_type="restaurant"), False),
+    (_google_place(primary_type="bar"), False),
+    (_google_place(primary_type="bakery"), False),
+    (_google_place(primary_type="cafe"), False),
+    (_google_place(addressComponents=[]), False),
+    (_google_place(addressComponents=[{"shortText": "UA", "types": ["locality"]}]), False),
+    (_google_place(addressComponents=None), False),
+    (_google_place(primary_type=None, types="coffee_shop"), False),
+])
+def test_google_results_require_structured_ukraine_and_coffee_shop(place, allowed):
+    assert (GooglePlacesProvider._place(place) is not None) is allowed
+
+
+def test_samar_search_qualifies_ukrainian_city_and_drops_russian_samara():
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"places": [
+                _google_place(id="ua-samar", formattedAddress="Самар, Дніпропетровська область, Україна"),
+                _google_place(country="RU", id="ru-samara", formattedAddress="Самара, Россия"),
+                _google_place(country="PL", id="pl-coffee"),
+                _google_place(primary_type="restaurant", id="ua-restaurant"),
+            ]}
+
+    def request(url, headers, payload):
+        calls.append(payload)
+        return Response()
+
+    provider = GooglePlacesProvider("fake-test-key", request=request)
+    results = provider.search(SalesSearchQuery("Самар", 10, "restaurant", None, 20))
+    assert [place["place_id"] for place in results] == ["ua-samar"]
+    assert calls[0]["textQuery"] == "Самар, Дніпропетровська область Україна кав'ярня"
+    assert calls[0]["includedType"] == "coffee_shop"
+    assert calls[0]["strictTypeFiltering"] is True
+
+
+def test_name_search_cannot_override_fixed_country_and_type():
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"places": []}
+
+    def request(url, headers, payload):
+        calls.append(payload)
+        return Response()
+
+    provider = GooglePlacesProvider("fake-test-key", request=request)
+    assert provider.search(SalesSearchQuery("Дніпро", 10, "bar", "Homie", 1)) == []
+    assert calls[0]["textQuery"] == "Дніпро Україна кав'ярня Homie"
+    assert calls[0]["regionCode"] == "UA"
+    assert calls[0]["includedType"] == "coffee_shop"
 
 
 def test_google_provider_without_key_fails_closed():
