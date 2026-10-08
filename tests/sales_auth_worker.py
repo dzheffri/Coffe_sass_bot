@@ -69,6 +69,7 @@ def worker(source, schema, audit_root):
                   if path.startswith("/sales")}
         assert routes == {
             "/sales/search": {"get"},
+            "/sales/search/usage": {"get"},
             "/sales/me": {"get"}, "/sales/leads": {"get", "post"},
             "/sales/leads/{lead_id}": {"get", "patch"},
             "/sales/leads/{lead_id}/events": {"post"},

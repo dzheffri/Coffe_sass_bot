@@ -8,10 +8,12 @@ from psycopg.errors import UndefinedTable
 from app.sales_auth import build_sales_superadmin_guard
 from app.sales_db import SalesError, SalesRepository
 from app.sales_search import (
+    SalesSearchPage,
     SalesSearchProviderError,
     SalesSearchQuery,
     build_sales_search_provider,
 )
+from app.sales_search_usage import PostgresSalesSearchUsage, SalesSearchUsageError
 from app.sales_models import (
     FollowupBucket,
     SalesEventCreate,
@@ -59,6 +61,14 @@ def build_sales_router(
             # Migrations are applied explicitly, never during API startup.
             raise HTTPException(503, detail={"code": "SALES_SCHEMA_NOT_READY"}) from exc
 
+    @router.get("/search/usage")
+    def search_usage(request: Request, actor=Depends(authenticated_actor)):
+        _check_query(request, set())
+        try:
+            return PostgresSalesSearchUsage(connection_factory).snapshot()
+        except SalesSearchUsageError as exc:
+            raise HTTPException(exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc
+
     @router.get("/search")
     def search_places(
         request: Request,
@@ -67,26 +77,34 @@ def build_sales_router(
         category: str = Query(default="cafe", min_length=1, max_length=80),
         name: str | None = Query(default=None, max_length=160),
         limit: int = Query(default=20, ge=1, le=20),
+        page_token: str | None = Query(default=None, min_length=1, max_length=4096),
         actor=Depends(authenticated_actor),
     ):
-        _check_query(request, {"city", "radius_km", "category", "name", "limit"})
+        _check_query(request, {"city", "radius_km", "category", "name", "limit", "page_token"})
         query = SalesSearchQuery(
             city=" ".join(city.split()),
             radius_km=radius_km,
             category=" ".join(category.split()),
             name=" ".join(name.split()) if name and name.strip() else None,
             limit=limit,
+            page_token=page_token,
         )
         provider = search_provider() if callable(search_provider) and not hasattr(search_provider, "search") else search_provider
         if provider is None:
-            provider = build_sales_search_provider()
+            provider = build_sales_search_provider(connection_factory)
         try:
-            items = provider.search(query)
+            page = provider.search_page(query) if hasattr(provider, "search_page") else SalesSearchPage(provider.search(query))
+        except SalesSearchUsageError as exc:
+            detail = {"code": exc.code, "message": exc.message, "usage": exc.usage}
+            headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+            raise HTTPException(exc.status_code, detail=detail, headers=headers) from exc
         except SalesSearchProviderError as exc:
-            raise HTTPException(exc.status_code, detail={"code": exc.code, "message": exc.message}) from exc
+            raise HTTPException(exc.status_code, detail={"code": exc.code, "message": exc.message, "usage": exc.usage}) from exc
         return {
-            "items": items,
-            "total": len(items),
+            "items": page.items,
+            "total": len(page.items),
+            "next_page_token": page.next_page_token,
+            "usage": page.usage,
             "limit": query.limit,
             "provider": getattr(provider, "name", "unknown"),
             "query": {

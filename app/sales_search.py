@@ -8,18 +8,25 @@ small deterministic mock provider below without making network requests.
 from __future__ import annotations
 
 import os
+import hashlib
+import hmac
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 
+from app.sales_search_usage import PostgresSalesSearchUsage
+
 
 class SalesSearchProviderError(Exception):
-    def __init__(self, code: str, status_code: int, message: str):
+    def __init__(self, code: str, status_code: int, message: str, usage=None):
         self.code = code
         self.status_code = status_code
         self.message = message
+        self.usage = usage
         super().__init__(message)
 
 
@@ -30,6 +37,14 @@ class SalesSearchQuery:
     category: str
     name: str | None
     limit: int
+    page_token: str | None = None
+
+
+@dataclass(frozen=True)
+class SalesSearchPage:
+    items: list[dict[str, Any]]
+    next_page_token: str | None = None
+    usage: dict[str, Any] | None = None
 
 
 class SalesSearchProvider(Protocol):
@@ -44,12 +59,6 @@ def _text(value: Any) -> str | None:
         return None
     value = " ".join(value.split())
     return value or None
-
-
-def _number(value: Any, *, integer: bool = False) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return int(value) if integer else float(value)
 
 
 class GooglePlacesProvider:
@@ -71,11 +80,9 @@ class GooglePlacesProvider:
         "places.addressComponents",
         "places.primaryType",
         "places.types",
-        "places.rating",
-        "places.userRatingCount",
         "places.websiteUri",
         "places.nationalPhoneNumber",
-        "places.googleMapsUri",
+        "nextPageToken",
     ))
 
     def __init__(
@@ -83,9 +90,11 @@ class GooglePlacesProvider:
         api_key: str,
         *,
         request: Callable[[str, Mapping[str, str], Mapping[str, Any]], Any] | None = None,
+        usage: Any = None,
     ):
         self.api_key = api_key.strip()
         self._request = request or self._request_http
+        self.usage = usage or PostgresSalesSearchUsage(None)
 
     def _request_http(self, url: str, headers: Mapping[str, str], payload: Mapping[str, Any]):
         try:
@@ -128,24 +137,54 @@ class GooglePlacesProvider:
             name = None
         if not place_id or not name:
             return None
+        instagram = _text(place.get("websiteUri"))
+        try:
+            parsed = urlsplit(instagram or "")
+            host = (parsed.hostname or "").lower()
+            if parsed.username or parsed.password or parsed.port or parsed.scheme not in {"http", "https"} or not (
+                host in {"instagram.com", "www.instagram.com"}
+            ):
+                instagram = None
+        except ValueError:
+            instagram = None
         return {
             "place_id": place_id,
             "name": name,
             "address": _text(place.get("formattedAddress")),
-            "rating": _number(place.get("rating")),
-            "reviews_count": _number(place.get("userRatingCount"), integer=True),
-            "website": _text(place.get("websiteUri")),
+            "instagram": instagram,
             "phone": _text(place.get("nationalPhoneNumber")),
-            "google_maps_url": _text(place.get("googleMapsUri")),
             "source": "google_places",
         }
 
     def search(self, query: SalesSearchQuery) -> list[dict[str, Any]]:
+        return self.search_page(query).items
+
+    def _page_context(self, query: SalesSearchQuery):
+        fingerprint = hashlib.sha256(json.dumps([
+            query.city, query.radius_km, query.category, query.name, query.limit,
+        ], ensure_ascii=False).encode()).hexdigest()
+        if not query.page_token:
+            return fingerprint, {"seen": [], "count": 0}
+        try:
+            data, signature = query.page_token.rsplit(".", 1)
+            expected = hmac.new(self.api_key.encode(), data.encode(), hashlib.sha256).hexdigest()
+            state = json.loads(data)
+            if not hmac.compare_digest(signature, expected) or state["query"] != fingerprint:
+                raise ValueError
+            if not 0 < state["count"] < 60 or not isinstance(state["seen"], list):
+                raise ValueError
+            return fingerprint, state
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise SalesSearchProviderError("INVALID_SEARCH_PAGE_TOKEN", 422,
+                                           "Почніть новий пошук кавʼярень.") from exc
+
+    def search_page(self, query: SalesSearchQuery) -> SalesSearchPage:
         if not self.api_key:
             raise SalesSearchProviderError(
                 "SALES_SEARCH_PROVIDER_NOT_CONFIGURED", 503,
                 "Пошук Google Places не налаштовано на сервері.",
             )
+        fingerprint, state = self._page_context(query)
         city = " ".join(query.city.split())
         if city.casefold() == "самар":
             city = "Самар, Дніпропетровська область"
@@ -160,6 +199,11 @@ class GooglePlacesProvider:
             "languageCode": "uk",
             "regionCode": "UA",
         }
+        if query.page_token:
+            payload["pageToken"] = state["token"]
+        # Each actual attempt (including a caller retry) reserves one request.
+        # No transport retries or Google calls can bypass the shared PG guard.
+        usage = self.usage.reserve()
         try:
             response = self._request(
                 self.endpoint,
@@ -170,41 +214,59 @@ class GooglePlacesProvider:
                 },
                 payload,
             )
-        except SalesSearchProviderError:
+        except SalesSearchProviderError as exc:
+            exc.usage = usage
             raise
         except Exception as exc:
             raise SalesSearchProviderError(
                 "SALES_SEARCH_PROVIDER_UNAVAILABLE", 503,
-                "Пошук кавʼярень тимчасово недоступний.",
+                "Пошук кавʼярень тимчасово недоступний.", usage,
             ) from exc
         if response.status_code in (401, 403):
             raise SalesSearchProviderError(
                 "SALES_SEARCH_PROVIDER_NOT_CONFIGURED", 503,
-                "Пошук Google Places не налаштовано на сервері.",
+                "Пошук Google Places не налаштовано на сервері.", usage,
             )
         if response.status_code >= 500:
             raise SalesSearchProviderError(
                 "SALES_SEARCH_PROVIDER_UNAVAILABLE", 503,
-                "Пошук кавʼярень тимчасово недоступний.",
+                "Пошук кавʼярень тимчасово недоступний.", usage,
             )
         if response.status_code >= 400:
             raise SalesSearchProviderError(
                 "SALES_SEARCH_PROVIDER_REQUEST_INVALID", 502,
-                "Не вдалося виконати пошук кавʼярень.",
+                "Не вдалося виконати пошук кавʼярень.", usage,
             )
         try:
             body = response.json()
         except (TypeError, ValueError) as exc:
             raise SalesSearchProviderError(
                 "SALES_SEARCH_PROVIDER_INVALID_RESPONSE", 502,
-                "Сервіс пошуку повернув некоректну відповідь.",
+                "Сервіс пошуку повернув некоректну відповідь.", usage,
             ) from exc
-        places = body.get("places") if isinstance(body, Mapping) else None
+        if not isinstance(body, Mapping):
+            raise SalesSearchProviderError("SALES_SEARCH_PROVIDER_INVALID_RESPONSE", 502,
+                                           "Сервіс пошуку повернув некоректну відповідь.", usage)
+        places = body.get("places")
         if not isinstance(places, list):
-            return []
-        return [normalized for place in places
-                if isinstance(place, Mapping)
-                for normalized in [self._place(place)] if normalized is not None]
+            places = []
+        places = places[:min(query.limit, 60 - state["count"])]
+        seen = set(state["seen"])
+        items = []
+        for place in places:
+            normalized = self._place(place) if isinstance(place, Mapping) else None
+            if normalized and normalized["place_id"] not in seen:
+                items.append(normalized)
+                seen.add(normalized["place_id"])
+        count = state["count"] + len(places)
+        next_token = _text(body.get("nextPageToken"))
+        if next_token and places and count < 60:
+            data = json.dumps({"query": fingerprint, "seen": sorted(seen),
+                               "count": count, "token": next_token}, separators=(",", ":"))
+            next_token = data + "." + hmac.new(self.api_key.encode(), data.encode(), hashlib.sha256).hexdigest()
+        else:
+            next_token = None
+        return SalesSearchPage(items, next_token, usage)
 
 
 class MockSalesSearchProvider:
@@ -221,5 +283,8 @@ class MockSalesSearchProvider:
         return self.results[:query.limit]
 
 
-def build_sales_search_provider() -> SalesSearchProvider:
-    return GooglePlacesProvider(os.getenv("GOOGLE_PLACES_API_KEY", ""))
+def build_sales_search_provider(connection_factory=None) -> SalesSearchProvider:
+    return GooglePlacesProvider(
+        os.getenv("GOOGLE_PLACES_API_KEY", ""),
+        usage=PostgresSalesSearchUsage(connection_factory),
+    )
