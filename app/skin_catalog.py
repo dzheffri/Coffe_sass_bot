@@ -132,7 +132,7 @@ SKIN_CATALOG = [
 {
     "id": "autumn_rain_coffee",
     "title": "Осінній дощ",
-    "filename": "skin_autumn_rain.png",
+    "filename": "skin_autumn_rain_v2.png",
     "achievement": "",
     "metric": "total_cups",
     "target": 0,
@@ -142,7 +142,7 @@ SKIN_CATALOG = [
 {
     "id": "pumpkin_latte_autumn",
     "title": "Гарбузовий латте",
-    "filename": "skin_pumpkin_latte.png",
+    "filename": "skin_pumpkin_latte_v2.png",
     "achievement": "",
     "metric": "total_cups",
     "target": 0,
@@ -152,7 +152,7 @@ SKIN_CATALOG = [
 {
     "id": "autumn_cozy_coffee",
     "title": "Осінній затишок",
-    "filename": "skin_autumn_cozy.png",
+    "filename": "skin_autumn_cozy_v2.png",
     "achievement": "",
     "metric": "total_cups",
     "target": 0,
