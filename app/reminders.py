@@ -26,6 +26,12 @@ REMINDER_INACTIVE_14_30 = "inactive_14_30"
 REMINDER_FREE_COFFEE = "free_coffee"
 REMINDER_SUBSCRIPTION_LAST_DAY = "subscription_last_day"
 
+_PERMANENT_PUSH_ERRORS = {
+    (400, "BadDeviceToken"),
+    (400, "DeviceTokenNotForTopic"),
+    (410, "Unregistered"),
+}
+
 
 def kyiv_now():
     return datetime.now(KYIV_TZ)
@@ -33,12 +39,13 @@ def kyiv_now():
 
 async def _send_reminder_app_push(
     *, user_id, shop_id, reminder_type, title, body
-):
+) -> bool | None:
+    # True: delivered; None: Telegram fallback; False: defer without duplicating.
     if not user_id:
-        return
+        return None
 
     try:
-        devices = get_app_push_devices_for_user(user_id)
+        devices = get_app_push_devices_for_user(user_id) or []
         unique_devices = []
         seen_tokens = set()
         for device in devices:
@@ -48,7 +55,7 @@ async def _send_reminder_app_push(
                 unique_devices.append(device)
 
         if not unique_devices:
-            return
+            return None
 
         result = await send_app_pushes(
             devices=unique_devices,
@@ -60,16 +67,39 @@ async def _send_reminder_app_push(
                 "shop_id": shop_id,
             },
         )
+        sent = result.get("sent", 0)
+        failed = result.get("failed", 0)
+        errors = result.get("errors", [])
+        if sent > 0:
+            delivered = True
+            outcome = "sent"
+        elif (
+            failed == len(unique_devices)
+            and len(errors) == len(unique_devices)
+            and all(
+                (error.get("status"), error.get("reason")) in _PERMANENT_PUSH_ERRORS
+                for error in errors
+            )
+        ):
+            # The existing APNs sender already removes these invalid tokens.
+            delivered = None
+            outcome = "all_tokens_invalid telegram_fallback"
+        else:
+            delivered = False
+            outcome = "temporary_or_unknown_failure"
+
         print(
             f"[reminders][APP PUSH] type={reminder_type} "
             f"devices={len(unique_devices)} "
-            f"sent={result.get('sent', 0)} failed={result.get('failed', 0)}"
+            f"sent={sent} failed={failed} outcome={outcome}"
         )
+        return delivered
     except Exception as exc:
         print(
             f"[reminders][APP PUSH] type={reminder_type} "
             f"error={type(exc).__name__}"
         )
+        return False
 
 
 async def send_subscription_last_day_reminders(bot: Bot):
@@ -87,8 +117,22 @@ async def send_subscription_last_day_reminders(bot: Bot):
             f"Щоб продовжити роботу, зв’яжіться з адміністратором сервісу."
         )
 
+        push_sent = await _send_reminder_app_push(
+            user_id=user_id,
+            shop_id=shop_id,
+            reminder_type=REMINDER_SUBSCRIPTION_LAST_DAY,
+            title="⚠️ Останній день підписки",
+            body=(
+                f"{row['shop_name']} · Після завершення підписки доступ "
+                "буде заблоковано. Зв’яжіться з адміністратором для продовження."
+            ),
+        )
+
         try:
-            await bot.send_message(telegram_user_id, text)
+            if push_sent is None:
+                await bot.send_message(telegram_user_id, text)
+            elif not push_sent:
+                continue
 
             save_reminder_log(
                 shop_id,
@@ -101,17 +145,6 @@ async def send_subscription_last_day_reminders(bot: Bot):
                 f"[reminders][subscription_last_day] "
                 f"failed for owner {telegram_user_id}: {e}"
             )
-
-        await _send_reminder_app_push(
-            user_id=user_id,
-            shop_id=shop_id,
-            reminder_type=REMINDER_SUBSCRIPTION_LAST_DAY,
-            title="⚠️ Останній день підписки",
-            body=(
-                f"{row['shop_name']} · Після завершення підписки доступ "
-                "буде заблоковано. Зв’яжіться з адміністратором для продовження."
-            ),
-        )
 
 
 async def send_one_left_reminders(bot: Bot):
@@ -149,8 +182,22 @@ async def send_one_left_reminders(bot: Bot):
             f"Заходь найближчим часом і забирай свій бонус 🎁"
         )
 
+        push_sent = await _send_reminder_app_push(
+            user_id=user_id,
+            shop_id=shop_id,
+            reminder_type=REMINDER_ONE_LEFT,
+            title="☕ Ще одна кава — і подарунок!",
+            body=(
+                f"{row['shop_name']} · Зараз: {row['cups']}/7 · "
+                "Заходь і забирай свій бонус 🎁"
+            ),
+        )
+
         try:
-            await bot.send_message(telegram_user_id, text)
+            if push_sent is None:
+                await bot.send_message(telegram_user_id, text)
+            elif not push_sent:
+                continue
 
             save_reminder_log(
                 shop_id,
@@ -165,17 +212,6 @@ async def send_one_left_reminders(bot: Bot):
                 f"[reminders][one_left] "
                 f"failed for {telegram_user_id}: {e}"
             )
-
-        await _send_reminder_app_push(
-            user_id=user_id,
-            shop_id=shop_id,
-            reminder_type=REMINDER_ONE_LEFT,
-            title="☕ Ще одна кава — і подарунок!",
-            body=(
-                f"{row['shop_name']} · Зараз: {row['cups']}/7 · "
-                "Заходь і забирай свій бонус 🎁"
-            ),
-        )
 
 
 async def send_inactive_5_7_reminders(bot: Bot):
@@ -218,8 +254,23 @@ async def send_inactive_5_7_reminders(bot: Bot):
             f"Заходь на каву найближчим часом 💛"
         )
 
+        push_sent = await _send_reminder_app_push(
+            user_id=user_id,
+            shop_id=shop_id,
+            reminder_type=REMINDER_INACTIVE_5_7,
+            title="👋 Ми скучили за тобою",
+            body=(
+                f"{row['shop_name']} · Заходь на каву 💛 · "
+                f"Чашки: {row['cups']}/7 · "
+                f"Безкоштовних кав: {row['free_coffee_balance']}"
+            ),
+        )
+
         try:
-            await bot.send_message(telegram_user_id, text)
+            if push_sent is None:
+                await bot.send_message(telegram_user_id, text)
+            elif not push_sent:
+                continue
 
             save_reminder_log(
                 shop_id,
@@ -234,18 +285,6 @@ async def send_inactive_5_7_reminders(bot: Bot):
                 f"[reminders][inactive_5_7] "
                 f"failed for {telegram_user_id}: {e}"
             )
-
-        await _send_reminder_app_push(
-            user_id=user_id,
-            shop_id=shop_id,
-            reminder_type=REMINDER_INACTIVE_5_7,
-            title="👋 Ми скучили за тобою",
-            body=(
-                f"{row['shop_name']} · Заходь на каву 💛 · "
-                f"Чашки: {row['cups']}/7 · "
-                f"Безкоштовних кав: {row['free_coffee_balance']}"
-            ),
-        )
 
 
 async def send_inactive_14_30_reminders(bot: Bot):
@@ -288,8 +327,23 @@ async def send_inactive_14_30_reminders(bot: Bot):
             f"Будемо раді бачити тебе знову 💛"
         )
 
+        push_sent = await _send_reminder_app_push(
+            user_id=user_id,
+            shop_id=shop_id,
+            reminder_type=REMINDER_INACTIVE_14_30,
+            title="☕ Давно не бачилися",
+            body=(
+                f"{row['shop_name']} · Будемо раді бачити тебе знову 💛 · "
+                f"Чашки: {row['cups']}/7 · "
+                f"Безкоштовних кав: {row['free_coffee_balance']}"
+            ),
+        )
+
         try:
-            await bot.send_message(telegram_user_id, text)
+            if push_sent is None:
+                await bot.send_message(telegram_user_id, text)
+            elif not push_sent:
+                continue
 
             save_reminder_log(
                 shop_id,
@@ -304,18 +358,6 @@ async def send_inactive_14_30_reminders(bot: Bot):
                 f"[reminders][inactive_14_30] "
                 f"failed for {telegram_user_id}: {e}"
             )
-
-        await _send_reminder_app_push(
-            user_id=user_id,
-            shop_id=shop_id,
-            reminder_type=REMINDER_INACTIVE_14_30,
-            title="☕ Давно не бачилися",
-            body=(
-                f"{row['shop_name']} · Будемо раді бачити тебе знову 💛 · "
-                f"Чашки: {row['cups']}/7 · "
-                f"Безкоштовних кав: {row['free_coffee_balance']}"
-            ),
-        )
 
 
 async def send_free_coffee_reminders(bot: Bot):
@@ -354,8 +396,23 @@ async def send_free_coffee_reminders(bot: Bot):
             f"Заходь та забирай свій бонус ☕"
         )
 
+        push_sent = await _send_reminder_app_push(
+            user_id=user_id,
+            shop_id=shop_id,
+            reminder_type=REMINDER_FREE_COFFEE,
+            title="🎁 У тебе є безкоштовна кава!",
+            body=(
+                f"{row['shop_name']} · "
+                f"Безкоштовних кав: {row['free_coffee_balance']} · "
+                f"Поточні чашки: {row['cups']}/7"
+            ),
+        )
+
         try:
-            await bot.send_message(telegram_user_id, text)
+            if push_sent is None:
+                await bot.send_message(telegram_user_id, text)
+            elif not push_sent:
+                continue
 
             save_reminder_log(
                 shop_id,
@@ -370,18 +427,6 @@ async def send_free_coffee_reminders(bot: Bot):
                 f"[reminders][free_coffee] "
                 f"failed for {telegram_user_id}: {e}"
             )
-
-        await _send_reminder_app_push(
-            user_id=user_id,
-            shop_id=shop_id,
-            reminder_type=REMINDER_FREE_COFFEE,
-            title="🎁 У тебе є безкоштовна кава!",
-            body=(
-                f"{row['shop_name']} · "
-                f"Безкоштовних кав: {row['free_coffee_balance']} · "
-                f"Поточні чашки: {row['cups']}/7"
-            ),
-        )
 
 
 async def run_reminders_once(bot: Bot):
