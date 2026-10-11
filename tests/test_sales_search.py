@@ -46,7 +46,40 @@ RESULTS = [{
 }]
 
 
-def _client(provider):
+class FakeLookupConnection:
+    """Small in-memory connection for the read-only place-id lookup."""
+
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.execute_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def cursor(self):
+        return self
+
+    def execute(self, statement, parameters):
+        self.execute_calls.append((statement, parameters))
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class FakeLookupFactory:
+    def __init__(self, rows=()):
+        self.connection = FakeLookupConnection(rows)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.connection
+
+
+def _client(provider, *, connection_factory=None, missing_factory=False):
     def verify_actor(authorization, init_data):
         if authorization == "Bearer sales-superadmin":
             return {"user_id": 1, "telegram_id": 9001}
@@ -56,6 +89,7 @@ def _client(provider):
     app.include_router(build_sales_router(
         verify_actor=verify_actor,
         superadmin_telegram_ids={9001},
+        connection_factory=None if missing_factory else (connection_factory or FakeLookupFactory()),
         search_provider=provider,
     ))
     return TestClient(app)
@@ -71,8 +105,78 @@ def test_mock_provider_search_is_authenticated_and_normalized():
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["provider"] == "mock"
-    assert body["items"] == RESULTS
+    assert body["items"] == [{**RESULTS[0], "is_lead": False, "lead_id": None}]
     assert provider.queries == [SalesSearchQuery("Київ", 12, "cafe", "Local", 1)]
+
+
+def test_existing_and_new_places_are_annotated_with_one_batched_lookup():
+    existing = {**RESULTS[0], "place_id": "ChIJexisting"}
+    new = {**RESULTS[0], "place_id": "ChIJnew", "name": "New Coffee"}
+    provider = MockSalesSearchProvider([existing, new])
+    factory = FakeLookupFactory([{"place_id": "ChIJexisting", "id": 17}])
+
+    with _client(provider, connection_factory=factory) as client:
+        response = client.get(
+            "/sales/search?city=Kyiv&limit=2",
+            headers={"Authorization": "Bearer sales-superadmin"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["items"] == [
+        {**existing, "is_lead": True, "lead_id": 17},
+        {**new, "is_lead": False, "lead_id": None},
+    ]
+    assert factory.calls == 1
+    assert len(factory.connection.execute_calls) == 1
+    statement, parameters = factory.connection.execute_calls[0]
+    assert "SELECT id,place_id FROM sales_leads" in statement
+    assert parameters == (["ChIJexisting", "ChIJnew"],)
+
+
+def test_empty_search_skips_lead_lookup_entirely():
+    provider = MockSalesSearchProvider([])
+    factory = FakeLookupFactory()
+
+    with _client(provider, connection_factory=factory) as client:
+        response = client.get(
+            "/sales/search?city=Kyiv",
+            headers={"Authorization": "Bearer sales-superadmin"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["items"] == []
+    assert factory.calls == 0
+    assert factory.connection.execute_calls == []
+
+
+def test_search_does_not_mutate_provider_results_or_make_extra_google_calls():
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"places": [_google_place(id="ChIJgoogle-route")]}
+
+    def fake_request(url, headers, payload):
+        calls.append((url, headers, payload))
+        return FakeResponse()
+
+    provider = GooglePlacesProvider("local-test-key", request=fake_request, usage=FakeUsage())
+    factory = FakeLookupFactory()
+    before = (provider.api_key, provider.endpoint, provider.field_mask)
+    with _client(provider, connection_factory=factory) as client:
+        response = client.get(
+            "/sales/search?city=Kyiv",
+            headers={"Authorization": "Bearer sales-superadmin"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert len(calls) == 1
+    assert factory.calls == 1
+    assert len(factory.connection.execute_calls) == 1
+    assert (provider.api_key, provider.endpoint, provider.field_mask) == before
 
 
 def test_search_requires_superadmin_and_rejects_unknown_query_fields():
@@ -330,6 +434,6 @@ def test_google_failure_and_retry_each_reserve_once_and_unavailable_guard_never_
 
 
 def test_usage_endpoint_requires_same_superadmin_guard_without_touching_google():
-    with _client(MockSalesSearchProvider()) as client:
+    with _client(MockSalesSearchProvider(), missing_factory=True) as client:
         assert client.get('/sales/search/usage').status_code == 401
         assert client.get('/sales/search/usage', headers={'Authorization': 'Bearer sales-superadmin'}).status_code == 503

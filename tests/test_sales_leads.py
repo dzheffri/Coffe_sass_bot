@@ -258,8 +258,13 @@ def test_signed_miniapp_can_create_lead_with_backend_actor(sales_api):
 
 
 def test_same_place_id_conflicts_while_null_place_ids_are_independent(sales_api):
+    from app.sales_db import SalesRepository
+
     client, db, *_ = sales_api
     first = create(client, place_id="local-place-unique")["lead"]
+    assert SalesRepository(db.connect).find_leads_by_place_ids(
+        ["local-place-unique", "new-place", "local-place-unique"]
+    ) == {"local-place-unique": first["id"]}
     duplicate = client.post("/sales/leads", headers=AUTH,
                             json={"name": "Conflicting place", "place_id": "local-place-unique"})
     assert duplicate.status_code == 409, duplicate.text
