@@ -33,6 +33,7 @@ MIGRATIONS = (
     "20260930_barista_sessions_validate.sql",
     "20261004_admin_invites.sql",
     "20261004_admin_broadcast.sql",
+    "20261013_broadcast_recipients.sql",
 )
 
 
@@ -147,6 +148,7 @@ def full_backend_audit(local_connection):
     "real_barista_qr_operations_readonly_atomic_and_delivery_isolated",
     "real_admin_invites_verified_existing_identity_and_atomic_session",
     "real_native_owner_tools_shop_scope_role_and_broadcast_isolation",
+    "consumer_broadcast_inbox_real_auth_wiring",
     "owner_analytics_complete_real_route_inventory",
     "real_owner_analytics_overview_authentication_and_shop_isolation",
     "real_owner_analytics_activity_authentication_and_shop_isolation",

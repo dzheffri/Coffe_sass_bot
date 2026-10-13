@@ -16,7 +16,7 @@ from test_barista_operations import operations_database, seed_balance
 
 
 @pytest.fixture
-def owner_database(operations_database):
+def owner_database(operations_database, tmp_path, monkeypatch):
     database = operations_database
     database.query("""
         CREATE TABLE broadcasts (
@@ -37,6 +37,11 @@ def owner_database(operations_database):
             VALUES(1,4,NOW()),(2,5,NOW()),(1,6,NOW()-INTERVAL '61 days');
     """)
     database.query((Path(__file__).parents[1] / "migrations/20261004_admin_broadcast.sql").read_text())
+    database.query((Path(__file__).parents[1] / "migrations/20261013_broadcast_recipients.sql").read_text())
+    from app import broadcast_publication
+    from app.broadcast_media_storage import BroadcastMediaStorage
+    database.broadcast_storage = BroadcastMediaStorage(tmp_path / "broadcast_media")
+    monkeypatch.setattr(broadcast_publication, "BroadcastMediaStorage", lambda: database.broadcast_storage)
     return database
 
 

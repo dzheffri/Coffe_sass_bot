@@ -18,6 +18,7 @@ from app.admin_tools import (claim_broadcast, cleanup_broadcast_previews, list_m
                              selected_shop, shop_response)
 from app.db import get_connection, log_broadcast_touches
 from app.broadcast_media import JSON_LIMIT, bounded_body, multipart_media, validate_text_length
+from app.broadcast_publication import BroadcastPublication
 
 logger = logging.getLogger(__name__)
 
@@ -206,12 +207,13 @@ def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
             raise HTTPException(503, detail={"code": "BROADCAST_NOT_CONFIGURED"}) from exc
 
     def prepare_send(token, confirmation_token):
-        with get_connection() as connection:
-            with connection.transaction():
-                session = authorize(token, connection=connection)
-                shop = require_owner(session)
-                broadcast = claim_broadcast(session, shop, confirmation_token, connection)
-                return shop, broadcast
+        with BroadcastPublication() as publication:
+            with get_connection() as connection:
+                with connection.transaction():
+                    session = authorize(token, connection=connection)
+                    shop = require_owner(session)
+                    broadcast = claim_broadcast(session, shop, confirmation_token, connection, publication)
+            return shop, broadcast
 
     def save_delivery(shop_id, broadcast_id, touched):
         with get_connection() as connection:

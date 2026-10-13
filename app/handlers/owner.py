@@ -1,5 +1,9 @@
+import logging
+import uuid
+
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -17,17 +21,21 @@ from app.db import (
     remove_shop_admin,
     get_subscription,
     can_send_broadcast,
-    get_broadcast_recipients,
-    save_broadcast,
-    log_broadcast_touches,
     create_admin_login_ticket,
 )
+from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
+
+from app.broadcast_publication import publish_bot_broadcast, record_broadcast_delivery
 from app.states import OwnerStates
 from app.keyboards import admin_main_keyboard
 from app.config import SCANNER_URL, SUPER_ADMIN_IDS, ADMIN_PANEL_URL
+from app.telegram_broadcast_media import download_telegram_broadcast_media
 
 
 router = Router()
+logger = logging.getLogger(__name__)
+_broadcast_isolation = SimpleEventIsolation()
 
 # Якщо хочеш для якоїсь конкретної кав'ярні прибрати ліміт розсилок,
 # вкажи її ID. Якщо не потрібно — залиш як є.
@@ -43,15 +51,31 @@ def broadcast_cancel_keyboard():
     )
 
 
-def broadcast_preview_keyboard():
+def broadcast_preview_keyboard(token: str):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Підтвердити", callback_data="broadcast_confirm"),
-                InlineKeyboardButton(text="❌ Скасувати", callback_data="broadcast_cancel"),
+                InlineKeyboardButton(text="✅ Підтвердити", callback_data=f"broadcast_confirm:{token}"),
+                InlineKeyboardButton(text="❌ Скасувати", callback_data=f"broadcast_cancel:{token}"),
             ]
         ]
     )
+
+
+def _broadcast_media_reference(message):
+    if message.photo:
+        return {"kind": "photo", "file_id": message.photo[-1].file_id, "filename": "photo.jpg"}
+    if message.video:
+        return {"kind": "video", "file_id": message.video.file_id,
+                "filename": getattr(message.video, "file_name", None) or "video.mp4"}
+    # GIFs/documents still use original-message delivery, without a persisted attachment.
+    return None
+
+
+def _broadcast_callback_token(callback, action):
+    data = getattr(callback, "data", None)
+    prefix = action + ":"
+    return data[len(prefix):] if isinstance(data, str) and data.startswith(prefix) else None
 
 
 def owner_main_keyboard_for_user(user_id: int):
@@ -241,22 +265,22 @@ async def subscription_handler(message: types.Message):
 
 @router.message(F.text == "📣 Зробити розсилку")
 async def broadcast_start_handler(message: types.Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
+    async with _broadcast_isolation.lock(key=state.key):
+        if not is_owner(message.from_user.id):
+            return
+        admin_shop = get_admin_shop_and_role(message.from_user.id)
+        if admin_shop and (admin_shop["id"] == MY_SHOP_ID or can_send_broadcast(admin_shop["id"])):
+            await state.clear()
+            await state.set_state(OwnerStates.waiting_broadcast_text)
+            error = None
+        elif admin_shop:
+            error = "❌ Ліміт розсилок вичерпано.\nДозволено максимум 8 промо-розсилки за 7 днів на кав’ярню."
+        else:
+            error = "❌ Не вдалося визначити кав’ярню."
+    if error:
+        await message.answer(error)
         return
 
-    admin_shop = get_admin_shop_and_role(message.from_user.id)
-    if not admin_shop:
-        await message.answer("❌ Не вдалося визначити кав’ярню.")
-        return
-
-    if admin_shop["id"] != MY_SHOP_ID and not can_send_broadcast(admin_shop["id"]):
-        await message.answer(
-            "❌ Ліміт розсилок вичерпано.\n"
-            "Дозволено максимум 8 промо-розсилки за 7 днів на кав’ярню."
-        )
-        return
-
-    await state.set_state(OwnerStates.waiting_broadcast_text)
     await message.answer(
         "Надішли текст, фото, відео, GIF або документ для розсилки.\n\n"
         "Можна:\n"
@@ -272,7 +296,10 @@ async def broadcast_start_handler(message: types.Message, state: FSMContext):
 
 @router.message(OwnerStates.waiting_broadcast_text, F.text == "❌ Скасувати розсилку")
 async def broadcast_cancel_handler(message: types.Message, state: FSMContext):
-    await state.clear()
+    async with _broadcast_isolation.lock(key=state.key):
+        if await state.get_state() != OwnerStates.waiting_broadcast_text.state:
+            return
+        await state.clear()
     await message.answer(
         "✅ Розсилку скасовано.",
         reply_markup=owner_main_keyboard_for_user(message.from_user.id)
@@ -281,47 +308,56 @@ async def broadcast_cancel_handler(message: types.Message, state: FSMContext):
 
 @router.message(OwnerStates.waiting_broadcast_text)
 async def broadcast_preview_handler(message: types.Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await state.clear()
-        await message.answer(
-            "❌ Доступ заборонено.",
-            reply_markup=owner_main_keyboard_for_user(message.from_user.id)
-        )
+    async with _broadcast_isolation.lock(key=state.key):
+        # The router's raw_state was loaded before acquiring this local lock.
+        if await state.get_state() != OwnerStates.waiting_broadcast_text.state:
+            return
+        if not is_owner(message.from_user.id):
+            await state.clear()
+            error = "❌ Доступ заборонено."
+        else:
+            admin_shop = get_admin_shop_and_role(message.from_user.id)
+            error = None if admin_shop else "❌ Не вдалося визначити кав’ярню."
+            if not admin_shop:
+                await state.clear()
+        if error is None:
+            if not (message.text or message.photo or message.video or message.animation or message.document):
+                error = "❌ Надішли текст, фото, відео, GIF або документ."
+            else:
+                token = uuid.uuid4().hex
+                await state.update_data(
+                    broadcast_text=(message.text or message.caption or "").strip(),
+                    broadcast_from_chat_id=message.chat.id,
+                    broadcast_message_id=message.message_id,
+                    broadcast_shop_id=admin_shop["id"],
+                    broadcast_preview_token=token,
+                    broadcast_media_reference=_broadcast_media_reference(message),
+                )
+    if error:
+        await message.answer(error)
         return
-
-    admin_shop = get_admin_shop_and_role(message.from_user.id)
-    if not admin_shop:
-        await state.clear()
-        await message.answer(
-            "❌ Не вдалося визначити кав’ярню.",
-            reply_markup=owner_main_keyboard_for_user(message.from_user.id)
-        )
-        return
-
-    text = (message.text or message.caption or "").strip()
-
-    if not (message.text or message.photo or message.video or message.animation or message.document):
-        await message.answer("❌ Надішли текст, фото, відео, GIF або документ.")
-        return
-
-    await state.update_data(
-        broadcast_text=text,
-        broadcast_from_chat_id=message.chat.id,
-        broadcast_message_id=message.message_id,
-    )
-
     await message.bot.copy_message(
         chat_id=message.chat.id,
         from_chat_id=message.chat.id,
         message_id=message.message_id,
-        reply_markup=broadcast_preview_keyboard(),
+        reply_markup=broadcast_preview_keyboard(token),
     )
 
 
-@router.callback_query(F.data == "broadcast_cancel")
+@router.callback_query(F.data.startswith("broadcast_cancel:"))
 async def broadcast_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-
+    token = _broadcast_callback_token(callback, "broadcast_cancel")
+    if not token:
+        return
+    async with _broadcast_isolation.lock(key=state.key):
+        data = await state.get_data()
+        current = (await state.get_state() == OwnerStates.waiting_broadcast_text.state
+                   and data.get("broadcast_preview_token") == token)
+        if current:
+            await state.clear()
+    if not current:
+        await callback.answer("Цей передперегляд уже неактуальний.")
+        return
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -334,85 +370,95 @@ async def broadcast_cancel_callback(callback: types.CallbackQuery, state: FSMCon
     await callback.answer()
 
 
-@router.callback_query(F.data == "broadcast_confirm")
+@router.callback_query(F.data.startswith("broadcast_confirm:"))
 async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMContext):
-    if not is_owner(callback.from_user.id):
-        await state.clear()
-        await callback.answer("❌ Доступ заборонено.", show_alert=True)
+    token = _broadcast_callback_token(callback, "broadcast_confirm")
+    if not token:
+        return
+    async with _broadcast_isolation.lock(key=state.key):
+        data = await state.get_data()
+        if (await state.get_state() != OwnerStates.waiting_broadcast_text.state
+                or data.get("broadcast_preview_token") != token):
+            error = "Цей передперегляд уже неактуальний."
+        elif not is_owner(callback.from_user.id):
+            await state.clear()
+            error = "❌ Доступ заборонено."
+        else:
+            admin_shop = get_admin_shop_and_role(callback.from_user.id)
+            if not admin_shop or admin_shop["id"] != data.get("broadcast_shop_id"):
+                await state.clear()
+                error = "❌ Кав’ярня змінилася. Почни розсилку ще раз."
+            elif data.get("broadcast_from_chat_id") is None or data.get("broadcast_message_id") is None:
+                await state.clear()
+                error = "❌ Надішли повідомлення для розсилки ще раз."
+            else:
+                # Detach and consume this preview before any Telegram await. A new
+                # preview may safely be created while this publication is sending.
+                data = dict(data)
+                await state.clear()
+                error = None
+    if error:
+        await callback.answer(error, show_alert=True)
         return
 
-    data = await state.get_data()
-    text = (data.get("broadcast_text") or "").strip()
-    from_chat_id = data.get("broadcast_from_chat_id")
-    message_id = data.get("broadcast_message_id")
-
-    admin_shop = get_admin_shop_and_role(callback.from_user.id)
-    if not admin_shop:
-        await state.clear()
-        await callback.answer("❌ Не вдалося визначити кав’ярню.", show_alert=True)
+    shop_id = data["broadcast_shop_id"]
+    try:
+        current_shop = await run_in_threadpool(get_shop, shop_id)
+    except Exception as exc:
+        logger.warning("Broadcast shop check failed (%s)", type(exc).__name__)
+        await callback.answer("❌ Не вдалося перевірити кав’ярню. Почни ще раз.", show_alert=True)
         return
-
-    if from_chat_id is None or message_id is None:
-        await state.clear()
-        await callback.answer("❌ Надішли повідомлення для розсилки ще раз.", show_alert=True)
+    if not current_shop or not current_shop["is_active"]:
+        await callback.answer("❌ Кав’ярню закрито. Розсилка недоступна.", show_alert=True)
         return
-
-    recipients = get_broadcast_recipients(admin_shop["id"])
-    if not recipients:
-        await state.clear()
-
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-        await callback.message.answer(
-            "❌ Немає активних клієнтів для розсилки.",
-            reply_markup=owner_main_keyboard_for_user(callback.from_user.id)
-        )
-        await callback.answer()
-        return
-
     await callback.answer("⏳ Запускаю розсилку...")
+    try:
+        attachment = await download_telegram_broadcast_media(callback.bot, data.get("broadcast_media_reference"))
+    except Exception as exc:
+        logger.warning("Broadcast media download failed (%s)", type(exc).__name__)
+        attachment = None
+    try:
+        publication = await run_in_threadpool(
+            publish_bot_broadcast, shop_id, callback.from_user.id,
+            data.get("broadcast_text") or "", attachment, quota_exempt=shop_id == MY_SHOP_ID,
+        )
+    except HTTPException as exc:
+        code = exc.detail.get("code") if isinstance(exc.detail, dict) else None
+        message = ("❌ Ліміт розсилок вичерпано." if exc.status_code == 429
+                   else "❌ Немає активних клієнтів для розсилки." if code in {"NO_RECIPIENTS", "EMPTY_AUDIENCE"}
+                   else "❌ Не вдалося опублікувати розсилку. Почни ще раз.")
+        await callback.message.answer(message)
+        return
+    except Exception as exc:
+        logger.warning("Broadcast publication failed (%s)", type(exc).__name__)
+        await callback.message.answer("❌ Не вдалося опублікувати розсилку. Почни ще раз.")
+        return
 
     sent = 0
     failed = 0
     touched_user_ids = []
-
-    for row in recipients:
-        current_shop = get_shop(admin_shop["id"])
-        if not current_shop or not current_shop["is_active"]:
-            if not sent:
-                await state.clear()
-                await callback.message.answer("❌ Кав’ярню закрито. Розсилка недоступна.")
-                return
-            break
+    telegram_recipients = [row for row in publication["recipients"] if row.get("telegram_user_id") is not None]
+    for index, row in enumerate(telegram_recipients):
         try:
+            current_shop = await run_in_threadpool(get_shop, shop_id)
+            if not current_shop or not current_shop["is_active"]:
+                failed += len(telegram_recipients) - index
+                break
             await callback.bot.copy_message(
                 chat_id=row["telegram_user_id"],
-                from_chat_id=from_chat_id,
-                message_id=message_id,
+                from_chat_id=data["broadcast_from_chat_id"],
+                message_id=data["broadcast_message_id"],
             )
-
             sent += 1
             touched_user_ids.append(row["user_id"])
-
-        except Exception as e:
-            print(f"[broadcast] failed for {row['telegram_user_id']}: {e}")
+        except Exception as exc:
+            logger.warning("Broadcast delivery failed (%s)", type(exc).__name__)
             failed += 1
 
-    save_broadcast(
-        admin_shop["id"],
-        callback.from_user.id,
-        text if text else "[media only]",
-        sent
-    )
-
-    if touched_user_ids:
-        log_broadcast_touches(admin_shop["id"], touched_user_ids)
-
-    await state.clear()
-
+    try:
+        await run_in_threadpool(record_broadcast_delivery, shop_id, publication["broadcast_id"], touched_user_ids)
+    except Exception as exc:
+        logger.warning("Broadcast delivery recording failed (%s)", type(exc).__name__)
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:

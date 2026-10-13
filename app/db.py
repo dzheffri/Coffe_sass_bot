@@ -1302,6 +1302,31 @@ def merge_users(source_user_id: int, target_user_id: int):
                 source_user_id,
             ))
 
+            # Preserve inbox membership before deleting source. The schema is
+            # rolled out separately, so pre-migration merges must still work.
+            cur.execute("SELECT to_regclass('broadcast_recipients') AS recipients_table")
+            if cur.fetchone()["recipients_table"] is not None:
+                cur.execute("""
+                    UPDATE broadcast_recipients target
+                    SET read_at = LEAST(target.read_at, source.read_at),
+                        delivery_status = COALESCE(target.delivery_status, source.delivery_status),
+                        created_at = LEAST(target.created_at, source.created_at)
+                    FROM broadcast_recipients source
+                    WHERE source.user_id = %s AND target.user_id = %s
+                      AND source.broadcast_id = target.broadcast_id
+                """, (source_user_id, target_user_id))
+                cur.execute("""
+                    DELETE FROM broadcast_recipients source
+                    USING broadcast_recipients target
+                    WHERE source.user_id = %s AND target.user_id = %s
+                      AND source.broadcast_id = target.broadcast_id
+                """, (source_user_id, target_user_id))
+                cur.execute("""
+                    UPDATE broadcast_recipients
+                    SET user_id = %s
+                    WHERE user_id = %s
+                """, (target_user_id, source_user_id))
+
             # -------------------------------------------------
             # 9. shop_admins
             #

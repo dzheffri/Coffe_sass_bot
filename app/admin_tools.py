@@ -187,7 +187,7 @@ def make_broadcast_preview(session, shop, text, connection, media=None):
         UPDATE admin_broadcast_previews SET invalidated_at=clock_timestamp(),media_bytes=NULL
         WHERE session_id=%s AND used_at IS NULL AND invalidated_at IS NULL
     """, (session["session_id"],))
-    recipients = reachable_recipients(shop["shop_id"], connection)
+    recipients = get_broadcast_recipients(shop["shop_id"], connection=connection)
     token = secrets.token_urlsafe(32)
     row = connection.execute("""
         INSERT INTO admin_broadcast_previews
@@ -204,7 +204,7 @@ def make_broadcast_preview(session, shop, text, connection, media=None):
             "media": {key: media[key] for key in ("kind","filename","size_bytes","mime_type")} if media else None}
 
 
-def claim_broadcast(session, shop, token, connection):
+def claim_broadcast(session, shop, token, connection, publication):
     # Same shop-before-preview order as preview creation/replacement.
     _lock_active_shop(shop["shop_id"], connection)
     preview = connection.execute("""
@@ -223,7 +223,7 @@ def claim_broadcast(session, shop, token, connection):
     valid = connection.execute("SELECT %s > clock_timestamp() AS valid", (preview["expires_at"],)).fetchone()["valid"]
     if not valid:
         raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
-    recipients = reachable_recipients(shop["shop_id"], connection)
+    recipients = get_broadcast_recipients(shop["shop_id"], connection=connection)
     if recipient_hash(recipients) != preview["recipients_hash"]:
         raise HTTPException(409, detail={"code": "PREVIEW_STALE"})
     if not recipients:
@@ -237,10 +237,8 @@ def claim_broadcast(session, shop, token, connection):
         raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
     # Reserve/audit before sending. A process crash cannot replay this token;
     # retry requires a fresh explicit preview rather than duplicating messages.
-    broadcast = connection.execute("""
-        INSERT INTO broadcasts(shop_id,sender_user_id,text,recipients_count)
-        VALUES(%s,%s,%s,0) RETURNING id
-    """, (shop["shop_id"], session["user_id"], preview["text"] or "[media only]")).fetchone()
+    broadcast = publication.publish(connection, shop["shop_id"], session["user_id"],
+                                    preview["text"], recipients, media)
     # A quota query or audit INSERT can itself wait on a database lock. Check
     # the real clock one last time at the claim, after every blocking step.
     claimed = connection.execute("""
@@ -250,7 +248,8 @@ def claim_broadcast(session, shop, token, connection):
     if claimed is None:
         raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
     return {"broadcast_id": broadcast["id"], "shop_id": shop["shop_id"],
-            "text": preview["text"], "recipients": recipients,
+            "text": preview["text"],
+            "recipients": [row for row in recipients if row["telegram_user_id"] is not None],
             "media": media}
 
 

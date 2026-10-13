@@ -363,6 +363,7 @@ def _security_scenarios(main, db, client, query, auth, state, report):
 
     _real_barista_operations(db, client, query, auth, report)
     _real_native_admin_tools(db, client, query, auth, jwt, report)
+    _real_consumer_broadcast_inbox(main, db, client, query, auth, report)
     _real_bot_regressions(main, db, client, query, auth, jwt, report)
 
 
@@ -588,7 +589,8 @@ def _real_native_admin_tools(db, client, query, auth, jwt, report):
     assert client.post("/barista/owner/broadcast/preview", headers=auth(admin), json={"text": "local"}).status_code == 403
     preview = client.post("/barista/owner/broadcast/preview", headers=auth(owner), json={"text": "Offline only"})
     assert preview.status_code == 200, preview.text
-    assert preview.json()["recipients_count"] == 1
+    # Inbox audience includes the app-only customer; Telegram delivery stays one.
+    assert preview.json()["recipients_count"] == 2
     confirmation = preview.json()["confirmation_token"]
     assert client.post("/barista/owner/broadcast", headers=auth(other_owner),
                        json={"confirmation_token": confirmation}).status_code == 403
@@ -603,9 +605,53 @@ def _real_native_admin_tools(db, client, query, auth, jwt, report):
         assert client.post("/barista/owner/broadcast", headers=auth(owner),
                            json={"confirmation_token": confirmation}).status_code == 409
         delivery.assert_awaited_once()
+    assert query("""SELECT user_id,read_at,delivery_status FROM broadcast_recipients
+        ORDER BY user_id""") == [
+        {"user_id": user_id, "read_at": None, "delivery_status": None}
+        for user_id in (1, 32650)]
     assert query("SELECT * FROM app_sessions WHERE purpose='client' ORDER BY id") == client_before
     os.environ["BARISTA_LOGIN_ENABLED"] = "false"
     report["real_native_owner_tools_shop_scope_role_and_broadcast_isolation"] = True
+
+
+def _real_consumer_broadcast_inbox(main, db, client, query, auth, report):
+    """Actual main/router/dependency wiring on the guarded local worker only."""
+    paths = main.app.openapi()["paths"]
+    assert {
+        "/me/broadcasts", "/me/shops/{shop_id}/broadcasts",
+        "/me/shops/{shop_id}/broadcasts/{broadcast_id}",
+        "/me/shops/{shop_id}/broadcasts/{broadcast_id}/read",
+        "/me/shops/{shop_id}/broadcasts/{broadcast_id}/media",
+    }.issubset(paths)
+    assert client.get("/me/broadcasts").status_code == 401
+    consumer = db.create_app_session(1)
+    other = db.create_app_session(4)
+    app_only = db.create_app_session(32650)
+    membership = query("SELECT id FROM shop_admins WHERE shop_id=1 AND user_id=1")[0]["id"]
+    staff = db.create_app_session(1, purpose="barista", selected_membership_id=membership)
+    assert client.get("/me/broadcasts", headers=auth(staff)).status_code == 401
+    result = client.get("/me/broadcasts", headers=auth(consumer))
+    assert result.status_code == 200, result.text
+    inbox = result.json()
+    assert inbox["total"] == 1 and inbox["unread_count"] == 1
+    assert client.get("/me/broadcasts", headers=auth(app_only)).json()["total"] == 1
+    broadcast_id = inbox["items"][0]["broadcast_id"]
+    path = f"/me/shops/1/broadcasts/{broadcast_id}"
+    detail = client.get(path, headers=auth(consumer))
+    assert detail.status_code == 200 and detail.json()["text"] == "Offline only"
+    assert detail.json()["media_endpoint"] is None and "media_key" not in detail.json()
+    for suffix, method in (("", "get"), ("/read", "post"), ("/media", "get")):
+        assert getattr(client, method)(path + suffix, headers=auth(other)).status_code == 404
+        wrong_shop = f"/me/shops/2/broadcasts/{broadcast_id}" + suffix
+        assert getattr(client, method)(wrong_shop, headers=auth(consumer)).status_code == 404
+    first = client.post(path + "/read", headers=auth(consumer))
+    second = client.post(path + "/read", headers=auth(consumer))
+    assert first.status_code == 200 and first.json()["read_at"] == second.json()["read_at"]
+    assert client.get("/me/broadcasts", headers=auth(consumer)).json()["unread_count"] == 0
+    assert client.get("/me/broadcasts", headers=auth(app_only)).json()["unread_count"] == 1
+    query("INSERT INTO broadcasts(shop_id,sender_user_id,text) VALUES(1,1,'Legacy without audience')")
+    assert client.get("/me/broadcasts", headers=auth(consumer)).json()["total"] == 1
+    report["consumer_broadcast_inbox_real_auth_wiring"] = True
 
 
 def _real_bot_regressions(main, db, client, query, auth, jwt, report):

@@ -78,6 +78,7 @@ from app.wallet_push import send_wallet_pushes
 from app.app_push import send_app_pushes
 from app.api.barista import build_barista_router
 from app.api.sales import build_sales_router
+from app.api.broadcasts import build_broadcast_inbox_router
 from app.telegram_link import confirm_telegram_link_session
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = "/data/uploads"
@@ -266,6 +267,12 @@ def get_current_user(
         )
 
     return session
+
+
+app.include_router(build_broadcast_inbox_router(
+    authenticate=get_current_user,
+    connection_factory=get_connection,
+))
 
 
 def get_verified_telegram_actor(authorization: str | None, init_data: str | None):

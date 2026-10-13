@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aiogram.fsm.storage.base import StorageKey
+
+
+PREVIEW_TOKEN = "1234567890ab4def81234567890abcde"
+
 
 class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
@@ -34,18 +39,20 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
             side_effect=AssertionError("No database connection is allowed"),
         ).start()
         patch.object(self.owner, "owner_main_keyboard_for_user", return_value=None).start()
+        patch.object(self.owner, "_broadcast_isolation", self.owner.SimpleEventIsolation()).start()
         self.owner_allowed = patch.object(self.owner, "is_owner", return_value=True).start()
         self.shop = patch.object(
             self.owner, "get_admin_shop_and_role",
             return_value={"id": 73, "name": "Offline shop", "role": "owner"},
         ).start()
-        self.recipients = patch.object(
-            self.owner, "get_broadcast_recipients",
-            return_value=[{"telegram_user_id": 201, "user_id": 11}],
+        self.publication = patch.object(
+            self.owner, "publish_bot_broadcast",
+            return_value={"broadcast_id": 101, "shop_id": 73, "text": "Original caption",
+                          "recipients": [{"telegram_user_id": 201, "user_id": 11}]},
         ).start()
         self.active_shop = patch.object(self.owner, "get_shop", return_value={"id": 73, "is_active": True}).start()
-        self.save = patch.object(self.owner, "save_broadcast").start()
-        self.touches = patch.object(self.owner, "log_broadcast_touches").start()
+        self.record = patch.object(self.owner, "record_broadcast_delivery").start()
+        self.download = patch.object(self.owner, "download_telegram_broadcast_media", new=AsyncMock(return_value=None)).start()
         self.all_users = patch.object(
             self.super_admin, "get_all_users", return_value=[]
         ).start()
@@ -67,13 +74,37 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         return message
 
     def state(self, data=None):
-        return SimpleNamespace(
-            clear=AsyncMock(), set_state=AsyncMock(), update_data=AsyncMock(),
-            get_data=AsyncMock(return_value=data or {}),
-        )
+        values = {"broadcast_preview_token": PREVIEW_TOKEN, "broadcast_shop_id": 73,
+                  "broadcast_media_reference": None, **(data or {})}
+        current = self.owner.OwnerStates.waiting_broadcast_text.state
+
+        async def clear():
+            nonlocal current
+            current = None
+            values.clear()
+
+        async def set_state(value):
+            nonlocal current
+            current = getattr(value, "state", value)
+
+        async def update_data(**updates):
+            values.update(updates)
+            return dict(values)
+
+        async def get_state():
+            return current
+
+        async def get_data():
+            return dict(values)
+
+        return SimpleNamespace(key=StorageKey(bot_id=9001, chat_id=777, user_id=9002),
+                               clear=AsyncMock(side_effect=clear), set_state=AsyncMock(side_effect=set_state),
+                               update_data=AsyncMock(side_effect=update_data),
+                               get_state=AsyncMock(side_effect=get_state), get_data=AsyncMock(side_effect=get_data))
 
     def callback(self):
         return SimpleNamespace(
+            data=f"broadcast_confirm:{PREVIEW_TOKEN}",
             from_user=SimpleNamespace(id=9002), answer=AsyncMock(),
             message=self.message(), bot=SimpleNamespace(copy_message=AsyncMock()),
         )
@@ -105,7 +136,7 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
                      dict(chat_id=202, from_chat_id=777, message_id=44)],
                 )
                 message.bot.send_message.assert_not_awaited()
-        self.recipients.assert_not_called()
+        self.publication.assert_not_called()
 
     async def test_owner_preview_preserves_media_and_caption_without_overrides(self):
         for kind in ("text", "photo", "video", "animation", "document"):
@@ -113,18 +144,28 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(kind=kind, caption=caption):
                     message, state = self.message(kind, caption=caption), self.state()
                     await self.owner.broadcast_preview_handler(message, state)
+                    payload = state.update_data.await_args.kwargs
+                    reference = ({"kind": "photo", "file_id": "photo-id", "filename": "photo.jpg"}
+                                 if kind == "photo" else {"kind": "video", "file_id": "video-id", "filename": "video.mp4"}
+                                 if kind == "video" else None)
                     state.update_data.assert_awaited_once_with(
                         broadcast_text="Original text" if kind == "text" else caption or "",
                         broadcast_from_chat_id=777, broadcast_message_id=44,
+                        broadcast_shop_id=73, broadcast_preview_token=payload["broadcast_preview_token"],
+                        broadcast_media_reference=reference,
                     )
+                    self.assertEqual(len(payload["broadcast_preview_token"]), 32)
                     copied = message.bot.copy_message.await_args.kwargs
                     self.assertEqual(copied["chat_id"], 777)
                     self.assertEqual(copied["from_chat_id"], 777)
                     self.assertEqual(copied["message_id"], 44)
                     self.assertIn("reply_markup", copied)
+                    buttons = copied["reply_markup"].inline_keyboard[0]
+                    self.assertEqual(buttons[0].callback_data, "broadcast_confirm:" + payload["broadcast_preview_token"])
+                    self.assertEqual(buttons[1].callback_data, "broadcast_cancel:" + payload["broadcast_preview_token"])
                     self.assertNotIn("text", copied)
                     self.assertNotIn("caption", copied)
-        self.recipients.assert_not_called()
+        self.publication.assert_not_called()
         self.all_users.assert_not_called()
 
     async def test_owner_confirmation_uses_only_server_shop_and_saved_original(self):
@@ -135,23 +176,21 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         })
         await self.owner.broadcast_confirm_callback(callback, state)
         self.shop.assert_called_once_with(9002)
-        self.recipients.assert_called_once_with(73)
+        self.publication.assert_called_once_with(73, 9002, "Original caption", None, quota_exempt=False)
         self.all_users.assert_not_called()
         callback.bot.copy_message.assert_awaited_once_with(
             chat_id=201, from_chat_id=888, message_id=55,
         )
-        self.save.assert_called_once_with(73, 9002, "Original caption", 1)
-        self.touches.assert_called_once_with(73, [11])
+        self.record.assert_called_once_with(73, 101, [11])
         state.clear.assert_awaited_once()
 
     async def test_owner_confirmation_without_original_ids_cannot_send(self):
         callback, state = self.callback(), self.state({"broadcast_text": "Old state"})
         await self.owner.broadcast_confirm_callback(callback, state)
-        self.recipients.assert_not_called()
+        self.publication.assert_not_called()
         self.all_users.assert_not_called()
         callback.bot.copy_message.assert_not_awaited()
-        self.save.assert_not_called()
-        self.touches.assert_not_called()
+        self.record.assert_not_called()
 
     async def test_owner_confirmation_cannot_send_to_closed_shop(self):
         self.active_shop.return_value = {"id": 73, "is_active": False}
@@ -159,8 +198,8 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         state = self.state({"broadcast_from_chat_id": 888, "broadcast_message_id": 55})
         await self.owner.broadcast_confirm_callback(callback, state)
         callback.bot.copy_message.assert_not_awaited()
-        self.save.assert_not_called()
-        self.touches.assert_not_called()
+        self.publication.assert_not_called()
+        self.record.assert_not_called()
         self.all_users.assert_not_called()
         state.clear.assert_awaited_once()
 
@@ -170,7 +209,7 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         state = self.state({"broadcast_from_chat_id": 888, "broadcast_message_id": 55})
         await self.owner.broadcast_confirm_callback(callback, state)
         self.shop.assert_not_called()
-        self.recipients.assert_not_called()
+        self.publication.assert_not_called()
         self.all_users.assert_not_called()
         callback.bot.copy_message.assert_not_awaited()
         state.clear.assert_awaited_once()
