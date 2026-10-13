@@ -129,6 +129,36 @@ SKIN_CATALOG = [
         "card_color": "#302822",
         "foreground_color": "#FFFFFF",
     },
+{
+    "id": "autumn_rain_coffee",
+    "title": "Осінній дощ",
+    "filename": "skin_autumn_rain_v2.png",
+    "achievement": "",
+    "metric": "total_cups",
+    "target": 0,
+    "card_color": "#6B3F2A",
+    "foreground_color": "#FFF7ED",
+},
+{
+    "id": "pumpkin_latte_autumn",
+    "title": "Гарбузовий латте",
+    "filename": "skin_pumpkin_latte_v2.png",
+    "achievement": "",
+    "metric": "total_cups",
+    "target": 0,
+    "card_color": "#C86422",
+    "foreground_color": "#FFF8EE",
+},
+{
+    "id": "autumn_cozy_coffee",
+    "title": "Осінній затишок",
+    "filename": "skin_autumn_cozy_v2.png",
+    "achievement": "",
+    "metric": "total_cups",
+    "target": 0,
+    "card_color": "#8A4B2A",
+    "foreground_color": "#FFF6EB",
+},   
 ]
 
 
