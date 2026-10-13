@@ -258,8 +258,13 @@ def test_signed_miniapp_can_create_lead_with_backend_actor(sales_api):
 
 
 def test_same_place_id_conflicts_while_null_place_ids_are_independent(sales_api):
+    from app.sales_db import SalesRepository
+
     client, db, *_ = sales_api
     first = create(client, place_id="local-place-unique")["lead"]
+    assert SalesRepository(db.connect).find_leads_by_place_ids(
+        ["local-place-unique", "new-place", "local-place-unique"]
+    ) == {"local-place-unique": {"id": first["id"], "status": "NEW", "connected_shop_id": None}}
     duplicate = client.post("/sales/leads", headers=AUTH,
                             json={"name": "Conflicting place", "place_id": "local-place-unique"})
     assert duplicate.status_code == 409, duplicate.text
@@ -267,6 +272,38 @@ def test_same_place_id_conflicts_while_null_place_ids_are_independent(sales_api)
     create(client, place_id=None)
     create(client, place_id=None)
     assert db.query("SELECT COUNT(*) AS n FROM sales_leads")[0]["n"] == 3
+
+
+def test_search_metadata_tracks_persisted_status_updates(sales_api, monkeypatch):
+    from app.sales_search import MockSalesSearchProvider
+
+    client, *_ = sales_api
+    place_id = "local-search-status"
+    provider = MockSalesSearchProvider([{"place_id": place_id, "name": "Persisted Coffee", "source": "mock"}])
+    monkeypatch.setattr("app.api.sales.build_sales_search_provider", lambda _: provider)
+    lead_id = create(client, place_id=place_id)["lead"]["id"]
+
+    def assert_search_status(expected):
+        response = client.get("/sales/search?city=Kyiv", headers=AUTH)
+        assert response.status_code == 200, response.text
+        item = response.json()["items"][0]
+        assert item["is_lead"] is True
+        assert item["lead_id"] == lead_id
+        assert item["lead_status"] == expected
+        assert item["lead_connected_shop_id"] is None
+
+    assert_search_status("NEW")
+    for status in ("INTERESTED", "DO_NOT_CONTACT"):
+        response = client.patch(f"/sales/leads/{lead_id}", headers=AUTH, json={"status": status})
+        assert response.status_code == 200, response.text
+        assert response.json()["lead"]["status"] == status
+        assert_search_status(status)
+
+    blocked = client.patch(f"/sales/leads/{lead_id}", headers=AUTH, json={"status": "CONTACTED"})
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "CONTACT_FORBIDDEN"
+    assert_search_status("DO_NOT_CONTACT")
+    assert len(provider.queries) == 4
 
 
 @pytest.mark.parametrize("field,first_value,second_value", [

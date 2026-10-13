@@ -100,8 +100,16 @@ def build_sales_router(
             raise HTTPException(exc.status_code, detail=detail, headers=headers) from exc
         except SalesSearchProviderError as exc:
             raise HTTPException(exc.status_code, detail={"code": exc.code, "message": exc.message, "usage": exc.usage}) from exc
+        leads = database_call("find_leads_by_place_ids", [item.get("place_id") for item in page.items]) if page.items else {}
+        items = []
+        for item in page.items:
+            lead = leads.get(item.get("place_id"))
+            items.append({**item, "is_lead": lead is not None,
+                          "lead_id": lead["id"] if lead is not None else None,
+                          "lead_status": lead["status"] if lead is not None else None,
+                          "lead_connected_shop_id": lead["connected_shop_id"] if lead is not None else None})
         return {
-            "items": page.items,
+            "items": items,
             "total": len(page.items),
             "next_page_token": page.next_page_token,
             "usage": page.usage,

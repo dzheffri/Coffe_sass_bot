@@ -212,6 +212,17 @@ class SalesRepository:
             extra.update({"lead_id": row["id"], "lead_name": row["name"]})
         return SalesError("DUPLICATE_PLACE_ID", 409, "Лід із таким place_id вже існує.", extra)
 
+    def find_leads_by_place_ids(self, place_ids):
+        place_ids = list(dict.fromkeys(value for value in place_ids if value))
+        if not place_ids:
+            return {}
+        with self.connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id,place_id,status,connected_shop_id FROM sales_leads WHERE place_id = ANY(%s)", (place_ids,))
+                return {row["place_id"]: {"id": row["id"], "status": row["status"],
+                                         "connected_shop_id": row["connected_shop_id"]}
+                        for row in cur.fetchall()}
+
     def list_leads(self, q=None, status=None, city=None, followup=None, limit=20, offset=0):
         self._pagination(limit, offset)
         predicates, parameters = [], []
