@@ -2406,18 +2406,19 @@ def can_send_broadcast(shop_id: int, *, connection=None):
             return bool(row and row["allowed"])
 
 
-def get_broadcast_recipients(shop_id: int, *, connection=None):
+def get_broadcast_recipients(shop_id: int, *, connection=None, all_clients: bool = False):
+    """Selected shop audience; native manual broadcasts include every client."""
     with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT u.telegram_user_id, sc.user_id
+                SELECT DISTINCT u.telegram_user_id, sc.user_id
                 FROM shop_clients sc
                 JOIN users u ON u.id = sc.user_id
                 JOIN coffee_shops cs ON cs.id = sc.shop_id AND cs.is_active
                 WHERE sc.shop_id = %s
-                  AND sc.last_activity_at >= NOW() - INTERVAL '60 days'
+                  AND (%s OR sc.last_activity_at >= NOW() - INTERVAL '60 days')
                 ORDER BY u.telegram_user_id
-            """, (shop_id,))
+            """, (shop_id, all_clients))
             return cur.fetchall()
 
 
@@ -2814,6 +2815,7 @@ def register_app_push_device(
     device_token: str,
     environment: str = "production",
     platform: str = "ios",
+    notifications_enabled: bool = True,
 ):
     """
     Регистрирует обычный APNs device token приложения.
@@ -2849,13 +2851,13 @@ def register_app_push_device(
                     notifications_enabled,
                     updated_at
                 )
-                VALUES (%s, %s, %s, %s, TRUE, NOW())
+                VALUES (%s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (device_token)
                 DO UPDATE SET
                     user_id = EXCLUDED.user_id,
                     platform = EXCLUDED.platform,
                     environment = EXCLUDED.environment,
-                    notifications_enabled = TRUE,
+                    notifications_enabled = EXCLUDED.notifications_enabled,
                     updated_at = NOW()
                 RETURNING *
             """, (
@@ -2863,6 +2865,7 @@ def register_app_push_device(
                 clean_token,
                 clean_platform,
                 clean_environment,
+                bool(notifications_enabled),
             ))
 
             return cur.fetchone()

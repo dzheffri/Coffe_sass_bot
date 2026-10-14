@@ -19,6 +19,7 @@ from app.admin_tools import (claim_broadcast, cleanup_broadcast_previews, list_m
 from app.db import get_connection, log_broadcast_touches
 from app.broadcast_media import JSON_LIMIT, bounded_body, multipart_media, validate_text_length
 from app.broadcast_publication import BroadcastPublication
+from app.broadcast_delivery import send_broadcast_app_push
 
 logger = logging.getLogger(__name__)
 
@@ -47,21 +48,33 @@ class BroadcastSendRequest(BaseModel):
 
 
 async def deliver_owner_broadcast(broadcast):
-    """Copy the pinned text/media to the verified shop recipients only."""
-    from app.config import BOT_TOKEN
-
-    bot = Bot(BOT_TOKEN)
+    """Notify the snapshot recipients via APNs, falling back to Telegram."""
+    bot = None
     touched = []
     failed = 0
     telegram_media_id = None
+    recipients = list({row["user_id"]: row for row in broadcast["recipients"]}.values())
     try:
-        for index, row in enumerate(broadcast["recipients"]):
+        for index, row in enumerate(recipients):
             try:
                 # Sending happens after claim commits. Recheck between sends
                 # so shop closure also stops the pending portion of delivery.
                 if not await run_in_threadpool(_broadcast_shop_is_active, broadcast["shop_id"]):
-                    failed += len(broadcast["recipients"]) - index
+                    failed += len(recipients) - index
                     break
+                push_sent = await send_broadcast_app_push(broadcast, row)
+                if push_sent is True:
+                    touched.append(row["user_id"])
+                    continue
+                if push_sent is False:
+                    failed += 1
+                    continue
+                if row.get("telegram_user_id") is None:
+                    # The recipient still has the message in their inbox.
+                    continue
+                if bot is None:
+                    from app.config import BOT_TOKEN
+                    bot = Bot(BOT_TOKEN)
                 media = broadcast.get("media")
                 if media is None:
                     await bot.send_message(chat_id=row["telegram_user_id"], text=broadcast["text"])
@@ -85,7 +98,8 @@ async def deliver_owner_broadcast(broadcast):
                 logger.warning("Owner broadcast delivery failed (%s)", type(exc).__name__)
                 failed += 1
     finally:
-        await bot.session.close()
+        if bot is not None:
+            await bot.session.close()
     return touched, failed
 
 

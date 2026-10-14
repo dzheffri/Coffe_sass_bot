@@ -84,10 +84,11 @@ def publish_bot_broadcast(shop_id, sender_telegram_user_id, text, media=None, *,
     with BroadcastPublication() as publication:
         with get_connection() as connection:
             with connection.transaction():
-                if connection.execute("""
-                    SELECT id FROM coffee_shops
+                shop = connection.execute("""
+                    SELECT id,name FROM coffee_shops
                     WHERE id=%s AND is_active IS TRUE FOR NO KEY UPDATE
-                """, (shop_id,)).fetchone() is None:
+                """, (shop_id,)).fetchone()
+                if shop is None:
                     raise HTTPException(403, detail={"code": "SHOP_ACCESS_DENIED"})
                 actor = connection.execute("""
                     SELECT u.id FROM users u JOIN shop_admins membership ON membership.user_id=u.id
@@ -101,7 +102,8 @@ def publish_bot_broadcast(shop_id, sender_telegram_user_id, text, media=None, *,
                 if not recipients:
                     raise HTTPException(409, detail={"code": "NO_RECIPIENTS"})
                 row = publication.publish(connection, shop_id, actor["id"], text, recipients, media)
-        return {"broadcast_id": row["id"], "shop_id": shop_id, "text": text, "recipients": recipients}
+        return {"broadcast_id": row["id"], "shop_id": shop_id, "shop_name": shop["name"],
+                "text": text, "recipients": recipients}
 
 
 def record_broadcast_delivery(shop_id, broadcast_id, touched):

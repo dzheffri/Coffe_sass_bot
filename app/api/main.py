@@ -2231,13 +2231,8 @@ def register_user_push_token(
             device_token=clean_token,
             environment=data.environment,
             platform="ios",
+            notifications_enabled=data.notifications_enabled,
         )
-
-        if not data.notifications_enabled:
-            device = set_app_push_device_enabled(
-                clean_token,
-                False,
-            )
 
     except ValueError as exc:
         raise HTTPException(

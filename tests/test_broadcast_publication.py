@@ -36,12 +36,14 @@ def snapshot(db):
         FROM broadcast_recipients ORDER BY broadcast_id,user_id""")
 
 
-def test_native_text_confirmation_saves_full_sixty_day_snapshot_without_changing_telegram(audience, owner_api):
+def test_native_text_confirmation_snapshots_all_shop_clients_without_changing_telegram(audience, owner_api):
     db = audience
     client, delivery = owner_api
     token = db.staff_token()
     body = preview(client, token, "Уся наша аудиторія").json()
-    assert body["recipients_count"] == 3
+    # Native owner broadcasts include old/inactive clients as well as users
+    # without Telegram. The selected shop still excludes user 5 from shop 2.
+    assert body["recipients_count"] == 4
     assert db.query("SELECT * FROM broadcasts") == []
     assert send(client, token, body["confirmation_token"]).status_code == 200
     row = db.query("SELECT * FROM broadcasts")[0]
@@ -49,12 +51,16 @@ def test_native_text_confirmation_saves_full_sixty_day_snapshot_without_changing
     assert row["media_type"] is None and row["media_key"] is None
     assert snapshot(db) == [
         {"broadcast_id": row["id"], "user_id": user, "read_at": None, "delivery_status": None}
-        for user in (2, 4, 7)]
-    assert {user["user_id"] for user in delivery.await_args.args[0]["recipients"]} == {4, 7}
-    assert row["recipients_count"] == 2
-    assert {row["user_id"] for row in db.query("SELECT user_id FROM touch_logs")} == {4, 7}
+        for user in (2, 4, 6, 7)]
+    # Publication delivery receives the complete inbox snapshot, including
+    # users without Telegram.  The APNs-first adapter decides per recipient
+    # whether Telegram fallback is needed after the claim.
+    assert {user["user_id"] for user in delivery.await_args.args[0]["recipients"]} == {2, 4, 6, 7}
+    assert delivery.await_args.args[0]["shop_name"] == "Наші"
+    assert row["recipients_count"] == 3
+    assert {row["user_id"] for row in db.query("SELECT user_id FROM touch_logs")} == {4, 6, 7}
     assert send(client, token, body["confirmation_token"]).status_code == 409
-    assert len(db.query("SELECT * FROM broadcasts")) == 1 and len(snapshot(db)) == 3
+    assert len(db.query("SELECT * FROM broadcasts")) == 1 and len(snapshot(db)) == 4
     assert delivery.await_count == 1
 
 
@@ -78,10 +84,11 @@ def test_native_media_persists_original_content_and_private_key(audience, owner_
     assert row["text"] == text
     assert db.broadcast_storage.get(row["media_key"])["bytes"] == data
     assert [path.name for path in db.broadcast_storage.root.iterdir()] == [row["media_key"]]
-    assert len(snapshot(db)) == 3
+    assert len(snapshot(db)) == 4
     payload = delivery.await_args.args[0]
     assert payload["media"]["bytes"] == data and payload["text"] == text
-    assert {user["user_id"] for user in payload["recipients"]} == {4, 7}
+    assert payload["shop_name"] == "Наші"
+    assert {user["user_id"] for user in payload["recipients"]} == {2, 4, 6, 7}
     stored = db.query("SELECT media_bytes,used_at FROM admin_broadcast_previews")[0]
     assert stored["media_bytes"] is None and stored["used_at"] is not None
 
@@ -99,7 +106,7 @@ def test_native_storage_failure_does_not_break_original_delivery_or_create_broke
     assert send(client, token, body["confirmation_token"]).status_code == 200
     row = db.query("SELECT * FROM broadcasts")[0]
     assert row["text"] == text and row["media_type"] is None and row["media_key"] is None
-    assert len(snapshot(db)) == 3
+    assert len(snapshot(db)) == 4
     assert delivery.await_args.args[0]["media"]["bytes"] == data
     assert delivery.await_count == 1
     assert "Broadcast media persistence failed (OSError)" in caplog.text
@@ -117,7 +124,60 @@ def test_app_only_audience_can_publish_without_telegram_devices(owner_database, 
     result = send(client, token, body["confirmation_token"])
     assert result.status_code == 200 and result.json()["sent"] == 0
     assert [row["user_id"] for row in snapshot(db)] == [2]
-    assert delivery.await_args.args[0]["recipients"] == []
+    assert delivery.await_args.args[0]["recipients"] == [{"telegram_user_id": None, "user_id": 2}]
+
+
+def test_native_snapshot_includes_null_activity_client_and_excludes_other_shop(owner_database, owner_api):
+    db = owner_database
+    db.query("ALTER TABLE shop_clients ALTER COLUMN last_activity_at DROP NOT NULL")
+    db.query("""
+        INSERT INTO users(id,telegram_user_id,personal_qr_token)
+        VALUES (8,NULL,'null-activity-client');
+        INSERT INTO shop_clients(shop_id,user_id,last_activity_at)
+        VALUES (1,8,NULL)
+    """)
+    client, delivery = owner_api
+    token = db.staff_token()
+    body = preview(client, token, "Для всіх клієнтів").json()
+
+    assert body["recipients_count"] == 3
+    assert send(client, token, body["confirmation_token"]).status_code == 200
+    payload = delivery.await_args.args[0]
+    assert {row["user_id"] for row in payload["recipients"]} == {4, 6, 8}
+    assert {row["user_id"] for row in snapshot(db)} == {4, 6, 8}
+    assert 5 not in {row["user_id"] for row in payload["recipients"]}
+
+
+def test_native_preview_becomes_stale_when_old_client_is_added(owner_database, owner_api):
+    db = owner_database
+    client, delivery = owner_api
+    token = db.staff_token()
+    body = preview(client, token).json()
+    db.query("""
+        INSERT INTO users(id,telegram_user_id,personal_qr_token)
+        VALUES (8,1008,'old-after-preview');
+        INSERT INTO shop_clients(shop_id,user_id,last_activity_at)
+        VALUES (1,8,NOW()-INTERVAL '365 days')
+    """)
+
+    response = send(client, token, body["confirmation_token"])
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "PREVIEW_STALE"
+    assert db.query("SELECT * FROM broadcasts") == []
+    assert snapshot(db) == []
+    delivery.assert_not_awaited()
+
+
+def test_native_preview_is_stable_when_only_client_activity_changes(owner_database, owner_api):
+    db = owner_database
+    client, delivery = owner_api
+    token = db.staff_token()
+    body = preview(client, token).json()
+    db.query("UPDATE shop_clients SET last_activity_at=NOW() WHERE shop_id=1 AND user_id=6")
+
+    response = send(client, token, body["confirmation_token"])
+    assert response.status_code == 200
+    assert delivery.await_count == 1
 
 
 def test_new_app_only_audience_member_invalidates_native_preview(owner_database, owner_api):
@@ -140,7 +200,7 @@ def test_native_concurrent_confirmation_creates_one_broadcast_snapshot_and_file(
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: send(client, token, body["confirmation_token"]), range(2)))
     assert sorted(response.status_code for response in results) == [200, 409]
-    assert len(db.query("SELECT * FROM broadcasts")) == 1 and len(snapshot(db)) == 3
+    assert len(db.query("SELECT * FROM broadcasts")) == 1 and len(snapshot(db)) == 4
     assert len(list(db.broadcast_storage.root.iterdir())) == 1
     assert delivery.await_count == 1
 

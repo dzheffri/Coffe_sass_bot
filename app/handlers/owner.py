@@ -27,6 +27,7 @@ from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
 from app.broadcast_publication import publish_bot_broadcast, record_broadcast_delivery
+from app.broadcast_delivery import send_broadcast_app_push
 from app.states import OwnerStates
 from app.keyboards import admin_main_keyboard
 from app.config import SCANNER_URL, SUPER_ADMIN_IDS, ADMIN_PANEL_URL
@@ -437,18 +438,25 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
     sent = 0
     failed = 0
     touched_user_ids = []
-    telegram_recipients = [row for row in publication["recipients"] if row.get("telegram_user_id") is not None]
-    for index, row in enumerate(telegram_recipients):
+    recipients = list({row["user_id"]: row for row in publication["recipients"]}.values())
+    for index, row in enumerate(recipients):
         try:
             current_shop = await run_in_threadpool(get_shop, shop_id)
             if not current_shop or not current_shop["is_active"]:
-                failed += len(telegram_recipients) - index
+                failed += len(recipients) - index
                 break
-            await callback.bot.copy_message(
-                chat_id=row["telegram_user_id"],
-                from_chat_id=data["broadcast_from_chat_id"],
-                message_id=data["broadcast_message_id"],
-            )
+            push_sent = await send_broadcast_app_push(publication, row)
+            if push_sent is False:
+                failed += 1
+                continue
+            if push_sent is None and row.get("telegram_user_id") is None:
+                continue
+            if push_sent is None:
+                await callback.bot.copy_message(
+                    chat_id=row["telegram_user_id"],
+                    from_chat_id=data["broadcast_from_chat_id"],
+                    message_id=data["broadcast_message_id"],
+                )
             sent += 1
             touched_user_ids.append(row["user_id"])
         except Exception as exc:

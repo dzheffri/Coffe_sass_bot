@@ -596,7 +596,12 @@ def _real_native_admin_tools(db, client, query, auth, jwt, report):
                        json={"confirmation_token": confirmation}).status_code == 403
 
     async def offline_delivery(broadcast):
-        assert broadcast["recipients"] == [{"telegram_user_id": 71001, "user_id": 1}]
+        # The publication snapshot contains the app-only customer too; the
+        # mocked legacy delivery reports only the Telegram recipient as sent.
+        assert broadcast["recipients"] == [
+            {"telegram_user_id": 71001, "user_id": 1},
+            {"telegram_user_id": None, "user_id": 32650},
+        ]
         return [1], 0
 
     with patch.object(barista_owner, "deliver_owner_broadcast", AsyncMock(side_effect=offline_delivery)) as delivery:

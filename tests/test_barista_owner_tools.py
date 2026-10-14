@@ -50,7 +50,12 @@ def owner_api(owner_database, api, monkeypatch):
     module = importlib.import_module("app.api.barista_owner")
 
     async def deliver(broadcast):
-        return [row["user_id"] for row in broadcast["recipients"]], 0
+        # This route fixture models the legacy Telegram-only fallback.  The
+        # payload still contains the complete inbox audience; users without a
+        # Telegram channel become touched only when the APNs adapter reports a
+        # successful native delivery (covered by direct adapter tests).
+        return [row["user_id"] for row in broadcast["recipients"]
+                if row.get("telegram_user_id") is not None], 0
 
     delivery = AsyncMock(side_effect=deliver)
     delivery.original = module.deliver_owner_broadcast
@@ -310,26 +315,32 @@ def test_role_downgrade_and_deleted_membership_apply_to_every_owner_request(owne
     delivery.assert_not_awaited()
 
 
-def test_broadcast_preview_and_send_reuse_own_shop_active_recipient_list(owner_api, owner_database):
+def test_broadcast_preview_and_send_snapshots_all_own_shop_clients(owner_api, owner_database):
     client, delivery = owner_api
     database = owner_database
     token = database.staff_token()
     response = preview(client, token)
     assert response.status_code == 200
     body = response.json()
-    assert body["recipients_count"] == 1
+    assert body["recipients_count"] == 2
     assert body["shop"]["id"] == 1
     stored = database.query("SELECT * FROM admin_broadcast_previews")[0]
     assert stored["token_hash"] != body["confirmation_token"]
     assert stored["used_at"] is None
     response = send(client, token, body["confirmation_token"])
     assert response.status_code == 200
-    assert response.json()["sent"] == 1
-    assert delivery.await_args.args[0]["recipients"] == [{"telegram_user_id":1004,"user_id":4}]
+    assert response.json()["sent"] == 2
+    assert delivery.await_args.args[0]["shop_name"] == "Наші"
+    assert delivery.await_args.args[0]["recipients"] == [
+        {"telegram_user_id":1004,"user_id":4},
+        {"telegram_user_id":1006,"user_id":6},
+    ]
     assert database.query("SELECT user_id,shop_id,type FROM touch_logs") == [
-        {"user_id":4,"shop_id":1,"type":"broadcast"}]
+        {"user_id":4,"shop_id":1,"type":"broadcast"},
+        {"user_id":6,"shop_id":1,"type":"broadcast"},
+    ]
     assert database.query("SELECT sender_user_id,shop_id,recipients_count FROM broadcasts") == [
-        {"sender_user_id":1,"shop_id":1,"recipients_count":1}]
+        {"sender_user_id":1,"shop_id":1,"recipients_count":2}]
     assert send(client, token, body["confirmation_token"]).status_code == 409
     assert delivery.await_count == 1
 
@@ -341,7 +352,9 @@ def test_other_shop_other_session_changed_audience_or_expired_preview_never_send
     body = preview(client, token).json()
     assert send(client, database.staff_token(user_id=3,membership_id=2), body["confirmation_token"]).status_code == 403
     assert send(client, database.staff_token(), body["confirmation_token"]).status_code == 403
-    database.query("UPDATE shop_clients SET last_activity_at=NOW() WHERE shop_id=1 AND user_id=6")
+    # Native snapshots use all shop clients, so changing recency does not
+    # change the hash. Adding a client must still invalidate the preview.
+    database.query("INSERT INTO shop_clients(shop_id,user_id,last_activity_at) VALUES(1,2,NOW()-INTERVAL '365 days')")
     response = send(client, token, body["confirmation_token"])
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "PREVIEW_STALE"
@@ -457,6 +470,8 @@ def test_preview_expiring_while_audit_insert_waits_cannot_send(owner_api, owner_
 def test_plain_text_delivery_uses_only_saved_recipient_ids_and_closes_bot_session(owner_api, monkeypatch):
     module = importlib.import_module("app.api.barista_owner")
     # Call the actual adapter, replacing only Telegram/config dependencies.
+    app_push = AsyncMock(return_value=None)
+    monkeypatch.setattr(module, "send_broadcast_app_push", app_push)
     bot = SimpleNamespace(send_message=AsyncMock(side_effect=[None, RuntimeError("offline failure")]),
                           session=SimpleNamespace(close=AsyncMock()))
     monkeypatch.setitem(sys.modules, "app.config", SimpleNamespace(BOT_TOKEN="offline-token"))
@@ -472,3 +487,4 @@ def test_plain_text_delivery_uses_only_saved_recipient_ids_and_closes_bot_sessio
         {"chat_id":1006,"text":"<b>Ordinary text</b>"},
     ]
     bot.session.close.assert_awaited_once()
+    assert app_push.await_count == 2

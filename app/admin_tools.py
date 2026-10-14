@@ -187,7 +187,7 @@ def make_broadcast_preview(session, shop, text, connection, media=None):
         UPDATE admin_broadcast_previews SET invalidated_at=clock_timestamp(),media_bytes=NULL
         WHERE session_id=%s AND used_at IS NULL AND invalidated_at IS NULL
     """, (session["session_id"],))
-    recipients = get_broadcast_recipients(shop["shop_id"], connection=connection)
+    recipients = get_broadcast_recipients(shop["shop_id"], connection=connection, all_clients=True)
     token = secrets.token_urlsafe(32)
     row = connection.execute("""
         INSERT INTO admin_broadcast_previews
@@ -223,7 +223,7 @@ def claim_broadcast(session, shop, token, connection, publication):
     valid = connection.execute("SELECT %s > clock_timestamp() AS valid", (preview["expires_at"],)).fetchone()["valid"]
     if not valid:
         raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
-    recipients = get_broadcast_recipients(shop["shop_id"], connection=connection)
+    recipients = get_broadcast_recipients(shop["shop_id"], connection=connection, all_clients=True)
     if recipient_hash(recipients) != preview["recipients_hash"]:
         raise HTTPException(409, detail={"code": "PREVIEW_STALE"})
     if not recipients:
@@ -247,9 +247,9 @@ def claim_broadcast(session, shop, token, connection, publication):
     """, (preview["token_hash"],)).fetchone()
     if claimed is None:
         raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
-    return {"broadcast_id": broadcast["id"], "shop_id": shop["shop_id"],
+    return {"broadcast_id": broadcast["id"], "shop_id": shop["shop_id"], "shop_name": shop["name"],
             "text": preview["text"],
-            "recipients": [row for row in recipients if row["telegram_user_id"] is not None],
+            "recipients": recipients,
             "media": media}
 
 

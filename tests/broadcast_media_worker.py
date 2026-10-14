@@ -52,6 +52,12 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         ).start()
         self.active_shop = patch.object(self.owner, "get_shop", return_value={"id": 73, "is_active": True}).start()
         self.record = patch.object(self.owner, "record_broadcast_delivery").start()
+        # APNs-first routing is exercised separately; keep this offline worker
+        # focused on Telegram media handling and avoid importing live DB/APNs
+        # configuration during the handler call.
+        self.app_push = patch.object(
+            self.owner, "send_broadcast_app_push", new=AsyncMock(return_value=None)
+        ).start()
         self.download = patch.object(self.owner, "download_telegram_broadcast_media", new=AsyncMock(return_value=None)).start()
         self.all_users = patch.object(
             self.super_admin, "get_all_users", return_value=[]

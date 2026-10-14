@@ -104,6 +104,7 @@ def test_shop_closure_wins_over_waiting_authorization(database):
 
 def test_already_claimed_broadcast_stops_pending_delivery_on_shop_closure(owner_api, owner_database, monkeypatch):
     module = importlib.import_module("app.api.barista_owner")
+    monkeypatch.setattr(module, "send_broadcast_app_push", AsyncMock(return_value=None))
 
     async def first_delivery(**kwargs):
         close_shop(owner_database)

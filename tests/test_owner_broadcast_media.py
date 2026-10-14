@@ -50,14 +50,18 @@ def test_valid_native_media_is_pinned_to_shop_preview_and_cleared_before_deliver
     assert result.status_code == 200
     body = result.json()
     assert body["media"] == {"kind":kind,"filename":name,"size_bytes":len(data),"mime_type":mime}
-    assert body["shop"]["id"] == 1 and body["recipients_count"] == 1
+    assert body["shop"]["id"] == 1 and body["recipients_count"] == 2
     stored = owner_database.query("SELECT * FROM admin_broadcast_previews")[0]
     assert bytes(stored["media_bytes"]) == data
     result = send(client,token,body["confirmation_token"])
     assert result.status_code == 200
     captured = delivery.await_args.args[0]
     assert captured["media"]["bytes"] == data and captured["media"]["kind"] == kind
-    assert captured["recipients"] == [{"user_id":4,"telegram_user_id":1004}]
+    assert captured["shop_name"] == "Наші"
+    assert captured["recipients"] == [
+        {"user_id":4,"telegram_user_id":1004},
+        {"user_id":6,"telegram_user_id":1006},
+    ]
     assert captured["text"] == "Запрошуємо на каву"
     stored = owner_database.query("SELECT * FROM admin_broadcast_previews")[0]
     assert stored["media_bytes"] is None and stored["used_at"] is not None
@@ -249,6 +253,8 @@ def test_pending_media_limit_applies_across_owner_sessions(owner_api,owner_datab
 @pytest.mark.parametrize("kind,method",[("photo","send_photo"),("video","send_video")])
 def test_native_delivery_passes_buffered_media_and_caption_only_to_verified_recipients(owner_api,monkeypatch,kind,method):
     module = importlib.import_module("app.api.barista_owner")
+    app_push = AsyncMock(return_value=None)
+    monkeypatch.setattr(module, "send_broadcast_app_push", app_push)
     bot = SimpleNamespace(send_photo=AsyncMock(),send_video=AsyncMock(),send_message=AsyncMock(),
                           session=SimpleNamespace(close=AsyncMock()))
     monkeypatch.setitem(sys.modules,"app.config",SimpleNamespace(BOT_TOKEN="offline-token"))
@@ -265,11 +271,14 @@ def test_native_delivery_passes_buffered_media_and_caption_only_to_verified_reci
     assert call[kind].data == data
     bot.send_message.assert_not_awaited()
     bot.session.close.assert_awaited_once()
+    assert app_push.await_count == 1
 
 
 @pytest.mark.parametrize("kind,method", [("photo", "send_photo"), ("video", "send_video")])
 def test_native_delivery_reuses_only_telegram_returned_media_id(owner_api, monkeypatch, kind, method):
     module = importlib.import_module("app.api.barista_owner")
+    app_push = AsyncMock(return_value=None)
+    monkeypatch.setattr(module, "send_broadcast_app_push", app_push)
     response = (SimpleNamespace(photo=[SimpleNamespace(file_id="bot-uploaded-photo")]) if kind == "photo"
                 else SimpleNamespace(video=SimpleNamespace(file_id="bot-uploaded-video")))
     bot = SimpleNamespace(send_photo=AsyncMock(return_value=response), send_video=AsyncMock(return_value=response),
@@ -291,6 +300,48 @@ def test_native_delivery_reuses_only_telegram_returned_media_id(owner_api, monke
     assert all(call.kwargs["caption"] == "Caption" for call in calls)
     bot.send_message.assert_not_awaited()
     bot.session.close.assert_awaited_once()
+
+
+def test_native_delivery_app_push_success_skips_telegram_for_full_snapshot(owner_api, monkeypatch):
+    module = importlib.import_module("app.api.barista_owner")
+    app_push = AsyncMock(side_effect=[True, True])
+    monkeypatch.setattr(module, "send_broadcast_app_push", app_push)
+    monkeypatch.setattr(module, "Bot", lambda *_: pytest.fail("Telegram must not be used after APNs success"))
+
+    touched, failed = asyncio.run(owner_api[1].original({
+        "broadcast_id": 31,
+        "shop_id": 1,
+        "shop_name": "Наші",
+        "text": "Знижка",
+        "recipients": [
+            {"user_id": 4, "telegram_user_id": 1004},
+            {"user_id": 6, "telegram_user_id": None},
+        ],
+    }))
+
+    assert touched == [4, 6] and failed == 0
+    assert app_push.await_count == 2
+
+
+def test_native_delivery_temporary_push_failure_never_falls_back_or_duplicates(owner_api, monkeypatch):
+    module = importlib.import_module("app.api.barista_owner")
+    app_push = AsyncMock(side_effect=[False, False])
+    monkeypatch.setattr(module, "send_broadcast_app_push", app_push)
+    monkeypatch.setattr(module, "Bot", lambda *_: pytest.fail("Temporary APNs failure must not trigger Telegram"))
+
+    touched, failed = asyncio.run(owner_api[1].original({
+        "broadcast_id": 32,
+        "shop_id": 1,
+        "shop_name": "Наші",
+        "text": "Повторити не можна",
+        "recipients": [
+            {"user_id": 4, "telegram_user_id": 1004},
+            {"user_id": 6, "telegram_user_id": None},
+        ],
+    }))
+
+    assert touched == [] and failed == 2
+    assert app_push.await_count == 2
 
 
 @pytest.mark.parametrize("column", ["invalidated_at", "media_bytes"])

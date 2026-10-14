@@ -162,6 +162,10 @@ def owner():
                 {"user_id": 12, "telegram_user_id": None},
             ],
         }),
+        # App push is attempted for the complete publication recipient
+        # snapshot.  The default emulates a user without an enabled device so
+        # the existing Telegram fallback assertions remain deterministic.
+        "send_broadcast_app_push": AsyncMock(return_value=None),
         "record_broadcast_delivery": Mock(),
     }
 
@@ -250,6 +254,25 @@ def test_confirmation_publishes_then_copies_original_only_to_telegram_audience(o
         owner.get_broadcast_recipients.assert_not_called()
         owner.save_broadcast.assert_not_called()
         owner.log_broadcast_touches.assert_not_called()
+
+    asyncio.run(scenario())
+
+
+def test_confirmation_prefers_app_push_and_keeps_telegram_as_fallback(owner):
+    async def scenario():
+        owner.send_broadcast_app_push.side_effect = [True, None]
+        owner.publish_bot_broadcast.return_value["recipients"] = [
+            {"user_id": 11, "telegram_user_id": 201},
+            {"user_id": 12, "telegram_user_id": None},
+        ]
+        state, callback = _state(), _callback()
+        await _seed_state(state, _saved_preview())
+
+        await owner.broadcast_confirm_callback(callback, state)
+
+        owner.send_broadcast_app_push.assert_awaited()
+        assert callback.bot.copy_message.await_count == 0
+        owner.record_broadcast_delivery.assert_called_once_with(SHOP_ID, BROADCAST_ID, [11])
 
     asyncio.run(scenario())
 
