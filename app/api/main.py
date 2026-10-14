@@ -79,6 +79,7 @@ from app.app_push import send_app_pushes
 from app.api.barista import build_barista_router
 from app.api.sales import build_sales_router
 from app.api.broadcasts import build_broadcast_inbox_router
+from app.api.community import build_community_router
 from app.telegram_link import confirm_telegram_link_session
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = "/data/uploads"
@@ -366,6 +367,13 @@ def require_superadmin(
     return current_user
 
 app.include_router(build_sales_router(
+    verify_actor=get_verified_telegram_actor,
+    superadmin_telegram_ids=SUPERADMIN_TELEGRAM_IDS,
+    connection_factory=get_connection,
+))
+
+app.include_router(build_community_router(
+    authenticate=get_current_user,
     verify_actor=get_verified_telegram_actor,
     superadmin_telegram_ids=SUPERADMIN_TELEGRAM_IDS,
     connection_factory=get_connection,
