@@ -266,7 +266,8 @@ def test_detail_read_and_media_use_identical_not_found_for_nonrecipients_before_
     if rejection == "unknown":
         path = f"/me/shops/1/broadcasts/{row['id'] + 100000}"
     recipients_before = db.query("SELECT * FROM broadcast_recipients ORDER BY id")
-    for method, endpoint in (("GET", path), ("POST", path + "/read"), ("GET", path + "/media")):
+    for method, endpoint in (("GET", path), ("POST", path + "/read"),
+                             ("DELETE", path), ("GET", path + "/media")):
         response = api.client.request(method, endpoint, headers={**bearer(token), "Range": "bytes=invalid"})
         assert response.status_code == 404
         assert response.json() == {"detail": {"code": "BROADCAST_NOT_FOUND"}}
@@ -274,6 +275,73 @@ def test_detail_read_and_media_use_identical_not_found_for_nonrecipients_before_
     assert db.query("SELECT * FROM broadcast_recipients ORDER BY id") == recipients_before
     api.storage_factory.assert_not_called()
     api.media_get.assert_not_called()
+
+
+def test_recipient_can_soft_delete_only_own_copy_idempotently_and_keep_audit_and_media(inbox_api):
+    api, db = inbox_api, inbox_api.db
+    row, data, _ = with_media(db, users=(4, 5))
+    token = db.db.create_app_session(4)
+    other_token = db.db.create_app_session(5)
+    audit_before = db.query("SELECT id,shop_id,sender_user_id,text,media_type,media_key FROM broadcasts")
+
+    first = api.client.delete(detail_path(row), headers=bearer(token))
+    assert first.status_code == 200
+    first_body = first.json()
+    assert set(first_body) == {"ok", "broadcast_id", "shop_id", "deleted_at"}
+    assert first_body["ok"] is True
+    assert first_body["broadcast_id"] == row["id"] and first_body["shop_id"] == row["shop_id"]
+    assert_private_headers(first)
+    deleted_at = first_body["deleted_at"]
+    assert db.query("SELECT deleted_at FROM broadcast_recipients WHERE broadcast_id=%s AND user_id=4",
+                    (row["id"],)) == [{"deleted_at": parsed_timestamp(deleted_at)}]
+
+    second = api.client.delete(detail_path(row), headers=bearer(token))
+    assert second.status_code == 200 and second.json() == first_body
+
+    for path in ("/me/broadcasts", "/me/shops/1/broadcasts"):
+        response = api.client.get(path, headers=bearer(token))
+        assert response.status_code == 200
+        assert response.json() == {"items": [], "total": 0, "unread_count": 0, "limit": 20, "offset": 0}
+        assert_private_headers(response)
+
+    for method, path in (
+        ("GET", detail_path(row)),
+        ("POST", detail_path(row) + "/read"),
+        ("GET", detail_path(row) + "/media"),
+    ):
+        response = api.client.request(method, path, headers=bearer(token))
+        assert response.status_code == 404
+        assert response.json() == {"detail": {"code": "BROADCAST_NOT_FOUND"}}
+        assert_private_headers(response)
+    api.storage_factory.assert_not_called()
+    api.media_get.assert_not_called()
+
+    # The publication and media remain audit data, and another recipient still
+    # owns an independent visible copy.
+    assert db.query("SELECT id,shop_id,sender_user_id,text,media_type,media_key FROM broadcasts") == audit_before
+    other_detail = api.client.get(detail_path(row), headers=bearer(other_token))
+    assert other_detail.status_code == 200
+    assert api.client.get(detail_path(row) + "/media", headers=bearer(other_token)).content == data
+    assert db.query("SELECT deleted_at FROM broadcast_recipients WHERE broadcast_id=%s AND user_id=5",
+                    (row["id"],)) == [{"deleted_at": None}]
+
+
+def test_delete_removes_message_from_totals_unread_and_pages(inbox_api):
+    api, db = inbox_api, inbox_api.db
+    rows = [publish(db, users=(4,), text=f"Повідомлення {index}") for index in range(3)]
+    token = db.db.create_app_session(4)
+    before = api.client.get("/me/broadcasts?limit=1&offset=0", headers=bearer(token)).json()
+    assert before["total"] == 3 and before["unread_count"] == 3
+
+    deleted = api.client.delete(detail_path(rows[1]), headers=bearer(token))
+    assert deleted.status_code == 200
+
+    after = api.client.get("/me/broadcasts?limit=1&offset=0", headers=bearer(token)).json()
+    assert after["total"] == 2 and after["unread_count"] == 2
+    assert rows[1]["id"] not in [item["broadcast_id"] for item in after["items"]]
+    page = api.client.get("/me/broadcasts?limit=2&offset=1", headers=bearer(token)).json()
+    assert page["total"] == 2 and page["unread_count"] == 2
+    assert rows[1]["id"] not in [item["broadcast_id"] for item in page["items"]]
 
 
 def test_legacy_broadcast_without_snapshot_is_hidden_despite_current_shop_membership(inbox_api):
@@ -308,7 +376,7 @@ def test_all_inbox_endpoints_require_active_consumer_sessions_before_storage(inb
         headers = {} if authorization == "missing" else bearer("invalid-offline-session")
     endpoints = [("GET", "/me/broadcasts"), ("GET", "/me/shops/1/broadcasts"),
                  ("GET", detail_path(row)), ("POST", detail_path(row) + "/read"),
-                 ("GET", detail_path(row) + "/media")]
+                 ("DELETE", detail_path(row)), ("GET", detail_path(row) + "/media")]
     for method, path in endpoints:
         response = api.client.request(method, path, headers={**headers, "Range": "bytes=invalid"})
         assert response.status_code == 401 and response.headers.get("www-authenticate") == "Bearer"

@@ -11,7 +11,10 @@ import pytest
 from conftest import PROJECT, extract_definitions
 
 
-MIGRATION = PROJECT / "migrations/20261013_broadcast_recipients.sql"
+MIGRATIONS = (
+    PROJECT / "migrations/20261013_broadcast_recipients.sql",
+    PROJECT / "migrations/20261014_broadcast_recipient_delete.sql",
+)
 LEGACY_SCHEMA = """
 CREATE TABLE users (id BIGSERIAL PRIMARY KEY, telegram_user_id BIGINT UNIQUE);
 CREATE TABLE coffee_shops (
@@ -59,7 +62,8 @@ def inbox_database(local_connection):
     try:
         db.query(LEGACY_SCHEMA)
         db.legacy = db.query("SELECT * FROM broadcasts ORDER BY id")
-        db.query(MIGRATION.read_text(encoding="utf-8"))
+        for migration in MIGRATIONS:
+            db.query(migration.read_text(encoding="utf-8"))
         yield db
     finally:
         state["schema"] = None
@@ -186,8 +190,9 @@ def test_migration_repeats_without_modifying_data_or_constraints(inbox_database)
     db.recipient()
     broadcasts = db.query("SELECT * FROM broadcasts")
     recipients = db.query("SELECT * FROM broadcast_recipients")
-    db.query(MIGRATION.read_text(encoding="utf-8"))
-    db.query(MIGRATION.read_text(encoding="utf-8"))
+    for _ in range(2):
+        for migration in MIGRATIONS:
+            db.query(migration.read_text(encoding="utf-8"))
     assert db.query("SELECT * FROM broadcasts") == broadcasts
     assert db.query("SELECT * FROM broadcast_recipients") == recipients
     with pytest.raises(UniqueViolation):
@@ -198,4 +203,4 @@ def test_migration_repeats_without_modifying_data_or_constraints(inbox_database)
         WHERE table_schema=current_schema() AND table_name='broadcast_recipients'
         ORDER BY ordinal_position""")
     assert [row["column_name"] for row in columns] == [
-        "id", "broadcast_id", "user_id", "read_at", "delivery_status", "created_at"]
+        "id", "broadcast_id", "user_id", "read_at", "delivery_status", "created_at", "deleted_at"]

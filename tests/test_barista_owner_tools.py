@@ -38,6 +38,7 @@ def owner_database(operations_database, tmp_path, monkeypatch):
     """)
     database.query((Path(__file__).parents[1] / "migrations/20261004_admin_broadcast.sql").read_text())
     database.query((Path(__file__).parents[1] / "migrations/20261013_broadcast_recipients.sql").read_text())
+    database.query((Path(__file__).parents[1] / "migrations/20261014_broadcast_recipient_delete.sql").read_text())
     from app import broadcast_publication
     from app.broadcast_media_storage import BroadcastMediaStorage
     database.broadcast_storage = BroadcastMediaStorage(tmp_path / "broadcast_media")

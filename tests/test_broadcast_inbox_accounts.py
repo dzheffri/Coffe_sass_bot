@@ -22,6 +22,7 @@ READ_LATE = datetime(2026, 3, 3, tzinfo=timezone.utc)
 def inbox_database(deletion_database):
     db = deletion_database
     db.query((PROJECT / "migrations/20261013_broadcast_recipients.sql").read_text())
+    db.query((PROJECT / "migrations/20261014_broadcast_recipient_delete.sql").read_text())
     return db
 
 
@@ -134,6 +135,19 @@ def test_merge_transfers_unique_recipient_rows_without_changing_target_or_other_
     before_repeat = db.query("SELECT * FROM broadcast_recipients ORDER BY id")
     assert merge_accounts(4, 4) == {"status": "already_merged", "user_id": 4}
     assert db.query("SELECT * FROM broadcast_recipients ORDER BY id") == before_repeat
+
+
+def test_merge_preserves_deleted_inbox_state_when_recipient_rows_collapse(inbox_database, merge_accounts):
+    db = inbox_database
+    source = recipient(db, 1, 2)
+    target = recipient(db, 1, 4)
+    deleted_at = datetime(2026, 3, 5, tzinfo=timezone.utc)
+    db.query("UPDATE broadcast_recipients SET deleted_at=%s WHERE id=%s", (deleted_at, source["id"]))
+
+    assert merge_accounts(2, 4) == {"status": "merged", "user_id": 4}
+
+    assert db.query("SELECT id,user_id,deleted_at FROM broadcast_recipients WHERE broadcast_id=1") == [
+        {"id": target["id"], "user_id": 4, "deleted_at": deleted_at}]
 
 
 @pytest.mark.parametrize(

@@ -67,7 +67,9 @@ def build_broadcast_inbox_router(*, authenticate: Callable, connection_factory: 
                                 headers=_PRIVATE_HEADERS) from error
 
     def list_messages(user_id, limit, offset, shop_id=None):
-        scope = "recipient.user_id=%s" + (" AND b.shop_id=%s" if shop_id is not None else "")
+        scope = "recipient.user_id=%s AND recipient.deleted_at IS NULL" + (
+            " AND b.shop_id=%s" if shop_id is not None else ""
+        )
         parameters = (user_id, shop_id) if shop_id is not None else (user_id,)
         with database() as connection:
             counts = connection.execute("""SELECT COUNT(*) AS total,
@@ -83,7 +85,8 @@ def build_broadcast_inbox_router(*, authenticate: Callable, connection_factory: 
     def owned_message(user_id, shop_id, broadcast_id):
         with database() as connection:
             row = connection.execute("SELECT " + _COLUMNS + ", b.media_key " + _JOINS + """
-                WHERE recipient.user_id=%s AND b.shop_id=%s AND b.id=%s
+                WHERE recipient.user_id=%s AND recipient.deleted_at IS NULL
+                    AND b.shop_id=%s AND b.id=%s
             """, (user_id, shop_id, broadcast_id)).fetchone()
         if row is None:
             _not_found()
@@ -118,8 +121,29 @@ def build_broadcast_inbox_router(*, authenticate: Callable, connection_factory: 
                 SET read_at=COALESCE(recipient.read_at,statement_timestamp())
                 FROM broadcasts b
                 WHERE recipient.broadcast_id=b.id AND recipient.user_id=%s
+                    AND recipient.deleted_at IS NULL
                     AND b.shop_id=%s AND b.id=%s
                 RETURNING b.id AS broadcast_id,b.shop_id,recipient.read_at
+            """, (user["user_id"], shop_id, broadcast_id)).fetchone()
+        if row is None:
+            _not_found()
+        return {"ok": True, **row}
+
+    @router.delete("/shops/{shop_id}/broadcasts/{broadcast_id}")
+    def delete_message(shop_id: int = Path(gt=0, le=_MAX_ID),
+                       broadcast_id: int = Path(gt=0, le=_MAX_ID),
+                       user=Depends(current_recipient)):
+        # Deletion is scoped to the authenticated recipient snapshot. It only
+        # hides this user's inbox row and never removes the broadcast/media or
+        # any other recipient's copy.
+        with database(readonly=False) as connection:
+            row = connection.execute("""
+                UPDATE broadcast_recipients recipient
+                SET deleted_at=COALESCE(recipient.deleted_at,statement_timestamp())
+                FROM broadcasts b
+                WHERE recipient.broadcast_id=b.id AND recipient.user_id=%s
+                    AND b.shop_id=%s AND b.id=%s
+                RETURNING b.id AS broadcast_id,b.shop_id,recipient.deleted_at
             """, (user["user_id"], shop_id, broadcast_id)).fetchone()
         if row is None:
             _not_found()

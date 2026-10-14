@@ -1307,10 +1307,23 @@ def merge_users(source_user_id: int, target_user_id: int):
             cur.execute("SELECT to_regclass('broadcast_recipients') AS recipients_table")
             if cur.fetchone()["recipients_table"] is not None:
                 cur.execute("""
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'broadcast_recipients'
+                          AND column_name = 'deleted_at'
+                    ) AS has_deleted_at
+                """)
+                has_deleted_at = cur.fetchone()["has_deleted_at"]
+                deleted_at_merge = ", deleted_at = COALESCE(target.deleted_at, source.deleted_at)" \
+                    if has_deleted_at else ""
+                cur.execute("""
                     UPDATE broadcast_recipients target
                     SET read_at = LEAST(target.read_at, source.read_at),
                         delivery_status = COALESCE(target.delivery_status, source.delivery_status),
                         created_at = LEAST(target.created_at, source.created_at)
+                """ + deleted_at_merge + """
                     FROM broadcast_recipients source
                     WHERE source.user_id = %s AND target.user_id = %s
                       AND source.broadcast_id = target.broadcast_id
