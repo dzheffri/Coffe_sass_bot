@@ -32,7 +32,7 @@ class CommunityRepository:
         self.connection = connection
 
     def _post_row(self, post_id: int, *, published_only: bool = False, lock: bool = False):
-        query = "SELECT * FROM community_posts WHERE id=%s"
+        query = "SELECT * FROM community_posts WHERE id=%s AND deleted_at IS NULL"
         if published_only:
             query += " AND published_at IS NOT NULL"
         if lock:
@@ -77,6 +77,7 @@ class CommunityRepository:
                 """SELECT id,title,series_part,series_total
                    FROM community_posts
                    WHERE type='series' AND LOWER(series_title)=LOWER(%s) AND published_at IS NOT NULL
+                     AND deleted_at IS NULL
                    ORDER BY series_part ASC, id ASC""", (row["series_title"],),
             ).fetchall()
             series_posts = [_series_summary(item) for item in siblings]
@@ -105,7 +106,9 @@ class CommunityRepository:
 
     def list_posts(self, user_id: int, *, limit: int, offset: int,
                    published_only: bool, admin: bool = False) -> dict:
-        where = " WHERE published_at IS NOT NULL" if published_only else ""
+        where = " WHERE deleted_at IS NULL"
+        if published_only:
+            where += " AND published_at IS NOT NULL"
         total = self.connection.execute(
             "SELECT COUNT(*) AS total FROM community_posts" + where
         ).fetchone()["total"]
@@ -177,8 +180,18 @@ class CommunityRepository:
             ).fetchone()
         return self._serialized(row, actor_user_id, admin=True), should_notify
 
+    def delete_post(self, post_id: int) -> None:
+        # Retain content, votes, reactions and media for safe recovery. Repeated
+        # deletion keeps the original timestamp and never republishes the post.
+        row = self.connection.execute(
+            """UPDATE community_posts SET deleted_at=COALESCE(deleted_at, NOW())
+               WHERE id=%s RETURNING id""", (post_id,),
+        ).fetchone()
+        if row is None:
+            raise CommunityError(404, "COMMUNITY_POST_NOT_FOUND")
+
     def react(self, post_id: int, user_id: int, interested: bool) -> dict:
-        self._post_row(post_id, published_only=True)
+        self._post_row(post_id, published_only=True, lock=True)
         self.connection.execute(
             """INSERT INTO community_reactions(post_id,user_id,interested)
                VALUES(%s,%s,%s)
@@ -188,7 +201,7 @@ class CommunityRepository:
         return self.get_post(post_id, user_id, published_only=True)
 
     def vote(self, post_id: int, user_id: int, option_id: int) -> dict:
-        row = self._post_row(post_id, published_only=True)
+        row = self._post_row(post_id, published_only=True, lock=True)
         if row["type"] != "poll":
             raise CommunityError(422, "NOT_A_POLL")
         options = _json_options(row["options"])

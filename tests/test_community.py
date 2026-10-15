@@ -15,6 +15,7 @@ from conftest import PROJECT, bearer
 
 
 MIGRATION = PROJECT / "migrations/20261015_community_posts.sql"
+SOFT_DELETE_MIGRATION = PROJECT / "migrations/20261015_community_soft_delete.sql"
 
 
 def _photo_bytes(kind="PNG"):
@@ -26,6 +27,7 @@ def _photo_bytes(kind="PNG"):
 @pytest.fixture
 def community_api(database, tmp_path):
     database.query(MIGRATION.read_text(encoding="utf-8"))
+    database.query(SOFT_DELETE_MIGRATION.read_text(encoding="utf-8"))
     module = importlib.import_module("app.api.community")
 
     def auth(authorization: str | None = Header(default=None)):
@@ -87,6 +89,7 @@ def test_every_admin_route_rejects_anonymous_and_non_allowlisted_actor(community
         ("GET", "/community/admin/posts", None),
         ("POST", "/community/admin/posts", {"type": "news", "title": "x", "text": "y"}),
         ("GET", f"/community/admin/posts/{draft['id']}", None),
+        ("DELETE", f"/community/admin/posts/{draft['id']}", None),
         ("PUT", f"/community/admin/posts/{draft['id']}", {"type": "news", "title": "x", "text": "y"}),
         ("POST", f"/community/admin/posts/{draft['id']}/image", None),
         ("POST", f"/community/admin/posts/{draft['id']}/publish", {"notify": False}),
@@ -371,3 +374,114 @@ def test_user_foreign_keys_cascade_reactions_but_preserve_post_history(community
     assert db.query("SELECT COUNT(*) AS n FROM community_posts")[0]["n"] == 2
     assert all(row["created_by_user_id"] is None
                for row in db.query("SELECT created_by_user_id FROM community_posts"))
+
+
+def test_soft_delete_migration_preserves_existing_community_rows_and_is_idempotent(database):
+    database.query(MIGRATION.read_text(encoding="utf-8"))
+    post = database.query("""INSERT INTO community_posts(type,title,text,published_at,image_url)
+        VALUES('news','До міграції','Існуючий текст',NOW(),'/uploads/community/kept.jpg')
+        RETURNING *""")[0]
+    for _ in range(2):
+        database.query(SOFT_DELETE_MIGRATION.read_text(encoding="utf-8"))
+    after = database.query("SELECT * FROM community_posts WHERE id=%s", (post["id"],))[0]
+    assert {key: after[key] for key in post} == post
+    assert after["deleted_at"] is None
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_superadmin_soft_delete_hides_draft_and_published_and_preserves_media(community_api, tmp_path, published):
+    client, db = community_api
+    admin, customer = _tokens(db)
+    post = _draft(client, admin, type="poll", title="Видалити", text="Зберегти текст",
+                  question="Q", options=["A", "B"])
+    image = client.post(f"/community/admin/posts/{post['id']}/image", headers=bearer(admin),
+                        files={"photo": ("photo.jpg", _photo_bytes("JPEG"), "image/jpeg")})
+    assert image.status_code == 200
+    media_file = tmp_path / "community-upload" / image.json()["image_url"].rsplit("/", 1)[1]
+    media_before = media_file.read_bytes()
+    if published:
+        assert client.post(f"/community/admin/posts/{post['id']}/publish", headers=bearer(admin), json={}).status_code == 200
+        assert client.put(f"/me/community/posts/{post['id']}/reaction", headers=bearer(customer),
+                          json={"interested": True}).status_code == 200
+        assert client.post(f"/me/community/posts/{post['id']}/vote", headers=bearer(customer),
+                           json={"option_id": 1}).status_code == 200
+    before = db.query("SELECT * FROM community_posts WHERE id=%s", (post["id"],))[0]
+    path = f"/community/admin/posts/{post['id']}"
+    deleted = client.delete(path, headers=bearer(admin))
+    assert deleted.status_code == 200 and deleted.json() == {"ok": True}
+    assert "no-store" in deleted.headers["cache-control"]
+    after = db.query("SELECT * FROM community_posts WHERE id=%s", (post["id"],))[0]
+    assert after["deleted_at"] is not None
+    assert {key: value for key, value in after.items() if key != "deleted_at"} == {
+        key: value for key, value in before.items() if key != "deleted_at"}
+    assert media_file.read_bytes() == media_before
+    assert db.query("SELECT COUNT(*) AS n FROM community_reactions WHERE post_id=%s", (post["id"],))[0]["n"] == int(published)
+    assert db.query("SELECT COUNT(*) AS n FROM community_poll_votes WHERE post_id=%s", (post["id"],))[0]["n"] == int(published)
+    for list_path, token in [("/me/community/posts", customer), ("/community/admin/posts", admin)]:
+        page = client.get(list_path, headers=bearer(token)).json()
+        assert page["items"] == [] and page["total"] == 0
+    assert client.get(path, headers=bearer(admin)).status_code == 404
+    assert client.get(f"/me/community/posts/{post['id']}", headers=bearer(customer)).status_code == 404
+    assert client.put(f"/me/community/posts/{post['id']}/reaction", headers=bearer(customer),
+                      json={"interested": False}).status_code == 404
+    assert client.post(f"/me/community/posts/{post['id']}/vote", headers=bearer(customer),
+                       json={"option_id": 2}).status_code == 404
+    assert client.put(path, headers=bearer(admin), json={"type": "news", "title": "x", "text": "y"}).status_code == 404
+    assert client.post(path + "/publish", headers=bearer(admin), json={"notify": True}).status_code == 404
+    assert client.post(path + "/image", headers=bearer(admin),
+                       files={"photo": ("x.png", _photo_bytes(), "image/png")}).status_code == 404
+    assert len(list(media_file.parent.iterdir())) == 1
+    assert client.delete(path, headers=bearer(admin)).json() == {"ok": True}
+    assert db.query("SELECT deleted_at FROM community_posts WHERE id=%s", (post["id"],))[0]["deleted_at"] == after["deleted_at"]
+    assert client.delete("/community/admin/posts/999999", headers=bearer(admin)).status_code == 404
+
+
+@pytest.mark.parametrize("role", ["owner", "admin"])
+def test_shop_owner_and_admin_cannot_delete_posts(community_api, role):
+    client, db = community_api
+    admin, _ = _tokens(db)
+    db.query("UPDATE shop_admins SET role=%s WHERE user_id=3", (role,))
+    other = _third_token(db)
+    post = _draft(client, admin)
+    path = f"/community/admin/posts/{post['id']}"
+    assert client.delete(path, headers=bearer(other)).status_code == 403
+    assert db.query("SELECT deleted_at FROM community_posts WHERE id=%s", (post["id"],))[0]["deleted_at"] is None
+
+
+def test_deletion_keeps_other_posts_votes_reactions_and_pagination(community_api):
+    client, db = community_api
+    admin, customer = _tokens(db)
+    posts = [_draft(client, admin, type="poll", title=f"Poll {i}", text="", question="Q", options=["A", "B"])
+             for i in range(3)]
+    for post in posts:
+        path = f"/community/admin/posts/{post['id']}"
+        assert client.post(path + "/publish", headers=bearer(admin), json={}).status_code == 200
+    keep, remove, newest = posts
+    assert client.put(f"/me/community/posts/{keep['id']}/reaction", headers=bearer(customer),
+                      json={"interested": True}).status_code == 200
+    assert client.post(f"/me/community/posts/{keep['id']}/vote", headers=bearer(customer),
+                       json={"option_id": 1}).status_code == 200
+    before = client.get(f"/me/community/posts/{keep['id']}", headers=bearer(customer)).json()
+    assert client.delete(f"/community/admin/posts/{remove['id']}", headers=bearer(admin)).status_code == 200
+    assert client.get(f"/me/community/posts/{keep['id']}", headers=bearer(customer)).json() == before
+    for path, token in [("/me/community/posts", customer), ("/community/admin/posts", admin)]:
+        first = client.get(path + "?limit=1&offset=0", headers=bearer(token)).json()
+        second = client.get(path + "?limit=1&offset=1", headers=bearer(token)).json()
+        assert first["total"] == second["total"] == 2
+        assert [item["id"] for item in first["items"] + second["items"]] == [newest["id"], keep["id"]]
+    assert client.put(f"/me/community/posts/{newest['id']}/reaction", headers=bearer(customer),
+                      json={"interested": True}).status_code == 200
+    assert client.post(f"/me/community/posts/{newest['id']}/vote", headers=bearer(customer),
+                       json={"option_id": 2}).status_code == 200
+
+
+def test_deleted_series_part_is_excluded_from_other_part_details(community_api):
+    client, db = community_api
+    admin, customer = _tokens(db)
+    posts = [_draft(client, admin, type="series", title=f"Частина {i}", text="Кава",
+                    series_title="Серія", series_part=i, series_total=2) for i in [1, 2]]
+    for post in posts:
+        assert client.post(f"/community/admin/posts/{post['id']}/publish", headers=bearer(admin), json={}).status_code == 200
+    assert client.delete(f"/community/admin/posts/{posts[0]['id']}", headers=bearer(admin)).status_code == 200
+    detail = client.get(f"/me/community/posts/{posts[1]['id']}", headers=bearer(customer)).json()
+    assert [item["id"] for item in detail["series_posts"]] == [posts[1]["id"]]

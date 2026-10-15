@@ -254,6 +254,15 @@ def build_community_router(
             except CommunityError as exc:
                 raise _error(exc) from exc
 
+    @router.delete("/community/admin/posts/{post_id}")
+    def admin_delete(post_id: int = Path(gt=0, le=_MAX_ID), actor=Depends(admin_response)):
+        with database(readonly=False) as connection:
+            try:
+                repository(connection).delete_post(post_id)
+            except CommunityError as exc:
+                raise _error(exc) from exc
+        return {"ok": True}
+
     @router.post("/community/admin/posts/{post_id}/image")
     async def admin_image(request: Request, post_id: int = Path(gt=0, le=_MAX_ID),
                           actor=Depends(admin_response)):
