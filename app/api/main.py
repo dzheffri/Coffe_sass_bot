@@ -391,10 +391,24 @@ def verify_google_id_token(token: str, *, audience: str | None = None):
         return None
 
     try:
+        if audience is not None:
+            expected_audience = audience.strip()
+        else:
+            expected_audience = [
+                value.strip()
+                for value in (
+                    os.getenv("GOOGLE_CLIENT_ID", ""),
+                    os.getenv("GOOGLE_ANDROID_WEB_CLIENT_ID", ""),
+                )
+                if value.strip()
+            ]
+        if not expected_audience:
+            return None
+
         payload = id_token.verify_oauth2_token(
             token,
             google_requests.Request(),
-            audience=audience or os.getenv("GOOGLE_CLIENT_ID"),
+            audience=expected_audience,
         )
 
         if payload.get("iss") not in {

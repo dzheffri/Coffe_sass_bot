@@ -22,6 +22,7 @@ from google.oauth2 import id_token
 CLIENT_APPLE_AUDIENCE = "test.client.apple"
 BARISTA_APPLE_AUDIENCE = "test.barista.apple"
 CLIENT_GOOGLE_AUDIENCE = "test.client.google"
+ANDROID_GOOGLE_AUDIENCE = "test.android.web.google"
 BARISTA_GOOGLE_AUDIENCE = "test.barista.google"
 KEY_ID = "offline-test-key"
 
@@ -88,6 +89,7 @@ def verifiers(signing_key, monkeypatch):
         "_apple_keys_cache": {"keys": None, "expires_at": 0},
     }
     monkeypatch.setenv("GOOGLE_CLIENT_ID", CLIENT_GOOGLE_AUDIENCE)
+    monkeypatch.delenv("GOOGLE_ANDROID_WEB_CLIENT_ID", raising=False)
     source_path = Path(__file__).resolve().parents[1] / "app" / "api" / "main.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     names = {"_b64url_decode", "verify_apple_id_token", "verify_google_id_token"}
@@ -202,3 +204,86 @@ def test_google_supported_issuers(verifiers, signing_key, issuer):
     assert verifiers.google(
         _signed_token(signing_key, payload), audience=BARISTA_GOOGLE_AUDIENCE
     ) == payload
+
+
+@pytest.mark.parametrize("audience", [CLIENT_GOOGLE_AUDIENCE, ANDROID_GOOGLE_AUDIENCE])
+def test_google_consumer_allowlist_preserves_ios_and_accepts_android(
+    verifiers, signing_key, monkeypatch, audience
+):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", f" {CLIENT_GOOGLE_AUDIENCE} ")
+    monkeypatch.setenv("GOOGLE_ANDROID_WEB_CLIENT_ID", f" {ANDROID_GOOGLE_AUDIENCE} ")
+    payload = _payload("google", audience)
+    assert verifiers.google(_signed_token(signing_key, payload)) == payload
+
+
+@pytest.mark.parametrize("audience", [BARISTA_GOOGLE_AUDIENCE, "untrusted.google.app"])
+def test_google_consumer_allowlist_rejects_other_apps(
+    verifiers, signing_key, monkeypatch, audience
+):
+    monkeypatch.setenv("GOOGLE_ANDROID_WEB_CLIENT_ID", ANDROID_GOOGLE_AUDIENCE)
+    assert verifiers.google(_signed_token(signing_key, _payload("google", audience))) is None
+
+
+@pytest.mark.parametrize("audience", [CLIENT_GOOGLE_AUDIENCE, ANDROID_GOOGLE_AUDIENCE])
+def test_google_explicit_barista_override_never_accepts_consumer_allowlist(
+    verifiers, signing_key, monkeypatch, audience
+):
+    monkeypatch.setenv("GOOGLE_ANDROID_WEB_CLIENT_ID", ANDROID_GOOGLE_AUDIENCE)
+    assert verifiers.google(
+        _signed_token(signing_key, _payload("google", audience)),
+        audience=BARISTA_GOOGLE_AUDIENCE,
+    ) is None
+    barista_payload = _payload("google", BARISTA_GOOGLE_AUDIENCE)
+    assert verifiers.google(
+        _signed_token(signing_key, barista_payload), audience=BARISTA_GOOGLE_AUDIENCE
+    ) == barista_payload
+
+
+@pytest.mark.parametrize("configured", [None, "", "   "])
+def test_google_optional_android_audience_does_not_change_legacy_default(
+    verifiers, signing_key, monkeypatch, configured
+):
+    if configured is not None:
+        monkeypatch.setenv("GOOGLE_ANDROID_WEB_CLIENT_ID", configured)
+    payload = _payload("google", CLIENT_GOOGLE_AUDIENCE)
+    assert verifiers.google(_signed_token(signing_key, payload)) == payload
+
+
+def test_google_missing_consumer_audiences_fails_closed_but_explicit_override_works(
+    verifiers, signing_key, monkeypatch
+):
+    monkeypatch.delenv("GOOGLE_CLIENT_ID")
+    token = _signed_token(signing_key, _payload("google", BARISTA_GOOGLE_AUDIENCE))
+    assert verifiers.google(token) is None
+    assert not verifiers.certificate_requests
+    assert verifiers.google(token, audience=BARISTA_GOOGLE_AUDIENCE) is not None
+
+
+@pytest.mark.parametrize("audience", ["", "   "])
+def test_google_blank_explicit_override_does_not_fall_back_to_consumers(
+    verifiers, signing_key, monkeypatch, audience
+):
+    monkeypatch.setenv("GOOGLE_ANDROID_WEB_CLIENT_ID", ANDROID_GOOGLE_AUDIENCE)
+    token = _signed_token(signing_key, _payload("google", CLIENT_GOOGLE_AUDIENCE))
+    assert verifiers.google(token, audience=audience) is None
+    assert not verifiers.certificate_requests
+
+
+@pytest.mark.parametrize("invalid_claim", ["expired", "issuer", "subject", "signature"])
+def test_google_android_allowlist_keeps_identity_validation(
+    verifiers, signing_key, monkeypatch, invalid_claim
+):
+    monkeypatch.setenv("GOOGLE_ANDROID_WEB_CLIENT_ID", ANDROID_GOOGLE_AUDIENCE)
+    payload = _payload("google", ANDROID_GOOGLE_AUDIENCE)
+    if invalid_claim == "expired":
+        payload["exp"] = int(time.time()) - 60
+    elif invalid_claim == "issuer":
+        payload["iss"] = "https://untrusted.example"
+    elif invalid_claim == "subject":
+        payload.pop("sub")
+    token = _signed_token(signing_key, payload)
+    if invalid_claim == "signature":
+        header, _, signature = token.split(".")
+        payload["sub"] = "tampered-subject"
+        token = ".".join([header, _encode(json.dumps(payload).encode("utf-8")), signature])
+    assert verifiers.google(token) is None
