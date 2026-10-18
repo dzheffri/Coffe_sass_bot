@@ -13,6 +13,7 @@ from psycopg.errors import UndefinedColumn, UndefinedTable
 from starlette.concurrency import run_in_threadpool
 
 from app.admin_tools import (claim_broadcast, cleanup_broadcast_previews, list_members, make_broadcast_preview,
+                             claim_network_broadcast, make_network_broadcast_preview,
                              preview_limits,
                              read_statistics, remove_member, require_owner,
                              selected_shop, shop_response)
@@ -30,6 +31,19 @@ def _broadcast_shop_is_active(shop_id):
             connection.execute("SET TRANSACTION READ ONLY")
             return connection.execute(
                 "SELECT id FROM coffee_shops WHERE id=%s AND is_active IS TRUE", (shop_id,),
+            ).fetchone() is not None
+
+
+def _broadcast_audience_is_active(broadcast):
+    with get_connection() as connection:
+        with connection.transaction():
+            connection.execute("SET TRANSACTION READ ONLY")
+            if broadcast.get("scope") == "NETWORK":
+                return connection.execute("""SELECT 1 FROM coffee_shops
+                    WHERE network_id=%s AND is_active IS TRUE LIMIT 1""",
+                    (broadcast["network_id"],)).fetchone() is not None
+            return connection.execute(
+                "SELECT id FROM coffee_shops WHERE id=%s AND is_active IS TRUE", (broadcast["shop_id"],),
             ).fetchone() is not None
 
 
@@ -59,7 +73,7 @@ async def deliver_owner_broadcast(broadcast):
             try:
                 # Sending happens after claim commits. Recheck between sends
                 # so shop closure also stops the pending portion of delivery.
-                if not await run_in_threadpool(_broadcast_shop_is_active, broadcast["shop_id"]):
+                if not await run_in_threadpool(_broadcast_audience_is_active, broadcast):
                     failed += len(recipients) - index
                     break
                 push_sent = await send_broadcast_app_push(broadcast, row)
@@ -251,6 +265,84 @@ def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
             # not look like permission to resend the same confirmed broadcast.
             logger.warning("Owner broadcast audit update failed (%s)", type(exc).__name__)
         return {"ok": True, "shop": shop_response(shop), "sent": len(touched), "failed": failed,
+                "status": "completed" if failed == 0 else "partial"}
+
+    def authorize_network(token, network_id, *, connection=None, touch=False):
+        session = authorize(token, connection=connection, touch=touch)
+        network = next((item for item in session.get("networks", [])
+                        if item["network_id"] == network_id), None)
+        if network is None:
+            raise HTTPException(403, detail={"code": "NETWORK_ACCESS_DENIED"})
+        return session, network
+
+    def network_upload_context(token, network_id):
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                session, _ = authorize_network(token, network_id, connection=connection, touch=False)
+                connection.execute("SELECT media_bytes FROM admin_broadcast_previews WHERE FALSE")
+                return session["session_id"]
+
+    def save_network_preview(token, network_id, text, media, expected_session_id):
+        with get_connection() as connection:
+            with connection.transaction():
+                session, network = authorize_network(token, network_id, connection=connection, touch=True)
+                if session["session_id"] != expected_session_id:
+                    raise HTTPException(409, detail={"code": "PREVIEW_CONTEXT_MISMATCH"})
+                result = make_network_broadcast_preview(session, network_id, text, connection, media=media)
+                return {"ok": True, "network": network, **result}
+
+    @router.post("/owner/networks/{network_id}/broadcast/preview")
+    async def network_preview(network_id: int, request: Request,
+                              authorization: str | None = Header(default=None)):
+        token = parse_bearer(authorization)
+        try:
+            expected_session_id = await run_in_threadpool(network_upload_context, token, network_id)
+            content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type == "application/json":
+                raw = await bounded_body(request, JSON_LIMIT)
+                try:
+                    body = BroadcastPreviewRequest.model_validate_json(raw)
+                except ValidationError as exc:
+                    raise HTTPException(422, detail={"code": "INVALID_BROADCAST_REQUEST"}) from exc
+                text, media = body.text.strip(), None
+                if not text:
+                    raise HTTPException(422, detail={"code": "EMPTY_BROADCAST"})
+                validate_text_length(text, 4096, "INVALID_BROADCAST_REQUEST")
+            elif content_type == "multipart/form-data":
+                text, media = await multipart_media(request)
+            else:
+                raise HTTPException(415, detail={"code": "UNSUPPORTED_MEDIA_TYPE"})
+            return await run_in_threadpool(save_network_preview, token, network_id, text, media,
+                                           expected_session_id)
+        except (UndefinedTable, UndefinedColumn) as exc:
+            raise HTTPException(503, detail={"code": "BROADCAST_NOT_CONFIGURED"}) from exc
+
+    def prepare_network_send(token, network_id, confirmation_token):
+        with BroadcastPublication() as publication:
+            with get_connection() as connection:
+                with connection.transaction():
+                    session, network = authorize_network(token, network_id, connection=connection, touch=True)
+                    broadcast = claim_network_broadcast(session, network_id, confirmation_token,
+                                                        connection, publication)
+            return network, broadcast
+
+    @router.post("/owner/networks/{network_id}/broadcast")
+    async def send_network(body: BroadcastSendRequest, network_id: int,
+                           authorization: str | None = Header(default=None)):
+        token = parse_bearer(authorization)
+        try:
+            network, broadcast = await run_in_threadpool(
+                prepare_network_send, token, network_id, body.confirmation_token)
+        except (UndefinedTable, UndefinedColumn) as exc:
+            raise HTTPException(503, detail={"code": "BROADCAST_NOT_CONFIGURED"}) from exc
+        touched, failed = await deliver_owner_broadcast(broadcast)
+        try:
+            await run_in_threadpool(save_delivery, broadcast["shop_id"], broadcast["broadcast_id"], touched)
+        except Exception as exc:
+            logger.warning("Network broadcast audit update failed (%s)", type(exc).__name__)
+        return {"ok": True, "network": {"id": network["network_id"], "name": network["name"]},
+                "scope": "NETWORK", "sent": len(touched), "failed": failed,
                 "status": "completed" if failed == 0 else "partial"}
 
     return router

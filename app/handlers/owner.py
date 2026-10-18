@@ -14,6 +14,8 @@ from aiogram.types import (
 from app.db import (
     is_owner,
     get_admin_shop_and_role,
+    get_admin_shops_for_telegram,
+    set_admin_active_shop,
     get_shop,
     get_shop_detailed_stats,
     get_shop_admins,
@@ -94,7 +96,61 @@ def owner_main_keyboard_for_user(user_id: int):
         can_switch_to_owner=False,
         can_switch_to_super_admin=is_super_admin,
         admin_panel_url=personal_admin_url,
+        can_select_shop=len(get_admin_shops_for_telegram(user_id)) > 1,
     )
+
+
+def admin_shop_picker(shops):
+    rows = []
+    for shop in shops:
+        title = shop["name"]
+        if shop.get("city"):
+            title += f" · {shop['city']}"
+        rows.append([InlineKeyboardButton(text=title[:64], callback_data=f"admin_shop_select:{shop['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(F.text == "🏪 Обрати кав’ярню")
+async def choose_admin_shop_handler(message: types.Message):
+    if not is_owner(message.from_user.id):
+        return
+    shops = get_admin_shops_for_telegram(message.from_user.id)
+    if len(shops) <= 1:
+        await message.answer("У вас доступна одна кав’ярня.")
+        return
+    await message.answer(
+        "Оберіть точку для наступних дій. Нарахування, списання та shop-розсилки застосовуватимуться лише до неї.",
+        reply_markup=admin_shop_picker(shops),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_shop_select:"))
+async def choose_admin_shop_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Доступ заборонено.", show_alert=True)
+        return
+    raw_id = (callback.data or "").partition(":")[2]
+    if not raw_id.isascii() or not raw_id.isdigit():
+        await callback.answer("Невірна кав’ярня.", show_alert=True)
+        return
+    shop_id = int(raw_id)
+    if not set_admin_active_shop(callback.from_user.id, shop_id):
+        await callback.answer("Немає доступу до цієї кав’ярні.", show_alert=True)
+        return
+    await state.clear()
+    admin_modes.pop(callback.from_user.id, None)
+    pending_scan.pop(callback.from_user.id, None)
+    shop = get_admin_shop_and_role(callback.from_user.id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer("Кав’ярню змінено")
+    if shop:
+        await callback.message.answer(
+            f"Активна кав’ярня: {shop['name']}",
+            reply_markup=owner_main_keyboard_for_user(callback.from_user.id),
+        )
 
 
 @router.message(F.text == "📊 Статистика кав’ярні")

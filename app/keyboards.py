@@ -29,6 +29,7 @@ def admin_main_keyboard(
     can_switch_to_owner: bool = False,
     can_switch_to_super_admin: bool = False,
     admin_panel_url: str = "",
+    can_select_shop: bool = False,
 ):
     keyboard = [
         [
@@ -44,6 +45,8 @@ def admin_main_keyboard(
     ]
 
     if is_owner:
+        if can_select_shop:
+            keyboard.append([KeyboardButton(text="🏪 Обрати кав’ярню")])
         keyboard.extend([
             [KeyboardButton(text="📊 Статистика кав’ярні")],
             [

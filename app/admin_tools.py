@@ -6,7 +6,8 @@ import secrets
 
 from fastapi import HTTPException
 
-from app.db import (can_send_broadcast, get_broadcast_recipients, get_shop_admins,
+from app.db import (can_send_broadcast, can_send_network_broadcast, get_broadcast_recipients,
+                    get_network_broadcast_recipients, get_shop_admins,
                     get_shop_marketing_efficiency, remove_shop_admin)
 
 MAX_PENDING_PREVIEWS_PER_SHOP = 5
@@ -130,6 +131,93 @@ def reachable_recipients(shop_id, connection):
 def recipient_hash(recipients):
     keys = sorted((row["user_id"], row["telegram_user_id"]) for row in recipients)
     return hashlib.sha256(json.dumps(keys, separators=(",", ":")).encode()).hexdigest()
+
+
+def make_network_broadcast_preview(session, network_id, text, connection, media=None):
+    network = connection.execute("SELECT * FROM coffee_networks WHERE id=%s FOR NO KEY UPDATE",
+                                 (network_id,)).fetchone()
+    if network is None or connection.execute(
+            "SELECT 1 FROM network_memberships WHERE network_id=%s AND user_id=%s AND role='NETWORK_OWNER'",
+            (network_id, session["user_id"])).fetchone() is None:
+        raise HTTPException(403, detail={"code": "NETWORK_ACCESS_DENIED"})
+    shops = connection.execute("""SELECT id,name FROM coffee_shops
+        WHERE network_id=%s AND is_active IS TRUE ORDER BY id FOR NO KEY UPDATE""", (network_id,)).fetchall()
+    if not shops:
+        raise HTTPException(409, detail={"code": "NETWORK_HAS_NO_ACTIVE_SHOPS"})
+    connection.execute("""UPDATE admin_broadcast_previews SET invalidated_at=clock_timestamp(),media_bytes=NULL
+        WHERE session_id=%s AND used_at IS NULL AND invalidated_at IS NULL""", (session["session_id"],))
+    limits = connection.execute("""SELECT COUNT(*) FILTER (
+            WHERE created_at>clock_timestamp()-INTERVAL '1 hour') AS recent,
+          COUNT(*) FILTER (WHERE used_at IS NULL AND invalidated_at IS NULL
+            AND expires_at>clock_timestamp() AND session_id<>%s) AS pending_other
+        FROM admin_broadcast_previews WHERE network_id=%s""",
+        (session["session_id"], network_id)).fetchone()
+    if limits["recent"] >= MAX_PREVIEWS_PER_SHOP_PER_HOUR:
+        raise HTTPException(429, detail={"code": "PREVIEW_RATE_LIMITED"})
+    if limits["pending_other"] >= MAX_PENDING_PREVIEWS_PER_SHOP:
+        raise HTTPException(429, detail={"code": "PREVIEW_LIMIT_REACHED"})
+    recipients = get_network_broadcast_recipients(network_id, connection=connection)
+    if not recipients:
+        raise HTTPException(409, detail={"code": "NO_RECIPIENTS"})
+    token = secrets.token_urlsafe(32)
+    row = connection.execute("""INSERT INTO admin_broadcast_previews
+        (token_hash,shop_id,network_id,owner_user_id,session_id,text,recipients_hash,expires_at,
+         media_kind,media_filename,media_mime,media_bytes)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,clock_timestamp()+INTERVAL '10 minutes',%s,%s,%s,%s)
+        RETURNING expires_at""", (hashlib.sha256(token.encode()).hexdigest(), shops[0]["id"], network_id,
+         session["user_id"], session["session_id"], text, recipient_hash(recipients),
+         media["kind"] if media else None, media["filename"] if media else None,
+         media["mime_type"] if media else None, media["bytes"] if media else None)).fetchone()
+    return {"scope": "NETWORK", "network": {"id": network["id"], "name": network["name"]},
+            "text": text, "recipients_count": len(recipients), "confirmation_token": token,
+            "expires_at": row["expires_at"],
+            "media": {key: media[key] for key in ("kind", "filename", "size_bytes", "mime_type")} if media else None}
+
+
+def claim_network_broadcast(session, network_id, token, connection, publication):
+    network = connection.execute("SELECT * FROM coffee_networks WHERE id=%s FOR NO KEY UPDATE",
+                                 (network_id,)).fetchone()
+    if network is None or connection.execute(
+            "SELECT 1 FROM network_memberships WHERE network_id=%s AND user_id=%s AND role='NETWORK_OWNER' FOR SHARE",
+            (network_id, session["user_id"])).fetchone() is None:
+        raise HTTPException(403, detail={"code": "NETWORK_ACCESS_DENIED"})
+    shops = connection.execute("""SELECT id,name FROM coffee_shops
+        WHERE network_id=%s AND is_active IS TRUE ORDER BY id FOR NO KEY UPDATE""", (network_id,)).fetchall()
+    if not shops:
+        raise HTTPException(409, detail={"code": "NETWORK_HAS_NO_ACTIVE_SHOPS"})
+    preview = connection.execute("SELECT * FROM admin_broadcast_previews WHERE token_hash=%s FOR UPDATE",
+                                 (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+    if preview is None:
+        raise HTTPException(404, detail={"code": "PREVIEW_NOT_FOUND"})
+    if (preview["network_id"] != network_id or preview["owner_user_id"] != session["user_id"]
+            or preview["session_id"] != session["session_id"]):
+        raise HTTPException(403, detail={"code": "PREVIEW_CONTEXT_MISMATCH"})
+    if preview["used_at"] is not None:
+        raise HTTPException(409, detail={"code": "BROADCAST_ALREADY_USED"})
+    if preview["invalidated_at"] is not None:
+        raise HTTPException(409, detail={"code": "PREVIEW_STALE"})
+    if not connection.execute("SELECT %s>clock_timestamp() AS valid", (preview["expires_at"],)).fetchone()["valid"]:
+        raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
+    recipients = get_network_broadcast_recipients(network_id, connection=connection)
+    if recipient_hash(recipients) != preview["recipients_hash"]:
+        raise HTTPException(409, detail={"code": "PREVIEW_STALE"})
+    if not can_send_network_broadcast(network_id, connection=connection):
+        raise HTTPException(429, detail={"code": "BROADCAST_LIMIT_REACHED"})
+    media = ({"kind": preview["media_kind"], "filename": preview["media_filename"],
+              "mime_type": preview["media_mime"], "bytes": bytes(preview["media_bytes"])}
+             if preview["media_kind"] is not None and preview["media_bytes"] is not None else None)
+    if preview["media_kind"] is not None and media is None:
+        raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
+    broadcast = publication.publish(connection, preview["shop_id"], session["user_id"],
+                                    preview["text"], recipients, media,
+                                    scope="NETWORK", network_id=network_id)
+    claimed = connection.execute("""UPDATE admin_broadcast_previews SET used_at=clock_timestamp(),media_bytes=NULL
+        WHERE token_hash=%s AND expires_at>clock_timestamp() RETURNING token_hash""", (preview["token_hash"],)).fetchone()
+    if claimed is None:
+        raise HTTPException(409, detail={"code": "PREVIEW_EXPIRED"})
+    return {"broadcast_id": broadcast["id"], "shop_id": preview["shop_id"],
+            "shop_name": network["name"], "network_id": network_id, "scope": "NETWORK",
+            "text": preview["text"], "recipients": recipients, "media": media}
 
 
 def preview_limits(session, shop, connection):

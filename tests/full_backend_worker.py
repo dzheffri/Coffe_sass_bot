@@ -111,7 +111,14 @@ def worker(source, phase, schema, audit_root):
         query("""CREATE TABLE IF NOT EXISTS shop_news (
             id BIGSERIAL PRIMARY KEY, shop_id BIGINT REFERENCES coffee_shops(id) ON DELETE CASCADE,
             title TEXT DEFAULT '', price TEXT DEFAULT '', image_url TEXT DEFAULT '',
-            sort_order INTEGER DEFAULT 0)""")
+            sort_order INTEGER DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        # Existing legacy Web moderation schema is query-managed, rather than
+        # created by db.init_db. Reproduce it before its additive sender migration.
+        query("""CREATE TABLE IF NOT EXISTS shop_change_requests (
+            id BIGSERIAL PRIMARY KEY,shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
+            submitted_by_telegram_id BIGINT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',
+            payload JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reviewed_at TIMESTAMPTZ,reviewed_by_telegram_id BIGINT,reject_reason TEXT)""")
         query("""INSERT INTO users(id,telegram_user_id,username,full_name,personal_qr_token)
             VALUES (1,71001,'owner','Local owner','local-owner-qr'),
                    (2,71002,'attacker','Local attacker','local-attacker-qr'),
@@ -365,6 +372,7 @@ def _security_scenarios(main, db, client, query, auth, state, report):
     _real_native_admin_tools(db, client, query, auth, jwt, report)
     _real_consumer_broadcast_inbox(main, db, client, query, auth, report)
     _real_bot_regressions(main, db, client, query, auth, jwt, report)
+    _real_owner_onboarding_web_and_telegram(main, db, client, query, auth, jwt, report)
 
 
 def _real_owner_analytics_security(
@@ -545,11 +553,15 @@ def _real_native_admin_tools(db, client, query, auth, jwt, report):
     memberless_body = {"provider": "google", "id_token": jwt("native-guest", barista=True)}
     before = query("SELECT COUNT(*) AS n FROM app_sessions")[0]["n"]
     response = client.post("/barista/auth/identity", json=memberless_body)
-    assert response.status_code == 403 and response.json()["detail"]["code"] == "NEEDS_INVITE"
-    assert query("SELECT COUNT(*) AS n FROM app_sessions")[0]["n"] == before
+    assert response.status_code == 200 and response.json()["needs_owner_claim"] is True
+    assert response.json()["session"]["purpose"] == "barista_onboarding"
+    assert query("SELECT COUNT(*) AS n FROM app_sessions")[0]["n"] == before + 1
+    assert client.post("/barista/owner/invites", headers=auth(response.json()["access_token"]), json={}).status_code == 401
     unknown = client.post("/barista/auth/identity", json={
         "provider": "google", "id_token": jwt("native-not-linked", barista=True)})
-    assert unknown.status_code == 403 and unknown.json()["detail"]["code"] == "IDENTITY_NOT_LINKED"
+    assert unknown.status_code == 200 and unknown.json()["needs_owner_claim"] is True
+    assert unknown.json()["selected_context"] is None
+    assert db.get_app_session(unknown.json()["access_token"]) is None
     assert client.post("/barista/owner/invites", headers=auth(admin), json={}).status_code == 403
     created = client.post("/barista/owner/invites", headers=auth(owner), json={})
     assert created.status_code == 201, created.text
@@ -760,6 +772,126 @@ def _real_bot_regressions(main, db, client, query, auth, jwt, report):
     confirm(merge_token, 71007)
     assert query("SELECT cups,free_coffee_balance FROM shop_clients WHERE shop_id=1 AND user_id=7")[0] == balance
     report["real_bot_existing_merge_preserves_balance_and_revokes_source"] = True
+
+
+def _real_owner_onboarding_web_and_telegram(main, db, client, query, auth, jwt, report):
+    """Actual new-owner routes, old moderation writer and trusted bot merge."""
+    from app.handlers import common
+
+    os.environ["BARISTA_LOGIN_ENABLED"] = "true"
+    os.environ["BARISTA_INVITE_PEPPER"] = "offline-isolated-invites-only-secret-32bytes-minimum"
+    superadmin_id = query("""INSERT INTO users(telegram_user_id,full_name,personal_qr_token)
+        VALUES(566408696,'Local onboarding reviewer','local-onboarding-reviewer-qr') RETURNING id""")[0]["id"]
+    query("INSERT INTO user_identities(user_id,provider,provider_user_id) VALUES(%s,'telegram','566408696')", (superadmin_id,))
+    superadmin = db.create_app_session(superadmin_id)
+    created = client.post("/superadmin/shops", headers=auth(superadmin), json={
+        "name": "Local native-owned cafe", "city": "Київ", "subtitle": "Before moderation"})
+    assert created.status_code == 201, created.text
+    shop_id = created.json()["shop"]["shop_id"]
+    assert created.json()["shop"]["owner_connected"] is False
+    issued = client.post(f"/superadmin/shops/{shop_id}/owner-invite", headers=auth(superadmin), json={})
+    assert issued.status_code == 201, issued.text
+    identity_body = {"provider": "google", "id_token": jwt("new-native-owner-without-telegram", barista=True)}
+    onboard = client.post("/barista/auth/identity", json=identity_body)
+    assert onboard.status_code == 200 and onboard.json()["needs_owner_claim"] is True
+    owner_id = onboard.json()["employee"]["user_id"]
+    claimed = client.post("/barista/auth/claim-owner", headers=auth(onboard.json()["access_token"]),
+                          json={"invite_code": issued.json()["invite"]["code"]})
+    assert claimed.status_code == 200, claimed.text
+    native = claimed.json()["access_token"]
+    assert claimed.json()["selected_context"]["role"] == "owner"
+    membership_id = claimed.json()["selected_context"]["membership_id"]
+    assert claimed.json()["employee"]["telegram_user_id"] is None
+    assert client.post("/barista/auth/identity", json=identity_body).json()["selected_context"]["membership_id"] == membership_id
+
+    started = client.post("/auth/admin-web-login/start", json={})
+    assert started.status_code == 201, started.text
+    pairing = started.json()
+    inspected = client.post("/barista/web-login/inspect", headers=auth(native), json={"code_or_token": pairing["code"]})
+    assert inspected.status_code == 200, inspected.text
+    confirmed = client.post("/barista/web-login/confirm", headers=auth(native), json={"code_or_token": pairing["request_token"]})
+    assert confirmed.status_code == 200, confirmed.text
+    browser = client.post("/auth/admin-web-login/poll", json={
+        "request_token": pairing["request_token"], "poll_token": pairing["poll_token"]})
+    assert browser.status_code == 200 and browser.json()["status"] == "approved", browser.text
+    web = browser.json()["access_token"]
+    assert browser.json()["actor"] == {"user_id": owner_id, "role": "owner"}
+    assert client.get("/admin-web/shop", headers=auth(web)).json()["shop"]["owner_telegram_id"] is None
+    changes = {"name": "Local approved native cafe", "subtitle": "Approved without Telegram",
+               "address": "вул. Кавова, 7", "work_from": "08:00", "work_to": "21:00",
+               "instagram": "@local_only", "description": "Local moderation fixture",
+               "logo_url": "/uploads/local-logo.png", "cover_url": "/uploads/local-cover.png",
+               "news": [{"title": "Локальна новина", "price": "95 грн", "image_url": "/uploads/local-news.png"}]}
+    submitted = client.post("/admin-web/shop/submit-changes", headers=auth(web), json=changes)
+    assert submitted.status_code == 200, submitted.text
+    request_id = submitted.json()["request_id"]
+    request_row = query("SELECT * FROM shop_change_requests WHERE id=%s", (request_id,))[0]
+    assert request_row["submitted_by_user_id"] == owner_id and request_row["submitted_by_telegram_id"] is None
+    assert client.post(f"/superadmin/moderation/{request_id}/approve", headers=auth(web)).status_code == 401
+    approved = client.post(f"/superadmin/moderation/{request_id}/approve", headers=auth(superadmin))
+    assert approved.status_code == 200, approved.text
+    persisted = query("SELECT name,subtitle,address,description FROM coffee_shops WHERE id=%s", (shop_id,))[0]
+    assert persisted == {key: changes[key] for key in persisted}
+    assert query("SELECT title,price,image_url FROM shop_news WHERE shop_id=%s", (shop_id,)) == changes["news"]
+    assert query("SELECT status FROM shop_change_requests WHERE id=%s", (request_id,))[0]["status"] == "approved"
+    assert query("SELECT telegram_user_id FROM users WHERE id=%s", (owner_id,))[0]["telegram_user_id"] is None
+    report["real_native_owner_web_moderation_without_telegram"] = True
+
+    # The existing Telegram profile contains its own client history and a
+    # duplicate staff membership. The native owner's ID and OWNER row must win.
+    telegram_id = 71990
+    source_id = query("""INSERT INTO users(telegram_user_id,full_name,personal_qr_token)
+        VALUES(%s,'Local existing Telegram profile','local-admin-link-source-qr') RETURNING id""", (telegram_id,))[0]["id"]
+    query("INSERT INTO user_identities(user_id,provider,provider_user_id) VALUES(%s,'telegram',%s)", (source_id, str(telegram_id)))
+    query("INSERT INTO shop_admins(shop_id,user_id,role) VALUES(%s,%s,'admin')", (shop_id, source_id))
+    query("""INSERT INTO shop_clients(shop_id,user_id,cups,free_coffee_balance,total_scans)
+        VALUES(%s,%s,2,1,7),(%s,%s,5,2,13)""", (shop_id, owner_id, shop_id, source_id))
+    transaction_id = query("""INSERT INTO transactions(shop_id,user_id,admin_user_id,type,cups_added)
+        VALUES(%s,%s,%s,'add_cups',5) RETURNING id""", (shop_id, source_id, owner_id))[0]["id"]
+    source_token = db.create_app_session(source_id)
+    link = client.post("/barista/telegram-link/start", headers=auth(native), json={})
+    assert link.status_code == 201, link.text
+    token = link.json()["token"]
+
+    def message(actor):
+        return SimpleNamespace(from_user=SimpleNamespace(id=actor,username="offline",full_name="Offline actor"),
+            chat=SimpleNamespace(id=actor,type="private"),answer=AsyncMock(),edit_text=AsyncMock())
+
+    incoming = message(telegram_id)
+    asyncio.run(common.start_handler(incoming,SimpleNamespace(args="link_"+token),SimpleNamespace(set_state=AsyncMock())))
+    incoming.answer.assert_awaited_once()
+    assert "Наші Admin" in incoming.answer.await_args.args[0]
+    assert client.get(f"/barista/telegram-link/status/{token}", headers=auth(native)).json()["status"] == "pending"
+    callback = SimpleNamespace(data="tg_link_confirm:"+token,from_user=SimpleNamespace(id=telegram_id),
+                               message=message(telegram_id),answer=AsyncMock())
+    asyncio.run(common.confirm_telegram_link(callback))
+    callback.message.edit_text.assert_awaited_once()
+    assert "Наші Admin" in callback.message.edit_text.await_args.args[0]
+    status = client.get(f"/barista/telegram-link/status/{token}", headers=auth(native))
+    assert status.status_code == 200 and status.json()["status"] == "linked", status.text
+    assert status.json()["telegram_user_id"] == telegram_id
+    public_status = client.get(f"/auth/telegram-link/status/{token}")
+    assert public_status.status_code == 200 and public_status.json()["status"] == "not_found"
+    assert "user_id" not in public_status.json() and "telegram_user_id" not in public_status.json()
+    assert db.get_user_by_identity("google", "new-native-owner-without-telegram")["id"] == owner_id
+    assert db.get_user_by_identity("telegram", str(telegram_id))["id"] == owner_id
+    assert query("SELECT id FROM users WHERE id=%s", (source_id,)) == []
+    assert db.get_app_session(source_token) is None
+    assert query("SELECT id,user_id,role FROM shop_admins WHERE shop_id=%s", (shop_id,)) == [
+        {"id": membership_id, "user_id": owner_id, "role": "owner"}]
+    balance = {"cups": 0, "free_coffee_balance": 4, "total_scans": 20}
+    assert query("SELECT cups,free_coffee_balance,total_scans FROM shop_clients WHERE shop_id=%s AND user_id=%s", (shop_id,owner_id))[0] == balance
+    assert query("SELECT user_id,admin_user_id FROM transactions WHERE id=%s", (transaction_id,))[0] == {
+        "user_id": owner_id, "admin_user_id": owner_id}
+    bot_owner = db.get_admin_shop_and_role(telegram_id)
+    assert bot_owner["id"] == shop_id and bot_owner["role"] == "owner" and db.is_owner(telegram_id)
+    assert client.get("/barista/me", headers=auth(native)).json()["employee"]["telegram_user_id"] == telegram_id
+    assert client.get("/admin-web/shop", headers=auth(web)).status_code == 200
+    # Replay must return the same receipt without merging/debiting a second time.
+    asyncio.run(common.confirm_telegram_link(callback))
+    assert query("SELECT cups,free_coffee_balance,total_scans FROM shop_clients WHERE shop_id=%s AND user_id=%s", (shop_id,owner_id))[0] == balance
+    report["real_admin_telegram_merge_preserves_owner_identity_history_and_bot_role"] = True
+    os.environ["BARISTA_LOGIN_ENABLED"] = "false"
 
 
 if __name__ == "__main__":

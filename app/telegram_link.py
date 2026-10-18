@@ -33,13 +33,16 @@ def _actor_matches(session: dict, telegram_id: int) -> bool:
 
 
 def _confirmed_response(session: dict) -> dict:
-    return {
+    response = {
         "ok": True,
         "status": "confirmed",
         "user_id": session["user_id"],
         "telegram_user_id": session["telegram_user_id"],
         "personal_qr_token": session["personal_qr_token"],
     }
+    if session.get("mode") == "admin_link":
+        response["admin_link"] = True
+    return response
 
 
 def bind_telegram_link_session(token: str, telegram_id: int) -> dict:
@@ -79,7 +82,10 @@ def bind_telegram_link_session(token: str, telegram_id: int) -> dict:
                     SET telegram_user_id = %s
                     WHERE token_hash = %s
                 """, (telegram_id, token_hash))
-                return {"ok": True, "status": "pending"}
+                response = {"ok": True, "status": "pending"}
+                if session.get("mode") == "admin_link":
+                    response["admin_link"] = True
+                return response
 
 
 def confirm_telegram_link_session(token: str, telegram_id: int) -> dict:
@@ -109,6 +115,10 @@ def confirm_telegram_link_session(token: str, telegram_id: int) -> dict:
                     return _failure("not_found", "Сесію не знайдено")
                 if datetime.now(timezone.utc) >= session["expires_at"]:
                     return _failure("expired", "Час підтвердження завершився")
+
+                if session["mode"] == "admin_link":
+                    from app.admin_telegram_link import confirm_admin_link
+                    return confirm_admin_link(conn, session, telegram_id)
 
                 telegram_user = get_user_by_identity("telegram", str(telegram_id))
                 if not telegram_user:

@@ -125,6 +125,16 @@ def full_backend_audit(local_connection):
                 expires_at,last_used_at,revoked_at FROM app_sessions ORDER BY id""").fetchall()
             assert json.loads(json.dumps(after_repeat, default=str)) == before
         report["online_migration_preserves_exact_legacy_state_and_repeats"] = True
+        # These extensions intentionally widen the old session purpose checks.
+        # Re-run historical migrations before, then independently repeat the
+        # extensions without asking the old rollout guard to accept new schema.
+        for filename in ("20261017_owner_onboarding.sql", "20261017_admin_web_login.sql"):
+            migration(filename)
+            migration(filename)
+        with connect() as conn:
+            extended = conn.execute("""SELECT id,user_id,token_hash,created_at,
+                expires_at,last_used_at,revoked_at FROM app_sessions ORDER BY id""").fetchall()
+            assert json.loads(json.dumps(extended, default=str)) == before
         worker(old, "legacy_post_migration")
         worker(PROJECT, "current_security")
         worker(old, "legacy_after_issuance")
@@ -158,6 +168,8 @@ def full_backend_audit(local_connection):
     "unmodified_old_backend_rejects_barista",
     "real_bot_private_actor_binding_and_confirmation",
     "real_bot_existing_merge_preserves_balance_and_revokes_source",
+    "real_native_owner_web_moderation_without_telegram",
+    "real_admin_telegram_merge_preserves_owner_identity_history_and_bot_role",
 ])
 def test_full_real_backend_security_and_rollout(full_backend_audit, check):
     assert full_backend_audit[check] is True

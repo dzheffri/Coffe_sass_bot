@@ -19,7 +19,9 @@ def test_closed_shop_hidden_from_client_discovery_without_deleting_balances(oper
     app = FastAPI()
     namespace = {"app": app, "get_connection": db.db.get_connection,
                  "get_shop_profile": lambda owner_id: {"ok": False}}
-    extract_definitions(PROJECT / "app/api/main.py", {"all_shops", "account_shops", "user_shops"}, namespace)
+    extract_definitions(PROJECT / "app/api/main.py", {
+        "all_shops", "account_shops", "user_shops", "_user_shop_loyalty_rows",
+    }, namespace)
     with TestClient(app) as client:
         for path in ("/shops", "/account/1/shops", "/users/1001/shops"):
             response = client.get(path)

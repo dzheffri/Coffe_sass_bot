@@ -5,6 +5,8 @@ from typing import Callable, Literal
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 from psycopg.errors import UndefinedTable
+from app.barista_sessions import BaristaSessionError
+from app.owner_onboarding import claim_invite
 
 from app.admin_invites import (
     InviteError, accept_invite, create_invite, list_invites, revoke_invite,
@@ -22,6 +24,13 @@ class AcceptInviteRequest(BaseModel):
 
 
 class CreateInviteRequest(BaseModel):
+    class Config:
+        extra = "forbid"
+
+
+class ClaimInviteRequest(BaseModel):
+    invite_code: str = Field(strict=True, pattern=r"^[0-9]{6}$")
+
     class Config:
         extra = "forbid"
 
@@ -45,6 +54,19 @@ def build_invite_router(*, authorize: Callable, parse_bearer: Callable,
                         verify_identity: Callable, me_response: Callable) -> APIRouter:
     # The parent router supplies /barista. No independent auth/session mechanism.
     router = APIRouter()
+
+    @router.post("/auth/claim-owner")
+    @router.post("/auth/claim-invite")
+    def claim(body: ClaimInviteRequest, authorization: str | None = Header(default=None)):
+        try:
+            token, session = claim_invite(token=parse_bearer(authorization), code=body.invite_code)
+        except InviteError as exc:
+            raise _http_error(exc) from exc
+        except BaristaSessionError as exc:
+            raise HTTPException(401, detail={"code": exc.code}, headers={"WWW-Authenticate": "Bearer"}) from exc
+        except UndefinedTable as exc:
+            raise HTTPException(503, detail={"code": "INVITES_NOT_CONFIGURED"}) from exc
+        return {"access_token": token, "token_type": "bearer", **me_response(session)}
 
     @router.post("/auth/accept-invite")
     def accept(body: AcceptInviteRequest):

@@ -77,9 +77,12 @@ from app.wallet_pass import (
 from app.wallet_push import send_wallet_pushes
 from app.app_push import send_app_pushes
 from app.api.barista import build_barista_router
+from app.api.admin_web import build_admin_web_router
 from app.api.sales import build_sales_router
 from app.api.broadcasts import build_broadcast_inbox_router
 from app.api.community import build_community_router
+from app.api.shop_onboarding import build_shop_onboarding_router, owner_metadata
+from app.api.networks import build_superadmin_network_router
 from app.telegram_link import confirm_telegram_link_session
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = "/data/uploads"
@@ -366,6 +369,9 @@ def require_superadmin(
 
     return current_user
 
+app.include_router(build_shop_onboarding_router(require_superadmin=require_superadmin))
+app.include_router(build_superadmin_network_router(require_superadmin=require_superadmin))
+
 app.include_router(build_sales_router(
     verify_actor=get_verified_telegram_actor,
     superadmin_telegram_ids=SUPERADMIN_TELEGRAM_IDS,
@@ -590,6 +596,17 @@ app.include_router(build_barista_router(
     parse_bearer=_get_bearer_token_or_401,
 ))
 
+app.include_router(build_admin_web_router(
+    parse_bearer=_get_bearer_token_or_401,
+    bot_username=lambda: (os.getenv("TELEGRAM_BOT_USERNAME") or "forYouMeCoffeBot").strip().lstrip("@"),
+    shop_model=UpdateShopRequest,
+    reminder_model=ReminderSettingsRequest,
+    analytics_functions={
+        "overview": get_owner_overview_stats, "activity": get_owner_activity_stats,
+        "clients": get_owner_clients, "details": get_owner_details_stats,
+    },
+))
+
 
 def validate_telegram_init_data(init_data: str, max_age_seconds: int = 86400):
     if not init_data:
@@ -749,29 +766,9 @@ def account_qr(user_id: int):
 def user_shops(telegram_user_id: int):
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    cs.id AS shop_id,
-                    cs.name AS db_shop_name,
-                    cs.city AS city,
-                    sc.cups,
-                    sc.free_coffee_balance,
-                    sc.last_activity_at,
-                    owner.telegram_user_id AS owner_telegram_id
-                FROM shop_clients sc
-                JOIN users client ON client.id = sc.user_id
-                JOIN coffee_shops cs ON cs.id = sc.shop_id
-                LEFT JOIN shop_admins sa
-                    ON sa.shop_id = cs.id AND sa.role = 'owner'
-                LEFT JOIN users owner
-                    ON owner.id = sa.user_id
-                WHERE client.telegram_user_id = %s AND cs.is_active
-                ORDER BY sc.last_activity_at DESC NULLS LAST, cs.name
-                """,
-                (telegram_user_id,)
-            )
-            rows = cur.fetchall()
+            cur.execute("SELECT id FROM users WHERE telegram_user_id=%s", (telegram_user_id,))
+            user = cur.fetchone()
+            rows = _user_shop_loyalty_rows(conn, user["id"]) if user else []
 
     shops = []
 
@@ -816,31 +813,7 @@ def user_shops(telegram_user_id: int):
 @app.get("/account/{user_id}/shops")
 def account_shops(user_id: int):
     with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    cs.id AS shop_id,
-                    cs.name AS db_shop_name,
-                    cs.city AS city,
-                    sc.cups,
-                    sc.free_coffee_balance,
-                    sc.last_activity_at,
-                    owner.telegram_user_id AS owner_telegram_id
-                FROM shop_clients sc
-                JOIN users client ON client.id = sc.user_id
-                JOIN coffee_shops cs ON cs.id = sc.shop_id
-                LEFT JOIN shop_admins sa
-                    ON sa.shop_id = cs.id AND sa.role = 'owner'
-                LEFT JOIN users owner
-                    ON owner.id = sa.user_id
-                WHERE client.id = %s AND cs.is_active
-                ORDER BY sc.last_activity_at DESC NULLS LAST, cs.name
-                """,
-                (user_id,)
-            )
-
-            rows = cur.fetchall()
+        rows = _user_shop_loyalty_rows(conn, user_id)
 
     shops = []
 
@@ -881,22 +854,64 @@ def account_shops(user_id: int):
         "ok": True,
         "shops": shops,
     }
+
+
+def _user_shop_loyalty_rows(connection, user_id: int):
+    """Return the unchanged per-shop payload, projecting SHARED balances per location."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT to_regclass('coffee_networks') AS networks")
+        networks_enabled = cur.fetchone()["networks"] is not None
+        if networks_enabled:
+            cur.execute("""SELECT cs.id AS shop_id,cs.name AS db_shop_name,cs.city,
+                CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.cups,0) ELSE COALESCE(sc.cups,0) END AS cups,
+                CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.free_coffee_balance,0)
+                     ELSE COALESCE(sc.free_coffee_balance,0) END AS free_coffee_balance,
+                COALESCE(sc.last_activity_at,ncl.last_activity_at) AS last_activity_at,
+                owner.telegram_user_id AS owner_telegram_id
+                FROM coffee_shops cs
+                LEFT JOIN shop_clients sc ON sc.shop_id=cs.id AND sc.user_id=%s
+                LEFT JOIN coffee_networks n ON n.id=cs.network_id
+                LEFT JOIN network_client_loyalty ncl ON ncl.network_id=cs.network_id AND ncl.user_id=%s
+                LEFT JOIN shop_admins sa ON sa.shop_id=cs.id AND sa.role='owner'
+                LEFT JOIN users owner ON owner.id=sa.user_id
+                WHERE cs.is_active IS TRUE AND (sc.id IS NOT NULL OR
+                    (n.loyalty_mode='SHARED' AND ncl.id IS NOT NULL))
+                ORDER BY COALESCE(sc.last_activity_at,ncl.last_activity_at) DESC NULLS LAST,cs.name""",
+                (user_id, user_id))
+        else:
+            cur.execute("""SELECT cs.id AS shop_id,cs.name AS db_shop_name,cs.city,
+                sc.cups,sc.free_coffee_balance,sc.last_activity_at,owner.telegram_user_id AS owner_telegram_id
+                FROM shop_clients sc JOIN coffee_shops cs ON cs.id=sc.shop_id
+                LEFT JOIN shop_admins sa ON sa.shop_id=cs.id AND sa.role='owner'
+                LEFT JOIN users owner ON owner.id=sa.user_id
+                WHERE sc.user_id=%s AND cs.is_active IS TRUE
+                ORDER BY sc.last_activity_at DESC NULLS LAST,cs.name""", (user_id,))
+        return cur.fetchall()
+
+
 @app.get("/users/{telegram_user_id}/stats")
 def user_stats(telegram_user_id: int):
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    COALESCE(SUM(sc.total_scans), 0) AS total_cups,
-                    COALESCE(SUM(sc.free_coffee_balance), 0) AS total_free,
-                    COUNT(sc.id) AS shops_count
-                FROM shop_clients sc
-                JOIN users u ON u.id = sc.user_id
-                WHERE u.telegram_user_id = %s
-                """,
-                (telegram_user_id,)
-            )
+            cur.execute("SELECT id FROM users WHERE telegram_user_id=%s", (telegram_user_id,))
+            user = cur.fetchone()
+            if user:
+                cur.execute("SELECT to_regclass('coffee_networks') AS networks")
+                if cur.fetchone()["networks"] is not None:
+                    cur.execute("""SELECT COALESCE(SUM(sc.total_scans),0) AS total_cups,
+                        COALESCE(SUM(CASE WHEN n.loyalty_mode='SHARED' THEN 0
+                            ELSE sc.free_coffee_balance END),0)+
+                        COALESCE((SELECT SUM(free_coffee_balance) FROM network_client_loyalty
+                            WHERE user_id=%s),0) AS total_free,COUNT(sc.id) AS shops_count
+                        FROM shop_clients sc JOIN coffee_shops cs ON cs.id=sc.shop_id
+                        LEFT JOIN coffee_networks n ON n.id=cs.network_id WHERE sc.user_id=%s""",
+                        (user["id"], user["id"]))
+                else:
+                    cur.execute("""SELECT COALESCE(SUM(sc.total_scans),0) AS total_cups,
+                        COALESCE(SUM(sc.free_coffee_balance),0) AS total_free,COUNT(sc.id) AS shops_count
+                        FROM shop_clients sc WHERE sc.user_id=%s""", (user["id"],))
+            else:
+                cur.execute("SELECT 0 AS total_cups,0 AS total_free,0 AS shops_count")
 
             row = cur.fetchone()
 
@@ -911,17 +926,18 @@ def user_stats(telegram_user_id: int):
 def account_stats(user_id: int):
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    COALESCE(SUM(sc.total_scans), 0) AS total_cups,
-                    COALESCE(SUM(sc.free_coffee_balance), 0) AS total_free,
-                    COUNT(sc.id) AS shops_count
-                FROM shop_clients sc
-                WHERE sc.user_id = %s
-                """,
-                (user_id,)
-            )
+            cur.execute("SELECT to_regclass('coffee_networks') AS networks")
+            if cur.fetchone()["networks"] is not None:
+                cur.execute("""SELECT COALESCE(SUM(sc.total_scans),0) AS total_cups,
+                    COALESCE(SUM(CASE WHEN n.loyalty_mode='SHARED' THEN 0 ELSE sc.free_coffee_balance END),0)+
+                    COALESCE((SELECT SUM(free_coffee_balance) FROM network_client_loyalty WHERE user_id=%s),0) AS total_free,
+                    COUNT(sc.id) AS shops_count FROM shop_clients sc
+                    LEFT JOIN coffee_shops cs ON cs.id=sc.shop_id
+                    LEFT JOIN coffee_networks n ON n.id=cs.network_id WHERE sc.user_id=%s""", (user_id,user_id))
+            else:
+                cur.execute("""SELECT COALESCE(SUM(sc.total_scans),0) AS total_cups,
+                    COALESCE(SUM(sc.free_coffee_balance),0) AS total_free,COUNT(sc.id) AS shops_count
+                    FROM shop_clients sc WHERE sc.user_id=%s""", (user_id,))
 
             row = cur.fetchone()
 
@@ -1404,6 +1420,7 @@ def telegram_link_status(token: str):
                     expires_at
                 FROM telegram_link_sessions
                 WHERE token_hash = %s
+                  AND mode <> 'admin_link'
                 LIMIT 1
                 """,
                 (token_hash,),
@@ -2811,7 +2828,8 @@ async def superadmin_approve_request(
                     scr.shop_id,
                     scr.status,
                     scr.payload,
-                    owner.telegram_user_id AS owner_telegram_id
+                    owner.telegram_user_id AS owner_telegram_id,
+                    sa.user_id AS owner_user_id
                 FROM shop_change_requests scr
 
                 LEFT JOIN shop_admins sa
@@ -2845,7 +2863,7 @@ async def superadmin_approve_request(
         "owner_telegram_id"
     ]
 
-    if not owner_telegram_id:
+    if not owner_telegram_id and not request_row.get("owner_user_id"):
         raise HTTPException(
             status_code=400,
             detail="Власника кавʼярні не знайдено",
@@ -2857,6 +2875,7 @@ async def superadmin_approve_request(
 
     result = update_shop_profile(
         owner_telegram_id=owner_telegram_id,
+        authorized_shop_id=request_row["shop_id"],
         name=payload.get("name", ""),
         subtitle=payload.get("subtitle", ""),
         address=payload.get("address", ""),
@@ -3006,7 +3025,17 @@ def superadmin_get_shops(
                           AND sa.role = 'owner'
                         ORDER BY sa.id
                         LIMIT 1
-                    ) AS owner_telegram_id
+                    ) AS owner_telegram_id,
+                    (
+                        SELECT json_build_object(
+                            'user_id',u.id,
+                            'name',COALESCE(NULLIF(u.full_name,''),NULLIF(u.username,''),'Власник'),
+                            'telegram_connected',u.telegram_user_id IS NOT NULL OR EXISTS (
+                                SELECT 1 FROM user_identities ui WHERE ui.user_id=u.id AND ui.provider='telegram'
+                            ))
+                        FROM shop_admins sa JOIN users u ON u.id=sa.user_id
+                        WHERE sa.shop_id=cs.id AND sa.role='owner' ORDER BY sa.id LIMIT 1
+                    ) AS owner_info
 
                 FROM coffee_shops cs
                 ORDER BY cs.name ASC, cs.id ASC
@@ -3032,6 +3061,7 @@ def superadmin_get_shops(
                 "logo_url": row["logo_url"] or "",
                 "cover_url": row["cover_url"] or "",
                 "is_active": bool(row["is_active"]),
+                **owner_metadata(row),
                 "owner_telegram_id": (
                     row["owner_telegram_id"]
                     or row["pending_owner_telegram_id"]
@@ -3079,7 +3109,17 @@ def superadmin_get_shop(
                           AND sa.role = 'owner'
                         ORDER BY sa.id
                         LIMIT 1
-                    ) AS owner_telegram_id
+                    ) AS owner_telegram_id,
+                    (
+                        SELECT json_build_object(
+                            'user_id',u.id,
+                            'name',COALESCE(NULLIF(u.full_name,''),NULLIF(u.username,''),'Власник'),
+                            'telegram_connected',u.telegram_user_id IS NOT NULL OR EXISTS (
+                                SELECT 1 FROM user_identities ui WHERE ui.user_id=u.id AND ui.provider='telegram'
+                            ))
+                        FROM shop_admins sa JOIN users u ON u.id=sa.user_id
+                        WHERE sa.shop_id=cs.id AND sa.role='owner' ORDER BY sa.id LIMIT 1
+                    ) AS owner_info
 
                 FROM coffee_shops cs
                 WHERE cs.id = %s
@@ -3128,6 +3168,7 @@ def superadmin_get_shop(
             "logo_url": shop["logo_url"] or "",
             "cover_url": shop["cover_url"] or "",
             "is_active": bool(shop["is_active"]),
+            **owner_metadata(shop),
             "owner_telegram_id": (
                 shop["owner_telegram_id"]
                 or shop["pending_owner_telegram_id"]

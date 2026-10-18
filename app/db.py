@@ -436,7 +436,7 @@ def init_db():
 
                     purpose TEXT NOT NULL DEFAULT 'client'
                         CONSTRAINT app_sessions_purpose_check
-                        CHECK (purpose IN ('client', 'barista')),
+                        CHECK (purpose IN ('client', 'barista', 'barista_onboarding')),
                     selected_membership_id BIGINT NULL
                         CONSTRAINT app_sessions_selected_membership_fkey
                         REFERENCES shop_admins(id) ON DELETE CASCADE,
@@ -446,7 +446,7 @@ def init_db():
                     last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     revoked_at TIMESTAMPTZ NULL,
                     CONSTRAINT app_sessions_context_check CHECK (
-                        (purpose = 'client' AND selected_membership_id IS NULL)
+                        (purpose IN ('client', 'barista_onboarding') AND selected_membership_id IS NULL)
                         OR
                         (purpose = 'barista' AND selected_membership_id IS NOT NULL)
                     )
@@ -530,14 +530,14 @@ def create_app_session(
 
     В БД сохраняется только SHA-256 hash.
     """
-    if purpose not in ("client", "barista"):
+    if purpose not in ("client", "barista", "barista_onboarding"):
         raise ValueError("Unsupported session purpose")
-    if (purpose == "client") != (selected_membership_id is None):
+    if (purpose == "barista") != (selected_membership_id is not None):
         raise ValueError("Session context does not match its purpose")
 
     token = secrets.token_urlsafe(32)
     token_hash = (
-        _hash_barista_session_token(token) if purpose == "barista"
+        _hash_barista_session_token(token) if purpose in ("barista", "barista_onboarding")
         else _hash_app_session_token(token)
     )
     expires_at = utc_now() + timedelta(days=APP_SESSION_TTL_DAYS)
@@ -1302,6 +1302,50 @@ def merge_users(source_user_id: int, target_user_id: int):
                 source_user_id,
             ))
 
+            # Network membership is an independent authority source. Merge it
+            # by internal user_id, preserving one membership per network and
+            # combining shared balances before the source user is removed.
+            cur.execute("SELECT to_regclass('network_memberships') AS memberships")
+            if cur.fetchone()["memberships"] is not None:
+                cur.execute("""SELECT * FROM network_client_loyalty WHERE user_id=%s
+                    ORDER BY network_id FOR UPDATE""", (source_user_id,))
+                for source_balance in cur.fetchall():
+                    cur.execute("""SELECT * FROM network_client_loyalty
+                        WHERE network_id=%s AND user_id=%s FOR UPDATE""",
+                        (source_balance["network_id"], target_user_id))
+                    target_balance = cur.fetchone()
+                    if target_balance is None:
+                        cur.execute("UPDATE network_client_loyalty SET user_id=%s WHERE id=%s",
+                                    (target_user_id, source_balance["id"]))
+                        continue
+                    total_cups = target_balance["cups"] + source_balance["cups"]
+                    extra_free = total_cups // LOYALTY_TARGET
+                    latest = max((target_balance, source_balance), key=lambda item: item["last_activity_at"])
+                    cur.execute("""UPDATE network_client_loyalty SET cups=%s,
+                        free_coffee_balance=%s,total_scans=%s,total_free_coffee_earned=%s,
+                        total_free_coffee_redeemed=%s,last_shop_id=%s,last_activity_at=%s
+                        WHERE id=%s""", (
+                        total_cups % LOYALTY_TARGET,
+                        target_balance["free_coffee_balance"] + source_balance["free_coffee_balance"] + extra_free,
+                        target_balance["total_scans"] + source_balance["total_scans"],
+                        target_balance["total_free_coffee_earned"] + source_balance["total_free_coffee_earned"] + extra_free,
+                        target_balance["total_free_coffee_redeemed"] + source_balance["total_free_coffee_redeemed"],
+                        latest["last_shop_id"], latest["last_activity_at"], target_balance["id"],
+                    ))
+                    cur.execute("DELETE FROM network_client_loyalty WHERE id=%s", (source_balance["id"],))
+
+                cur.execute("""SELECT * FROM network_memberships WHERE user_id=%s
+                    ORDER BY network_id FOR UPDATE""", (source_user_id,))
+                for source_membership in cur.fetchall():
+                    target_membership = cur.execute("""SELECT id FROM network_memberships
+                        WHERE user_id=%s AND network_id=%s FOR UPDATE""",
+                        (target_user_id, source_membership["network_id"])).fetchone()
+                    if target_membership:
+                        cur.execute("DELETE FROM network_memberships WHERE id=%s", (source_membership["id"],))
+                    else:
+                        cur.execute("UPDATE network_memberships SET user_id=%s WHERE id=%s",
+                                    (target_user_id, source_membership["id"]))
+
             # Preserve inbox membership before deleting source. The schema is
             # rolled out separately, so pre-migration merges must still work.
             cur.execute("SELECT to_regclass('broadcast_recipients') AS recipients_table")
@@ -1755,14 +1799,28 @@ def get_owners_for_subscription_last_day():
 def get_user_shops(telegram_user_id: int):
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT cs.*, sc.cups, sc.free_coffee_balance, sc.last_activity_at
-                FROM shop_clients sc
-                JOIN users u ON u.id = sc.user_id
-                JOIN coffee_shops cs ON cs.id = sc.shop_id
-                WHERE u.telegram_user_id = %s AND cs.is_active
-                ORDER BY cs.name
-            """, (telegram_user_id,))
+            cur.execute("SELECT id FROM users WHERE telegram_user_id=%s", (telegram_user_id,))
+            user = cur.fetchone()
+            if not user:
+                return []
+            cur.execute("SELECT to_regclass('coffee_networks') AS networks")
+            if cur.fetchone()["networks"] is not None:
+                cur.execute("""SELECT cs.*,
+                    CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.cups,0) ELSE COALESCE(sc.cups,0) END AS cups,
+                    CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.free_coffee_balance,0)
+                         ELSE COALESCE(sc.free_coffee_balance,0) END AS free_coffee_balance,
+                    COALESCE(sc.last_activity_at,ncl.last_activity_at) AS last_activity_at
+                    FROM coffee_shops cs
+                    LEFT JOIN shop_clients sc ON sc.shop_id=cs.id AND sc.user_id=%s
+                    LEFT JOIN coffee_networks n ON n.id=cs.network_id
+                    LEFT JOIN network_client_loyalty ncl ON ncl.network_id=cs.network_id AND ncl.user_id=%s
+                    WHERE cs.is_active IS TRUE AND (sc.id IS NOT NULL OR
+                        (n.loyalty_mode='SHARED' AND ncl.id IS NOT NULL)) ORDER BY cs.name""",
+                    (user["id"], user["id"]))
+            else:
+                cur.execute("""SELECT cs.*,sc.cups,sc.free_coffee_balance,sc.last_activity_at
+                    FROM shop_clients sc JOIN coffee_shops cs ON cs.id=sc.shop_id
+                    WHERE sc.user_id=%s AND cs.is_active ORDER BY cs.name""", (user["id"],))
             return cur.fetchall()
 
 
@@ -1853,16 +1911,67 @@ def remove_shop_admin(shop_id: int, admin_telegram_user_id: int | None = None, *
 def get_admin_shop_and_role(admin_telegram_user_id: int):
     with get_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("""SELECT EXISTS(SELECT 1 FROM information_schema.columns
+                WHERE table_schema=current_schema() AND table_name='users'
+                  AND column_name='active_admin_shop_id') AS available""")
+            active_context = cur.fetchone()["available"]
+            order = "(u.active_admin_shop_id = cs.id) DESC NULLS LAST, sa.id" if active_context else "sa.id"
             cur.execute("""
                 SELECT cs.*, sa.role
                 FROM shop_admins sa
                 JOIN users u ON u.id = sa.user_id
                 JOIN coffee_shops cs ON cs.id = sa.shop_id
-                WHERE u.telegram_user_id = %s AND cs.is_active
-                ORDER BY sa.id
+                WHERE u.id = COALESCE(
+                    (SELECT ui.user_id FROM user_identities ui
+                     WHERE ui.provider='telegram' AND ui.provider_user_id=%s),
+                    (SELECT legacy.id FROM users legacy WHERE legacy.telegram_user_id=%s)
+                ) AND cs.is_active
+                ORDER BY """ + order + """
                 LIMIT 1
-            """, (admin_telegram_user_id,))
+            """, (str(admin_telegram_user_id), admin_telegram_user_id))
             return cur.fetchone()
+
+
+def get_admin_shops_for_telegram(admin_telegram_user_id: int):
+    """All currently active shop memberships for a Telegram-linked staff user."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT EXISTS(SELECT 1 FROM information_schema.columns
+                WHERE table_schema=current_schema() AND table_name='users'
+                  AND column_name='active_admin_shop_id') AS available""")
+            active_context = cur.fetchone()["available"]
+            order = "(u.active_admin_shop_id=cs.id) DESC NULLS LAST,sa.id" if active_context else "sa.id"
+            cur.execute("""SELECT cs.*,sa.role FROM shop_admins sa
+                JOIN users u ON u.id=sa.user_id JOIN coffee_shops cs ON cs.id=sa.shop_id
+                WHERE u.id=COALESCE(
+                    (SELECT ui.user_id FROM user_identities ui
+                     WHERE ui.provider='telegram' AND ui.provider_user_id=%s),
+                    (SELECT legacy.id FROM users legacy WHERE legacy.telegram_user_id=%s))
+                  AND cs.is_active IS TRUE AND sa.role IN ('owner','admin')
+                ORDER BY """ + order,
+                (str(admin_telegram_user_id), admin_telegram_user_id))
+            return cur.fetchall()
+
+
+def set_admin_active_shop(admin_telegram_user_id: int, shop_id: int) -> bool:
+    """Persist a Telegram staff point only if the internal user has that membership."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT EXISTS(SELECT 1 FROM information_schema.columns
+                WHERE table_schema=current_schema() AND table_name='users'
+                  AND column_name='active_admin_shop_id') AS available""")
+            if not cur.fetchone()["available"]:
+                return False
+            cur.execute("""UPDATE users u SET active_admin_shop_id=%s
+                WHERE u.id=COALESCE(
+                    (SELECT ui.user_id FROM user_identities ui
+                     WHERE ui.provider='telegram' AND ui.provider_user_id=%s),
+                    (SELECT legacy.id FROM users legacy WHERE legacy.telegram_user_id=%s))
+                  AND EXISTS(SELECT 1 FROM shop_admins sa JOIN coffee_shops cs ON cs.id=sa.shop_id
+                    WHERE sa.user_id=u.id AND sa.shop_id=%s AND sa.role IN ('owner','admin')
+                      AND cs.is_active IS TRUE)
+                RETURNING u.id""", (shop_id, str(admin_telegram_user_id), admin_telegram_user_id, shop_id))
+            return cur.fetchone() is not None
 
 
 def is_owner(admin_telegram_user_id: int):
@@ -1940,6 +2049,116 @@ def save_return_log(shop_id: int, user_id: int, touch_log_id: int, touch_type: s
             return cur.fetchone()
 
 
+def _shared_network_for_shop(connection, shop_id: int):
+    """Return the SHARED network id, while remaining compatible pre-migration."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT to_regclass('coffee_networks') AS networks")
+        if cur.fetchone()["networks"] is None:
+            return None
+        cur.execute("""SELECT cs.network_id FROM coffee_shops cs
+            JOIN coffee_networks n ON n.id=cs.network_id
+            WHERE cs.id=%s AND n.loyalty_mode='SHARED'""", (shop_id,))
+        row = cur.fetchone()
+        return row["network_id"] if row else None
+
+
+def _add_shared_network_cups(connection, network_id: int, shop_id: int,
+                              client_user_id: int, admin_user_id: int, count: int):
+    with connection.cursor() as cur:
+        cur.execute("""INSERT INTO network_client_loyalty(network_id,user_id,last_shop_id)
+            VALUES(%s,%s,%s) ON CONFLICT(network_id,user_id) DO NOTHING""",
+            (network_id, client_user_id, shop_id))
+        cur.execute("""SELECT * FROM network_client_loyalty
+            WHERE network_id=%s AND user_id=%s FOR UPDATE""", (network_id, client_user_id))
+        before = cur.fetchone()
+        total_cups = before["cups"] + count
+        earned_free = total_cups // LOYALTY_TARGET
+        remaining_cups = total_cups % LOYALTY_TARGET
+        cur.execute("""UPDATE network_client_loyalty
+            SET cups=%s,free_coffee_balance=free_coffee_balance+%s,
+                total_scans=total_scans+%s,total_free_coffee_earned=total_free_coffee_earned+%s,
+                last_shop_id=%s,last_activity_at=NOW()
+            WHERE id=%s RETURNING *""",
+            (remaining_cups, earned_free, count, earned_free, shop_id, before["id"]))
+        network_balance = cur.fetchone()
+        cur.execute("""INSERT INTO shop_clients(shop_id,user_id,cups,free_coffee_balance,
+                total_scans,total_free_coffee_earned,last_activity_at)
+            VALUES(%s,%s,0,0,%s,%s,NOW())
+            ON CONFLICT(shop_id,user_id) DO UPDATE SET
+                total_scans=shop_clients.total_scans+EXCLUDED.total_scans,
+                total_free_coffee_earned=shop_clients.total_free_coffee_earned+EXCLUDED.total_free_coffee_earned,
+                last_activity_at=NOW() RETURNING *""",
+            (shop_id, client_user_id, count, earned_free))
+        shop_client = cur.fetchone()
+
+        last_touch = get_last_marketing_touch(
+            shop_id=shop_id, user_id=client_user_id, days=7, connection=connection
+        )
+        cur.execute("""INSERT INTO transactions
+            (shop_id,user_id,admin_user_id,type,cups_added,free_redeemed)
+            VALUES(%s,%s,%s,'add_cups',%s,0)""",
+            (shop_id, client_user_id, admin_user_id, count))
+        cur.execute("""INSERT INTO touch_logs(user_id,shop_id,type)
+            VALUES(%s,%s,'service')""", (client_user_id, shop_id))
+        saved_return = None
+        if last_touch:
+            saved_return = save_return_log(
+                shop_id=shop_id, user_id=client_user_id,
+                touch_log_id=last_touch["id"], touch_type=last_touch["type"],
+                connection=connection,
+            )
+    return {
+        "shop_client": {**shop_client, "cups": network_balance["cups"],
+                        "free_coffee_balance": network_balance["free_coffee_balance"]},
+        "earned_free": earned_free,
+        "last_touch": last_touch,
+        "return_source": last_touch["type"] if saved_return else None,
+        "saved_return": saved_return,
+    }
+
+
+def _redeem_shared_network_free(connection, network_id: int, shop_id: int,
+                                client_user_id: int, admin_user_id: int):
+    with connection.cursor() as cur:
+        cur.execute("""SELECT * FROM network_client_loyalty
+            WHERE network_id=%s AND user_id=%s FOR UPDATE""", (network_id, client_user_id))
+        balance = cur.fetchone()
+        if balance is None:
+            cur.execute("""SELECT 1 FROM shop_clients sc JOIN coffee_shops cs ON cs.id=sc.shop_id
+                WHERE cs.network_id=%s AND sc.user_id=%s LIMIT 1""", (network_id, client_user_id))
+            return "EMPTY" if cur.fetchone() else "NOT_FOUND"
+        if balance["free_coffee_balance"] <= 0:
+            return "EMPTY"
+
+        last_touch = get_last_marketing_touch(
+            shop_id=shop_id, user_id=client_user_id, days=7, connection=connection
+        )
+        cur.execute("""UPDATE network_client_loyalty
+            SET free_coffee_balance=free_coffee_balance-1,
+                total_free_coffee_redeemed=total_free_coffee_redeemed+1,
+                last_shop_id=%s,last_activity_at=NOW()
+            WHERE id=%s RETURNING *""", (shop_id, balance["id"]))
+        updated_network = cur.fetchone()
+        cur.execute("""INSERT INTO shop_clients(shop_id,user_id,cups,free_coffee_balance,
+                total_free_coffee_redeemed,last_activity_at)
+            VALUES(%s,%s,0,0,1,NOW())
+            ON CONFLICT(shop_id,user_id) DO UPDATE SET
+                total_free_coffee_redeemed=shop_clients.total_free_coffee_redeemed+1,
+                last_activity_at=NOW() RETURNING *""", (shop_id, client_user_id))
+        shop_client = cur.fetchone()
+        cur.execute("""INSERT INTO transactions
+            (shop_id,user_id,admin_user_id,type,cups_added,free_redeemed)
+            VALUES(%s,%s,%s,'redeem_free',0,1)""", (shop_id, client_user_id, admin_user_id))
+        cur.execute("INSERT INTO touch_logs(user_id,shop_id,type) VALUES(%s,%s,'service')",
+                    (client_user_id, shop_id))
+        if last_touch:
+            save_return_log(shop_id=shop_id, user_id=client_user_id,
+                            touch_log_id=last_touch["id"], touch_type=last_touch["type"],
+                            connection=connection)
+    return {**shop_client, "cups": updated_network["cups"],
+            "free_coffee_balance": updated_network["free_coffee_balance"]}
+
+
 def add_cups_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: int, count: int, *, connection=None):
     if count <= 0:
         raise ValueError("count must be > 0")
@@ -1952,6 +2171,11 @@ def add_cups_for_shop_client(shop_id: int, client_user_id: int, admin_user_id: i
                 cur.execute("SELECT id FROM coffee_shops WHERE id=%s AND is_active FOR SHARE", (shop_id,))
                 if cur.fetchone() is None:
                     raise ValueError("SHOP_CLOSED")
+                shared_network_id = _shared_network_for_shop(conn, shop_id)
+                if shared_network_id is not None:
+                    return _add_shared_network_cups(
+                        conn, shared_network_id, shop_id, client_user_id, admin_user_id, count,
+                    )
                 cur.execute("""
                     SELECT *
                     FROM shop_clients
@@ -2042,6 +2266,11 @@ def redeem_free_for_shop_client(shop_id: int, client_user_id: int, admin_user_id
                 cur.execute("SELECT id FROM coffee_shops WHERE id=%s AND is_active FOR SHARE", (shop_id,))
                 if cur.fetchone() is None:
                     raise ValueError("SHOP_CLOSED")
+                shared_network_id = _shared_network_for_shop(conn, shop_id)
+                if shared_network_id is not None:
+                    return _redeem_shared_network_free(
+                        conn, shared_network_id, shop_id, client_user_id, admin_user_id,
+                    )
                 cur.execute("""
                     SELECT *
                     FROM shop_clients
@@ -2126,19 +2355,31 @@ def redeem_free_for_shop_client(shop_id: int, client_user_id: int, admin_user_id
 def get_shop_client_balance(shop_id: int, telegram_user_id: int):
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT sc.*, cs.name AS shop_name
-                FROM shop_clients sc
-                JOIN users u ON u.id = sc.user_id
-                JOIN coffee_shops cs ON cs.id = sc.shop_id
-                WHERE sc.shop_id = %s AND u.telegram_user_id = %s
-            """, (shop_id, telegram_user_id))
-            return cur.fetchone()
+            cur.execute("SELECT id FROM users WHERE telegram_user_id=%s", (telegram_user_id,))
+            user = cur.fetchone()
+        if user is None:
+            return None
+        return get_shop_client_balance_by_user_id(shop_id, user["id"], connection=conn)
 
 
 def get_shop_client_balance_by_user_id(shop_id: int, user_id: int, *, connection=None):
     with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('coffee_networks') AS networks")
+            if cur.fetchone()["networks"] is not None:
+                cur.execute("""SELECT sc.id,cs.id AS shop_id,sc.user_id,
+                    CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.cups,0) ELSE sc.cups END AS cups,
+                    CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.free_coffee_balance,0)
+                         ELSE sc.free_coffee_balance END AS free_coffee_balance,
+                    sc.total_scans,sc.total_free_coffee_earned,sc.total_free_coffee_redeemed,
+                    sc.created_at,sc.last_activity_at,cs.name AS shop_name
+                    FROM coffee_shops cs
+                    LEFT JOIN shop_clients sc ON sc.shop_id=cs.id AND sc.user_id=%s
+                    LEFT JOIN coffee_networks n ON n.id=cs.network_id
+                    LEFT JOIN network_client_loyalty ncl ON ncl.network_id=cs.network_id AND ncl.user_id=%s
+                    WHERE cs.id=%s AND (sc.id IS NOT NULL OR ncl.id IS NOT NULL)""",
+                    (user_id, user_id, shop_id))
+                return cur.fetchone()
             cur.execute("""
                 SELECT sc.*, cs.name AS shop_name
                 FROM shop_clients sc
@@ -2433,6 +2674,29 @@ def get_broadcast_recipients(shop_id: int, *, connection=None, all_clients: bool
                 ORDER BY u.telegram_user_id
             """, (shop_id, all_clients))
             return cur.fetchall()
+
+
+def get_network_broadcast_recipients(network_id: int, *, connection=None):
+    """Snapshot unique internal users across every active shop in a network."""
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT DISTINCT u.telegram_user_id,sc.user_id
+                FROM shop_clients sc JOIN users u ON u.id=sc.user_id
+                JOIN coffee_shops cs ON cs.id=sc.shop_id AND cs.is_active IS TRUE
+                WHERE cs.network_id=%s ORDER BY sc.user_id""", (network_id,))
+            return cur.fetchall()
+
+
+def can_send_network_broadcast(network_id: int, *, connection=None):
+    """Apply the existing eight-confirmed-broadcast weekly limit per network."""
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
+        with conn.cursor() as cur:
+            row = cur.execute("""SELECT EXISTS(SELECT 1 FROM coffee_shops
+                    WHERE network_id=%s AND is_active IS TRUE) AND
+                (SELECT COUNT(*) FROM broadcasts WHERE network_id=%s
+                    AND created_at>=NOW()-INTERVAL '7 days')<8 AS allowed""",
+                (network_id, network_id)).fetchone()
+            return bool(row and row["allowed"])
 
 
 def save_broadcast(shop_id: int, sender_telegram_user_id: int, text: str, recipients_count: int):

@@ -26,6 +26,8 @@ from app.db import (
 )
 from app.loyalty_notifications import notify_cups_added, notify_free_redeemed
 from app.account_deletion import account_deletion_state, delete_personal_account
+from app.owner_onboarding import create_onboarding_identity, resolve_onboarding_session
+from app.api.networks import build_barista_network_router
 
 
 logger = logging.getLogger(__name__)
@@ -111,17 +113,21 @@ def _me_response(session: dict) -> dict:
     selected = next(
         membership for membership in session["memberships"]
         if membership["membership_id"] == session["selected_membership_id"]
-    )
+    ) if session["selected_membership_id"] is not None else None
     return {
         "ok": True,
         "employee": {
             "user_id": session["user_id"],
             "name": session["full_name"] or session["username"] or "Бариста",
+            "telegram_user_id": session.get("telegram_user_id"),
         },
         "shops": session["memberships"],
+        "networks": session.get("networks", []),
         "selected_context": selected,
+        "onboarding_required": bool(session.get("onboarding_required")),
+        "needs_owner_claim": bool(session.get("onboarding_required")),
         "session": {
-            "purpose": "barista",
+            "purpose": "barista_onboarding" if session.get("onboarding_required") else "barista",
             "expires_at": session["session_expires_at"],
             "idle_timeout_days": 30,
         },
@@ -143,6 +149,12 @@ def build_barista_router(
 
     def current_barista(authorization: str | None = Header(default=None)) -> dict:
         return authorize(parse_bearer(authorization))
+
+    def identity_session(token: str, *, logout: bool = False) -> dict:
+        try:
+            return resolve_onboarding_session(token, logout=logout)
+        except BaristaSessionError:
+            return authorize(token, logout=logout)
 
     def lookup_client(token: str, connection) -> dict:
         user = get_user_by_qr_token(token, connection=connection)
@@ -209,7 +221,7 @@ def build_barista_router(
             logger.warning("Barista notification delivery failed (%s)", type(exc).__name__)
         return response
 
-    def verified_identity(provider: str, id_token: str) -> tuple[dict, str]:
+    def verified_identity(provider: str, id_token: str, *, create: bool = False) -> tuple[dict, str]:
         if os.getenv("BARISTA_LOGIN_ENABLED", "false").strip().lower() != "true":
             raise HTTPException(503, detail={"code": "BARISTA_LOGIN_DISABLED"})
         env_name = (
@@ -227,6 +239,8 @@ def build_barista_router(
             raise HTTPException(401, detail={"code": "INVALID_IDENTITY"})
 
         user = find_user(provider, subject)
+        if not user and create:
+            user = create_onboarding_identity(provider, subject)
         if not user:
             # Linking an old Telegram account requires a separate verified flow.
             raise HTTPException(403, detail={"code": "IDENTITY_NOT_LINKED"})
@@ -235,11 +249,15 @@ def build_barista_router(
 
     @router.post("/auth/identity")
     def identity_login(body: IdentityRequest):
-        user, _ = verified_identity(body.provider, body.id_token)
+        user, _ = verified_identity(body.provider, body.id_token, create=True)
 
         memberships = get_barista_memberships(user["id"])
         if not memberships:
-            raise HTTPException(403, detail={"code": "NEEDS_INVITE"})
+            if body.shop_id is not None:
+                raise HTTPException(403, detail={"code": "SHOP_ACCESS_DENIED"})
+            token = create_app_session(user["id"], purpose="barista_onboarding")
+            session = resolve_onboarding_session(token)
+            return {"access_token": token, "token_type": "bearer", **_me_response(session)}
 
         if body.shop_id is None:
             if len(memberships) != 1:
@@ -264,8 +282,8 @@ def build_barista_router(
         return {"access_token": token, "token_type": "bearer", **_me_response(session)}
 
     @router.get("/me")
-    def me(session=Depends(current_barista)):
-        return _me_response(session)
+    def me(authorization: str | None = Header(default=None)):
+        return _me_response(identity_session(parse_bearer(authorization)))
 
     @router.get("/account/deletion")
     def deletion_eligibility(authorization: str | None = Header(default=None)):
@@ -301,7 +319,7 @@ def build_barista_router(
 
     @router.post("/auth/logout")
     def logout(authorization: str | None = Header(default=None)):
-        authorize(parse_bearer(authorization), logout=True)
+        identity_session(parse_bearer(authorization), logout=True)
         return {"ok": True, "revoked": True}
 
     @router.post("/scan")
@@ -333,5 +351,6 @@ def build_barista_router(
         verify_identity=verified_identity, me_response=_me_response,
     ))
     router.include_router(build_owner_router(authorize=authorize, parse_bearer=parse_bearer))
+    router.include_router(build_barista_network_router(authorize=authorize, parse_bearer=parse_bearer))
 
     return router

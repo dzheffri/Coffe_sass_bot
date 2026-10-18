@@ -15,17 +15,23 @@ def get_barista_memberships(user_id: int) -> list[dict]:
     """Read staff access by internal user ID, without Telegram or client roles."""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT sa.id AS membership_id, sa.shop_id, cs.name, sa.role
-                FROM shop_admins sa
-                JOIN coffee_shops cs ON cs.id = sa.shop_id
-                WHERE sa.user_id = %s AND sa.role IN ('admin', 'owner')
-                  AND cs.is_active IS TRUE
-                ORDER BY sa.id
-                """,
-                (user_id,),
-            )
+            cur.execute("SELECT to_regclass('coffee_networks') AS networks")
+            networks_enabled = cur.fetchone()["networks"] is not None
+            if networks_enabled:
+                cur.execute("""SELECT sa.id AS membership_id,sa.shop_id,cs.name,
+                    CASE WHEN nm.id IS NOT NULL THEN 'owner' ELSE sa.role END AS role,
+                    cs.network_id,n.name AS network_name
+                    FROM shop_admins sa JOIN coffee_shops cs ON cs.id=sa.shop_id
+                    LEFT JOIN coffee_networks n ON n.id=cs.network_id
+                    LEFT JOIN network_memberships nm ON nm.user_id=sa.user_id
+                        AND nm.network_id=cs.network_id AND nm.role='NETWORK_OWNER'
+                    WHERE sa.user_id=%s AND (sa.role IN ('admin','owner') OR nm.id IS NOT NULL)
+                      AND cs.is_active IS TRUE ORDER BY sa.id""", (user_id,))
+            else:
+                cur.execute("""SELECT sa.id AS membership_id,sa.shop_id,cs.name,sa.role
+                    FROM shop_admins sa JOIN coffee_shops cs ON cs.id=sa.shop_id
+                    WHERE sa.user_id=%s AND sa.role IN ('admin','owner')
+                      AND cs.is_active IS TRUE ORDER BY sa.id""", (user_id,))
             return cur.fetchall()
 
 
@@ -59,13 +65,9 @@ def resolve_barista_session(
             with conn.cursor() as cur:
                 # This lookup does not extend the session or lock it before staff.
                 cur.execute(
-                    """
-                    SELECT user_id
-                    FROM app_sessions
-                    WHERE token_hash = %s AND purpose = 'barista'
-                      AND revoked_at IS NULL
-                      AND expires_at > statement_timestamp()
-                    """,
+                    """SELECT user_id FROM app_sessions
+                       WHERE token_hash=%s AND purpose='barista' AND revoked_at IS NULL
+                         AND expires_at>statement_timestamp()""",
                     (token_hash,),
                 )
                 candidate = cur.fetchone()
@@ -74,111 +76,94 @@ def resolve_barista_session(
 
                 if touch:
                     # Hold shop status stable throughout a write operation.
-                    # NO KEY UPDATE matches invitation/preview serialization;
-                    # using SHARE then upgrading would deadlock two creators.
                     cur.execute(
-                        """
-                        SELECT cs.id FROM coffee_shops cs
-                        WHERE cs.is_active IS TRUE AND EXISTS (
-                            SELECT 1 FROM shop_admins sa WHERE sa.shop_id=cs.id
-                              AND sa.user_id=%s AND sa.role IN ('admin','owner')
-                        )
-                        ORDER BY cs.id FOR NO KEY UPDATE OF cs
-                        """,
+                        """SELECT cs.id FROM coffee_shops cs
+                           WHERE cs.is_active IS TRUE AND EXISTS (
+                             SELECT 1 FROM shop_admins sa WHERE sa.shop_id=cs.id
+                               AND sa.user_id=%s AND sa.role IN ('admin','owner'))
+                           ORDER BY cs.id FOR NO KEY UPDATE OF cs""",
                         (candidate["user_id"],),
                     )
                     cur.fetchall()
 
-                cur.execute(
-                    """
-                    SELECT sa.id AS membership_id, sa.shop_id, cs.name, sa.role
-                    FROM shop_admins sa
-                    JOIN coffee_shops cs ON cs.id = sa.shop_id
-                    WHERE sa.user_id = %s AND sa.role IN ('admin', 'owner')
-                      AND cs.is_active IS TRUE
-                    ORDER BY sa.id
-                    """ + (" FOR SHARE OF sa" if touch else ""),
-                    (candidate["user_id"],),
-                )
+                cur.execute("SELECT to_regclass('coffee_networks') AS networks")
+                networks_enabled = cur.fetchone()["networks"] is not None
+                if networks_enabled:
+                    query = """SELECT sa.id AS membership_id,sa.shop_id,cs.name,
+                        CASE WHEN nm.id IS NOT NULL THEN 'owner' ELSE sa.role END AS role,
+                        cs.network_id,n.name AS network_name
+                        FROM shop_admins sa JOIN coffee_shops cs ON cs.id=sa.shop_id
+                        LEFT JOIN coffee_networks n ON n.id=cs.network_id
+                        LEFT JOIN network_memberships nm ON nm.user_id=sa.user_id
+                          AND nm.network_id=cs.network_id AND nm.role='NETWORK_OWNER'
+                        WHERE sa.user_id=%s AND (sa.role IN ('admin','owner') OR nm.id IS NOT NULL)
+                          AND cs.is_active IS TRUE ORDER BY sa.id"""
+                else:
+                    query = """SELECT sa.id AS membership_id,sa.shop_id,cs.name,sa.role
+                        FROM shop_admins sa JOIN coffee_shops cs ON cs.id=sa.shop_id
+                        WHERE sa.user_id=%s AND sa.role IN ('admin','owner')
+                          AND cs.is_active IS TRUE ORDER BY sa.id"""
+                cur.execute(query + (" FOR SHARE OF sa" if touch else ""), (candidate["user_id"],))
                 memberships = cur.fetchall()
 
                 cur.execute(
-                    """
-                    SELECT s.id AS session_id, s.user_id, s.selected_membership_id,
-                           s.expires_at AS session_expires_at,
-                           u.full_name, u.username
-                    FROM app_sessions s
-                    JOIN users u ON u.id = s.user_id
-                    WHERE s.token_hash = %s AND s.user_id = %s
-                      AND s.purpose = 'barista' AND s.revoked_at IS NULL
-                      AND s.expires_at > statement_timestamp()
-                    """ + (" FOR UPDATE OF s" if touch else ""),
+                    """SELECT s.id AS session_id,s.user_id,s.selected_membership_id,
+                              s.expires_at AS session_expires_at,u.full_name,u.username,u.telegram_user_id
+                       FROM app_sessions s JOIN users u ON u.id=s.user_id
+                       WHERE s.token_hash=%s AND s.user_id=%s AND s.purpose='barista'
+                         AND s.revoked_at IS NULL AND s.expires_at>statement_timestamp()"""
+                    + (" FOR UPDATE OF s" if touch else ""),
                     (token_hash, candidate["user_id"]),
                 )
                 session = cur.fetchone()
                 if session is None:
                     raise BaristaSessionError("INVALID_SESSION")
 
-                selected = next(
-                    (
-                        membership
-                        for membership in memberships
-                        if membership["membership_id"]
-                        == session["selected_membership_id"]
-                    ),
-                    None,
-                )
+                selected = next((membership for membership in memberships
+                                 if membership["membership_id"] == session["selected_membership_id"]), None)
                 if selected is None:
                     raise BaristaSessionError("STAFF_ACCESS_REQUIRED")
-
                 if shop_id is not None:
-                    selected = next(
-                        (
-                            membership
-                            for membership in memberships
-                            if membership["shop_id"] == shop_id
-                        ),
-                        None,
-                    )
+                    selected = next((membership for membership in memberships
+                                     if membership["shop_id"] == shop_id), None)
                     if selected is None:
                         raise BaristaSessionError("SHOP_ACCESS_DENIED")
 
                 if not touch:
                     session["memberships"] = memberships
+                    session["networks"] = _user_networks(conn, candidate["user_id"]) if networks_enabled else []
                     return session
 
                 if logout:
-                    cur.execute(
-                        """
-                        UPDATE app_sessions
-                        SET revoked_at = statement_timestamp()
-                        WHERE id = %s AND purpose = 'barista'
-                          AND revoked_at IS NULL
-                          AND expires_at > statement_timestamp()
-                        RETURNING expires_at AS session_expires_at
-                        """,
-                        (session["session_id"],),
-                    )
+                    cur.execute("""UPDATE app_sessions SET revoked_at=statement_timestamp()
+                        WHERE id=%s AND purpose='barista' AND revoked_at IS NULL
+                          AND expires_at>statement_timestamp()
+                        RETURNING expires_at AS session_expires_at""", (session["session_id"],))
                 else:
-                    cur.execute(
-                        """
-                        UPDATE app_sessions
-                        SET selected_membership_id = %s,
-                            last_used_at = statement_timestamp(),
-                            -- 30 elapsed days, independent of the DB timezone/DST.
-                            expires_at = statement_timestamp() + INTERVAL '720 hours'
-                        WHERE id = %s AND purpose = 'barista'
-                          AND revoked_at IS NULL
-                          AND expires_at > statement_timestamp()
-                        RETURNING expires_at AS session_expires_at
-                        """,
-                        (selected["membership_id"], session["session_id"]),
-                    )
+                    cur.execute("""UPDATE app_sessions SET selected_membership_id=%s,
+                        last_used_at=statement_timestamp(),expires_at=statement_timestamp()+INTERVAL '720 hours'
+                        WHERE id=%s AND purpose='barista' AND revoked_at IS NULL
+                          AND expires_at>statement_timestamp()
+                        RETURNING expires_at AS session_expires_at""",
+                        (selected["membership_id"], session["session_id"]))
                 updated = cur.fetchone()
                 if updated is None:
                     raise BaristaSessionError("INVALID_SESSION")
-
                 session.update(updated)
                 session["selected_membership_id"] = selected["membership_id"]
                 session["memberships"] = memberships
+                session["networks"] = _user_networks(conn, candidate["user_id"]) if networks_enabled else []
                 return session
+
+
+def _user_networks(connection, user_id: int) -> list[dict]:
+    with connection.cursor() as cur:
+        cur.execute("""SELECT n.id AS network_id,n.name,n.logo_url,n.loyalty_mode,
+            nm.id AS network_membership_id,
+            COALESCE(json_agg(json_build_object('shop_id',s.id,'name',s.name)
+                ORDER BY s.id) FILTER (WHERE s.id IS NOT NULL),'[]'::json) AS shops
+            FROM network_memberships nm JOIN coffee_networks n ON n.id=nm.network_id
+            LEFT JOIN coffee_shops s ON s.network_id=n.id AND s.is_active IS TRUE
+            WHERE nm.user_id=%s AND nm.role='NETWORK_OWNER'
+            GROUP BY n.id,nm.id ORDER BY n.id""", (user_id,))
+        return cur.fetchall()

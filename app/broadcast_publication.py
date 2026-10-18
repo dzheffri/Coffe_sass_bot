@@ -50,7 +50,8 @@ class BroadcastPublication:
                     logger.warning("Broadcast media cleanup deferred (%s)", type(error).__name__)
         return False
 
-    def publish(self, connection, shop_id, sender_user_id, text, recipients, media=None):
+    def publish(self, connection, shop_id, sender_user_id, text, recipients, media=None,
+                *, scope="SHOP", network_id=None):
         metadata = None
         if media is not None:
             try:
@@ -62,12 +63,22 @@ class BroadcastPublication:
                 # Keep the original Telegram payload available to the caller.
                 # NULL metadata never points to a missing/partial attachment.
                 logger.warning("Broadcast media persistence failed (%s)", type(error).__name__)
-        broadcast = connection.execute("""
-            INSERT INTO broadcasts(shop_id,sender_user_id,text,recipients_count,media_type,media_key)
-            VALUES(%s,%s,%s,0,%s,%s) RETURNING *
-        """, (shop_id, sender_user_id, text,
-              metadata["media_type"] if metadata else None,
-              metadata["media_key"] if metadata else None)).fetchone()
+        if scope == "NETWORK":
+            if not network_id:
+                raise ValueError("network_id is required for network broadcasts")
+            broadcast = connection.execute("""
+                INSERT INTO broadcasts(shop_id,sender_user_id,text,recipients_count,media_type,media_key,scope,network_id)
+                VALUES(%s,%s,%s,0,%s,%s,'NETWORK',%s) RETURNING *
+            """, (shop_id, sender_user_id, text,
+                  metadata["media_type"] if metadata else None,
+                  metadata["media_key"] if metadata else None, network_id)).fetchone()
+        else:
+            broadcast = connection.execute("""
+                INSERT INTO broadcasts(shop_id,sender_user_id,text,recipients_count,media_type,media_key)
+                VALUES(%s,%s,%s,0,%s,%s) RETURNING *
+            """, (shop_id, sender_user_id, text,
+                  metadata["media_type"] if metadata else None,
+                  metadata["media_key"] if metadata else None)).fetchone()
         user_ids = sorted({row["user_id"] for row in recipients})
         connection.execute("""
             INSERT INTO broadcast_recipients(broadcast_id,user_id)

@@ -110,8 +110,12 @@ def update_shop_profile(
     logo_url: str,
     cover_url: str,
     news: list[dict],
+    *, authorized_shop_id: int | None = None,
 ):
-    shop = ensure_shop_profile_exists(owner_telegram_id)
+    # Only authenticated server callers may supply a pre-authorized shop.
+    # Legacy bot/Web callers retain the original Telegram owner lookup.
+    shop = ({"id": authorized_shop_id} if authorized_shop_id is not None
+            else ensure_shop_profile_exists(owner_telegram_id))
 
     if not shop:
         return {

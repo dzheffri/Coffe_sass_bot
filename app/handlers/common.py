@@ -13,6 +13,7 @@ from app.db import (
     get_panel_mode,
     set_panel_mode,
     create_admin_login_ticket,
+    get_admin_shops_for_telegram,
 )
 from app.keyboards import user_main_keyboard, admin_main_keyboard
 from app.config import SUPER_ADMIN_IDS, SCANNER_URL, ADMIN_PANEL_URL
@@ -28,8 +29,8 @@ def get_personal_admin_panel_url(user_id: int) -> str:
     return f"{base_url}/?ticket={ticket}"
 
 
-async def send_correct_panel(message: types.Message):
-    user_id = message.from_user.id
+async def send_correct_panel(message: types.Message, *, actor_id: int | None = None):
+    user_id = actor_id if actor_id is not None else message.from_user.id
     admin_flag = is_any_shop_admin(user_id)
     owner_flag = is_owner(user_id)
     super_admin_flag = user_id in SUPER_ADMIN_IDS
@@ -66,6 +67,7 @@ async def send_correct_panel(message: types.Message):
                         if owner_flag
                         else ""
                     ),
+                    can_select_shop=owner_flag and len(get_admin_shops_for_telegram(user_id)) > 1,
                 )
             )
             return
@@ -98,6 +100,7 @@ async def send_correct_panel(message: types.Message):
                     if owner_flag
                     else ""
                 ),
+                can_select_shop=owner_flag and len(get_admin_shops_for_telegram(user_id)) > 1,
             )
         )
         return
@@ -170,11 +173,16 @@ async def start_handler(
             )
             return
 
-        await message.answer(
+        prompt = (
+            "☕ <b>Підключити Telegram до «Наші Admin»?</b>\n\n"
+            "Підтвердіть підключення до профілю, з якого ви відкрили посилання.\n\n"
+            if binding.get("admin_link") else
             "☕ <b>Підключити бонуси до «Наші»?</b>\n\n"
             "Після підтвердження ваші чашки, подарунки та історія "
             "будуть доступні у профілі застосунку.\n\n"
-            "Якщо ви не починали це підключення — нічого не натискайте.",
+        )
+        await message.answer(
+            prompt + "Якщо ви не починали це підключення — нічого не натискайте.",
             reply_markup=telegram_link_keyboard(token),
         )
         return
@@ -244,6 +252,13 @@ async def confirm_telegram_link(callback: types.CallbackQuery):
         await callback.message.edit_text(
             f"❌ {message}"
         )
+        return
+
+    if data.get("admin_link"):
+        await callback.message.edit_text(
+            "✅ Telegram підключено до «Наші Admin». Поверніться в застосунок."
+        )
+        await send_correct_panel(callback.message, actor_id=callback.from_user.id)
         return
 
     await callback.message.edit_text(

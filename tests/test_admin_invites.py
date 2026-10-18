@@ -91,7 +91,7 @@ def test_accept_reverifies_existing_identity_creates_admin_and_session_atomicall
     assert result.status_code == 200
     assert calls[-1] == (provider, "client", "nashi-google-ios" if provider == "google" else "com.nashi.barista")
     body = result.json()
-    assert body["employee"] == {"user_id": 2, "name": "Іван"}
+    assert body["employee"] == {"user_id": 2, "name": "Іван", "telegram_user_id": None}
     assert body["selected_context"]["role"] == "admin"
     assert body["selected_context"]["shop_id"] == 1
     session = database.session(body["access_token"])
@@ -157,12 +157,14 @@ def test_unknown_identity_cannot_create_user_membership_session_or_attempt_recor
     assert database.query("SELECT * FROM barista_invite_attempts") == []
 
 
-def test_known_user_without_membership_needs_invite_but_existing_admin_and_owner_login(invites_api, database):
+def test_known_user_without_membership_gets_onboarding_but_existing_admin_and_owner_login(invites_api, database):
     client, _ = invites_api
+    database.query((PROJECT / "migrations/20261017_owner_onboarding.sql").read_text())
     before = database.query("SELECT * FROM app_sessions ORDER BY id")
     result = client.post("/barista/auth/identity", json={"provider": "google", "id_token": "client"})
-    assert result.status_code == 403 and result.json()["detail"]["code"] == "NEEDS_INVITE"
-    assert database.query("SELECT * FROM app_sessions ORDER BY id") == before
+    assert result.status_code == 200 and result.json()["needs_owner_claim"] is True
+    after = database.query("SELECT * FROM app_sessions ORDER BY id")
+    assert after[:-1] == before and after[-1]["purpose"] == "barista_onboarding"
     for identity, role in (("owner", "owner"), ("other", "admin")):
         response = client.post("/barista/auth/identity", json={"provider": "google", "id_token": identity})
         assert response.status_code == 200 and response.json()["selected_context"]["role"] == role

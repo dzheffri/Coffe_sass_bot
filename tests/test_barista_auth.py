@@ -47,7 +47,7 @@ def test_identity_uses_verified_subject_existing_user_and_native_audience(api, d
     assert response.status_code == 200
     result = response.json()
     assert calls == [(provider, "valid-staff", audience)]
-    assert result["employee"] == {"user_id": 1, "name": "Ольга"}
+    assert result["employee"] == {"user_id": 1, "name": "Ольга", "telegram_user_id": 1001}
     assert result["selected_context"] == {"membership_id": 1, "shop_id": 1, "name": "Наші", "role": "owner"}
     assert result["token_type"] == "bearer"
     token = result["access_token"]
@@ -61,10 +61,8 @@ def test_identity_uses_verified_subject_existing_user_and_native_audience(api, d
 
 @pytest.mark.parametrize("token,expected,status", [
     ("forged-subject", "INVALID_IDENTITY", 401),
-    ("valid-unknown", "IDENTITY_NOT_LINKED", 403),
-    ("valid-client", "NEEDS_INVITE", 403),
 ])
-def test_no_auto_creation_or_staff_elevation(api, database, token, expected, status):
+def test_invalid_identity_never_creates_user_or_staff_session(api, database, token, expected, status):
     client, _ = api
     before = database.query("SELECT COUNT(*) AS n FROM app_sessions")[0]["n"]
     result = client.post("/barista/auth/identity", json={"provider": "google", "id_token": token})
