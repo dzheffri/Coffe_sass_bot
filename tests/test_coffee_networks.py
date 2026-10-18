@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib
+from datetime import datetime, timezone
 
 import psycopg
 import pytest
@@ -25,7 +26,7 @@ def network_api(onboarding_api, database, monkeypatch):
           cups INTEGER NOT NULL DEFAULT 0, free_coffee_balance INTEGER NOT NULL DEFAULT 0,
           total_scans INTEGER NOT NULL DEFAULT 0, total_free_coffee_earned INTEGER NOT NULL DEFAULT 0,
           total_free_coffee_redeemed INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(shop_id,user_id));
+          last_activity_at TIMESTAMPTZ, UNIQUE(shop_id,user_id));
         CREATE TABLE transactions (
           id BIGSERIAL PRIMARY KEY, shop_id BIGINT NOT NULL REFERENCES coffee_shops(id) ON DELETE CASCADE,
           user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -197,11 +198,56 @@ def test_per_shop_loyalty_remains_independent_and_cross_shop_redeem_is_denied(ne
     assert database.db.get_shop_client_balance_by_user_id(second, 2) is None
 
 
+@pytest.mark.parametrize("last_activity", [None, datetime(2020, 1, 3)])
+def test_shared_mode_transition_preserves_balances_with_nullable_shop_activity(network_api, database, last_activity):
+    client, _ = network_api
+    network = make_network(database)
+    first, second = add_shop(database, "Nullable A"), add_shop(database, "Nullable B")
+    attach(database, network["id"], first); attach(database, network["id"], second)
+    database.query("""INSERT INTO shop_clients
+        (shop_id,user_id,cups,free_coffee_balance,total_scans,total_free_coffee_earned,
+         total_free_coffee_redeemed,created_at,last_activity_at)
+        VALUES(%s,2,2,1,4,2,1,'2020-01-01',%s),(%s,2,3,2,5,2,0,'2020-01-02',NULL)""",
+        (first, last_activity, second))
+
+    response = client.patch(f"/superadmin/networks/{network['id']}",
+        headers=bearer("local-superadmin"), json={"loyalty_mode": "SHARED"})
+    assert response.status_code == 200, response.text
+    assert response.json()["network"]["loyalty_mode"] == "SHARED"
+    balance = database.query("SELECT * FROM network_client_loyalty WHERE network_id=%s AND user_id=2",
+                             (network["id"],))[0]
+    assert (balance["cups"], balance["free_coffee_balance"]) == (5, 3)
+    assert (balance["total_scans"], balance["total_free_coffee_earned"],
+            balance["total_free_coffee_redeemed"]) == (9, 4, 1)
+    assert balance["last_shop_id"] == (first if last_activity else second)
+    assert balance["last_activity_at"].date().isoformat() == ("2020-01-03" if last_activity else "2020-01-02")
+    assert database.query("SELECT cups,free_coffee_balance FROM shop_clients WHERE shop_id=ANY(%s) ORDER BY shop_id",
+                          ([first, second],)) == [
+        {"cups": 0, "free_coffee_balance": 0}, {"cups": 0, "free_coffee_balance": 0},
+    ]
+
+
+def test_shared_balance_merge_compares_legacy_naive_activity_with_aware_network_activity(network_api, database):
+    network = make_network(database, mode="SHARED")
+    first, second = add_shop(database, "Existing shared"), add_shop(database, "Legacy shared")
+    attach(database, network["id"], first)
+    database.query("ALTER TABLE shop_clients ALTER COLUMN last_activity_at TYPE TIMESTAMP USING last_activity_at AT TIME ZONE 'UTC'")
+    database.query("""INSERT INTO network_client_loyalty
+        (network_id,user_id,cups,free_coffee_balance,last_shop_id,last_activity_at)
+        VALUES(%s,2,1,2,%s,%s)""", (network["id"], first, datetime(2020, 1, 4, tzinfo=timezone.utc)))
+    database.query("""INSERT INTO shop_clients(shop_id,user_id,cups,free_coffee_balance,last_activity_at)
+        VALUES(%s,2,2,3,'2020-01-03')""", (second,))
+    attach(database, network["id"], second)
+    balance = database.query("SELECT cups,free_coffee_balance,last_shop_id FROM network_client_loyalty WHERE network_id=%s AND user_id=2",
+                             (network["id"],))[0]
+    assert balance == {"cups": 3, "free_coffee_balance": 5, "last_shop_id": first}
+
+
 def test_network_stats_are_aggregated_with_shop_breakdown_and_recipient_dedup(network_api, database):
     network = make_network(database)
     first, second, outside = add_shop(database, "Stats A"), add_shop(database, "Stats B"), add_shop(database, "Outside")
     attach(database, network["id"], first); attach(database, network["id"], second)
-    database.query("INSERT INTO shop_clients(shop_id,user_id,cups) VALUES(%s,2,2),(%s,2,1),(%s,3,5)",
+    database.query("INSERT INTO shop_clients(shop_id,user_id,cups,last_activity_at) VALUES(%s,2,2,NOW()),(%s,2,1,NOW()),(%s,3,5,NOW())",
                    (first, second, outside))
     database.query("INSERT INTO transactions(shop_id,user_id,admin_user_id,type,cups_added) VALUES(%s,2,1,'add_cups',3),(%s,2,1,'add_cups',4),(%s,3,1,'add_cups',9)",
                    (first, second, outside))

@@ -172,14 +172,18 @@ def merge_shop_balances_into_network(connection, network_id: int, *, shop_id: in
     if shop_id is not None:
         shop_filter = " AND sc.shop_id=%s"
         params.append(shop_id)
-    rows = connection.execute("""SELECT sc.* FROM shop_clients sc JOIN coffee_shops s ON s.id=sc.shop_id
+    rows = connection.execute("""SELECT sc.*,
+        COALESCE(sc.last_activity_at,sc.created_at,statement_timestamp()) AS effective_activity_at
+        FROM shop_clients sc JOIN coffee_shops s ON s.id=sc.shop_id
         WHERE s.network_id=%s""" + shop_filter + " ORDER BY sc.user_id,sc.shop_id FOR UPDATE OF sc", tuple(params)).fetchall()
     by_user: dict[int, list[dict]] = {}
     for row in rows:
         by_user.setdefault(row["user_id"], []).append(row)
     for user_id, clients in by_user.items():
         shop_cups = sum(row["cups"] for row in clients)
-        existing = connection.execute("""SELECT * FROM network_client_loyalty
+        existing = connection.execute("""SELECT *,
+            COALESCE(last_activity_at,created_at,statement_timestamp()) AS effective_activity_at
+            FROM network_client_loyalty
             WHERE network_id=%s AND user_id=%s FOR UPDATE""", (network_id, user_id)).fetchone()
         existing_cups = existing["cups"] if existing else 0
         total_cups = shop_cups + existing_cups
@@ -189,15 +193,16 @@ def merge_shop_balances_into_network(connection, network_id: int, *, shop_id: in
         scans = sum(row["total_scans"] for row in clients)
         earned = sum(row["total_free_coffee_earned"] for row in clients) + extra
         redeemed = sum(row["total_free_coffee_redeemed"] for row in clients)
-        latest = max(clients, key=lambda row: row["last_activity_at"])
+        latest = max(clients, key=lambda row: row["effective_activity_at"])
+        latest = {**latest, "last_activity_at": latest["effective_activity_at"]}
         if existing:
             free += existing["free_coffee_balance"]
             scans += existing["total_scans"]
             earned += existing["total_free_coffee_earned"]
             redeemed += existing["total_free_coffee_redeemed"]
-            if existing["last_activity_at"] > latest["last_activity_at"]:
+            if existing["effective_activity_at"] > latest["last_activity_at"]:
                 latest = {**latest, "shop_id": existing["last_shop_id"] or latest["shop_id"],
-                          "last_activity_at": existing["last_activity_at"]}
+                          "last_activity_at": existing["effective_activity_at"]}
         connection.execute("""INSERT INTO network_client_loyalty
             (network_id,user_id,cups,free_coffee_balance,total_scans,total_free_coffee_earned,
              total_free_coffee_redeemed,last_shop_id,last_activity_at)
