@@ -1916,11 +1916,17 @@ def get_admin_shop_and_role(admin_telegram_user_id: int):
                   AND column_name='active_admin_shop_id') AS available""")
             active_context = cur.fetchone()["available"]
             order = "(u.active_admin_shop_id = cs.id) DESC NULLS LAST, sa.id" if active_context else "sa.id"
+            cur.execute("SELECT to_regclass('network_memberships') AS memberships")
+            networks_enabled = cur.fetchone()["memberships"] is not None
+            role = "CASE WHEN nm.id IS NOT NULL THEN 'owner' ELSE sa.role END AS role" if networks_enabled else "sa.role"
+            network_join = """LEFT JOIN network_memberships nm ON nm.user_id=sa.user_id
+                AND nm.network_id=cs.network_id AND nm.role='NETWORK_OWNER'""" if networks_enabled else ""
             cur.execute("""
-                SELECT cs.*, sa.role
+                SELECT cs.*, """ + role + """
                 FROM shop_admins sa
                 JOIN users u ON u.id = sa.user_id
                 JOIN coffee_shops cs ON cs.id = sa.shop_id
+                """ + network_join + """
                 WHERE u.id = COALESCE(
                     (SELECT ui.user_id FROM user_identities ui
                      WHERE ui.provider='telegram' AND ui.provider_user_id=%s),
@@ -1941,8 +1947,14 @@ def get_admin_shops_for_telegram(admin_telegram_user_id: int):
                   AND column_name='active_admin_shop_id') AS available""")
             active_context = cur.fetchone()["available"]
             order = "(u.active_admin_shop_id=cs.id) DESC NULLS LAST,sa.id" if active_context else "sa.id"
-            cur.execute("""SELECT cs.*,sa.role FROM shop_admins sa
+            cur.execute("SELECT to_regclass('network_memberships') AS memberships")
+            networks_enabled = cur.fetchone()["memberships"] is not None
+            role = "CASE WHEN nm.id IS NOT NULL THEN 'owner' ELSE sa.role END AS role" if networks_enabled else "sa.role"
+            network_join = """LEFT JOIN network_memberships nm ON nm.user_id=sa.user_id
+                AND nm.network_id=cs.network_id AND nm.role='NETWORK_OWNER'""" if networks_enabled else ""
+            cur.execute("""SELECT cs.*,""" + role + """ FROM shop_admins sa
                 JOIN users u ON u.id=sa.user_id JOIN coffee_shops cs ON cs.id=sa.shop_id
+                """ + network_join + """
                 WHERE u.id=COALESCE(
                     (SELECT ui.user_id FROM user_identities ui
                      WHERE ui.provider='telegram' AND ui.provider_user_id=%s),

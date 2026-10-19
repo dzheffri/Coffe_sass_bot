@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
+from psycopg.errors import UniqueViolation
 import pytest
 
 from conftest import PROJECT, bearer
@@ -16,6 +17,7 @@ from conftest import PROJECT, bearer
 
 MIGRATION = PROJECT / "migrations/20261015_community_posts.sql"
 SOFT_DELETE_MIGRATION = PROJECT / "migrations/20261015_community_soft_delete.sql"
+ACTIVE_SERIES_MIGRATION = PROJECT / "migrations/20261019_community_series_active_uniqueness.sql"
 
 
 def _photo_bytes(kind="PNG"):
@@ -28,6 +30,7 @@ def _photo_bytes(kind="PNG"):
 def community_api(database, tmp_path):
     database.query(MIGRATION.read_text(encoding="utf-8"))
     database.query(SOFT_DELETE_MIGRATION.read_text(encoding="utf-8"))
+    database.query(ACTIVE_SERIES_MIGRATION.read_text(encoding="utf-8"))
     module = importlib.import_module("app.api.community")
 
     def auth(authorization: str | None = Header(default=None)):
@@ -312,6 +315,92 @@ def test_series_detail_returns_published_siblings_only(community_api):
         "type": "series", "title": "Дубль", "text": "C",
         "series_title": "Історія", "series_part": 1, "series_total": 2,
     }).status_code == 409
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_active_series_part_is_unique_for_drafts_and_published_posts(community_api, published):
+    client, db = community_api
+    admin, _ = _tokens(db)
+    post = _draft(client, admin, type="series", series_title="Espresso", series_part=1, series_total=3)
+    if published:
+        assert client.post(f"/community/admin/posts/{post['id']}/publish", headers=bearer(admin), json={}).status_code == 200
+    duplicate = client.post("/community/admin/posts", headers=bearer(admin), json={
+        "type": "series", "title": "Дублікат", "text": "Текст", "series_title": "  ESPRESSO  ",
+        "series_part": 1, "series_total": 3,
+    })
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"]["code"] == "SERIES_PART_ALREADY_EXISTS"
+    assert len(db.query("SELECT * FROM community_posts")) == 1
+
+
+def test_deleted_published_series_part_can_be_recreated_without_losing_history(community_api):
+    client, db = community_api
+    admin, customer = _tokens(db)
+    original = _draft(client, admin, type="series", title="Стара частина", text="Історичний текст",
+                      series_title="Еспресо", series_part=1, series_total=3)
+    assert client.post(f"/community/admin/posts/{original['id']}/publish", headers=bearer(admin), json={}).status_code == 200
+    assert client.delete(f"/community/admin/posts/{original['id']}", headers=bearer(admin)).status_code == 200
+    historical = db.query("SELECT * FROM community_posts WHERE id=%s", (original["id"],))[0]
+    replacement = _draft(client, admin, type="series", title="Нова частина", text="Актуальний текст",
+                         series_title=" Еспресо ", series_part=1, series_total=3)
+    assert replacement["id"] != original["id"]
+    assert replacement["is_published"] is False
+    assert client.get("/me/community/posts", headers=bearer(customer)).json()["total"] == 0
+    assert client.post(f"/community/admin/posts/{replacement['id']}/publish", headers=bearer(admin), json={}).status_code == 200
+    feed = client.get("/me/community/posts", headers=bearer(customer)).json()
+    assert [item["id"] for item in feed["items"]] == [replacement["id"]]
+    assert client.get(f"/me/community/posts/{original['id']}", headers=bearer(customer)).status_code == 404
+    detail = client.get(f"/me/community/posts/{replacement['id']}", headers=bearer(customer))
+    assert detail.status_code == 200
+    assert [item["id"] for item in detail.json()["series_posts"]] == [replacement["id"]]
+    assert db.query("SELECT * FROM community_posts WHERE id=%s", (original["id"],))[0] == historical
+    assert historical["deleted_at"] is not None
+
+
+def test_series_draft_update_conflicts_only_with_active_parts(community_api):
+    client, db = community_api
+    admin, _ = _tokens(db)
+    occupied = _draft(client, admin, type="series", series_title="Espresso", series_part=1, series_total=3)
+    draft = _draft(client, admin, type="series", series_title="Espresso", series_part=2, series_total=3)
+    body = {"type": "series", "title": "Оновлено", "text": "Текст", "series_title": " ESPRESSO ",
+            "series_part": 1, "series_total": 3}
+    conflict = client.put(f"/community/admin/posts/{draft['id']}", headers=bearer(admin), json=body)
+    assert conflict.status_code == 409 and conflict.json()["detail"]["code"] == "SERIES_PART_ALREADY_EXISTS"
+    assert db.query("SELECT series_part FROM community_posts WHERE id=%s", (draft["id"],)) == [{"series_part": 2}]
+    assert client.delete(f"/community/admin/posts/{occupied['id']}", headers=bearer(admin)).status_code == 200
+    updated = client.put(f"/community/admin/posts/{draft['id']}", headers=bearer(admin), json=body)
+    assert updated.status_code == 200 and updated.json()["series_part"] == 1
+
+
+def test_active_series_migration_preserves_history_and_survives_full_replay(database):
+    database.query(MIGRATION.read_text(encoding="utf-8"))
+    database.query(SOFT_DELETE_MIGRATION.read_text(encoding="utf-8"))
+    old = database.query("""INSERT INTO community_posts
+        (type,title,text,series_title,series_part,series_total,published_at,deleted_at)
+        VALUES('series','Стара частина','Історія',' Espresso ',1,3,NOW(),NOW()) RETURNING *""")[0]
+    active = database.query("""INSERT INTO community_posts(type,title,text,series_title,series_part,series_total)
+        VALUES('series','Чинна частина','Текст','Espresso',2,3) RETURNING *""")[0]
+    insert = """INSERT INTO community_posts(type,title,text,series_title,series_part,series_total)
+        VALUES('series','Заміна','Текст','ESPRESSO',1,3) RETURNING *"""
+    # This is the legacy bug: the deleted row still reserves its normalized slot.
+    with pytest.raises(UniqueViolation):
+        database.query(insert)
+    for _ in range(2):
+        database.query(ACTIVE_SERIES_MIGRATION.read_text(encoding="utf-8"))
+    replacement = database.query(insert)[0]
+    before = database.query("SELECT * FROM community_posts ORDER BY id")
+    for _ in range(2):
+        for migration in (MIGRATION, SOFT_DELETE_MIGRATION, ACTIVE_SERIES_MIGRATION):
+            database.query(migration.read_text(encoding="utf-8"))
+    assert database.query("SELECT * FROM community_posts ORDER BY id") == before
+    assert next(row for row in before if row["id"] == old["id"]) == old
+    assert next(row for row in before if row["id"] == active["id"]) == active
+    assert replacement["deleted_at"] is None
+    with pytest.raises(UniqueViolation):
+        database.query(insert)
+    predicate = database.query("""SELECT pg_get_expr(indpred,indrelid) AS predicate FROM pg_index
+        WHERE indexrelid='uq_community_posts_series_part'::regclass""")[0]["predicate"]
+    assert "deleted_at IS NULL" in predicate
 
 
 def test_photo_is_validated_randomized_and_published_image_is_immutable(community_api):

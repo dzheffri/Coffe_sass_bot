@@ -115,7 +115,7 @@ def test_shop_creation_and_owner_invitation_are_superadmin_only(onboarding_api, 
     assert len(database.query("SELECT * FROM coffee_shops")) == 2
 
 
-@pytest.mark.parametrize("body", [{"name": " "}, {"name": "x", "owner_user_id": 2},
+@pytest.mark.parametrize("body", [{"name": " "}, {"name": "x", "user_id": 2},
                                   {"name": "x", "pending_owner_telegram_id": 1002}, {"name": "x", "role": "owner"}])
 def test_create_rejects_blank_names_and_authorization_fields(onboarding_api, body):
     client, _ = onboarding_api

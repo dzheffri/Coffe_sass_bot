@@ -10,7 +10,7 @@ from app.admin_invites import InviteError
 from app.db import get_connection
 from app.network_management import (
     attach_shop, create_network, create_network_owner_invite, detach_shop,
-    list_networks, network_dashboard, update_network,
+    list_networks, network_dashboard, owner_shops_dashboard, update_network,
 )
 from app.barista_sessions import BaristaSessionError
 
@@ -142,6 +142,19 @@ def build_barista_network_router(*, authorize: Callable, parse_bearer: Callable)
     def owner_networks(authorization: str | None = Header(default=None)):
         session = session_for(authorization, touch=False)
         return {"ok": True, "networks": session.get("networks", [])}
+
+    @router.get("/owner/shops/statistics")
+    def owner_shops_statistics(authorization: str | None = Header(default=None)):
+        try:
+            with get_connection() as connection:
+                with connection.transaction():
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    session = session_for(authorization, connection=connection, touch=False)
+                    return {"ok": True, **owner_shops_dashboard(connection, session["user_id"])}
+        except InviteError as exc:
+            _raise_invite(exc)
+        except (UndefinedTable, UndefinedColumn) as exc:
+            raise HTTPException(503, detail={"code": "NETWORKS_NOT_CONFIGURED"}) from exc
 
     @router.get("/owner/networks/{network_id}/statistics")
     def owner_network_statistics(network_id: int, authorization: str | None = Header(default=None)):

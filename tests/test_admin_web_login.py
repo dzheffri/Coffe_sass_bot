@@ -46,9 +46,9 @@ def poll(client, request):
         "request_token": request["request_token"], "poll_token": request["poll_token"]})
 
 
-def confirm(client, request, token):
+def confirm(client, request, token, *, selector="code"):
     return client.post("/barista/web-login/confirm", headers=bearer(token),
-                       json={"code_or_token": request["code"]})
+                       json={"code_or_token": request[selector]})
 
 
 def test_pairing_qr_code_are_short_lived_opaque_and_stored_as_hashes(web_api, database):
@@ -73,7 +73,7 @@ def test_owner_inspects_confirms_and_browser_consumes_once_without_telegram(web_
     assert response.status_code == 200
     assert response.json()["shop"] == {"shop_id": 1, "name": "Наші"}
     assert poll(web_api, request).json()["status"] == "pending"  # inspect != consent
-    assert confirm(web_api, request, native).status_code == 200
+    assert confirm(web_api, request, native, selector=selector).status_code == 200
     result = poll(web_api, request).json()
     assert result["status"] == "approved"
     assert result["actor"] == {"user_id": 1, "role": "owner"}
@@ -83,7 +83,69 @@ def test_owner_inspects_confirms_and_browser_consumes_once_without_telegram(web_
     assert web_api.get("/me", headers=headers).status_code == 401
     assert web_api.get("/barista/me", headers=headers).status_code == 401
     assert poll(web_api, request).json()["status"] == "expired"
-    assert confirm(web_api, request, native).status_code == 404
+    assert confirm(web_api, request, native, selector=selector).status_code == 404
+
+
+def test_qr_raw_token_and_short_code_resolve_exact_same_pending_request(web_api, database):
+    native = database.staff_token()
+    request = start(web_api)
+    other = start(web_api)
+    module = importlib.import_module("app.admin_web_login")
+    before = database.query("SELECT * FROM admin_web_login_requests ORDER BY id")
+    assert len(request["request_token"]) == 43
+    assert (before[0]["expires_at"] - before[0]["created_at"]).total_seconds() == 300
+    with database.db.get_connection() as connection:
+        with connection.transaction():
+            raw = module.find_request(connection, request["request_token"])
+            short = module.find_request(connection, request["code"])
+            different = module.find_request(connection, other["request_token"])
+    assert raw["id"] == short["id"] == before[0]["id"]
+    assert raw["id"] != different["id"]
+    assert raw["token_hash"] == module.digest(request["request_token"])
+    assert raw["code_hash"] == module.code_digest(request["code"])
+    for selector in ("request_token", "code"):
+        inspected = web_api.post("/barista/web-login/inspect", headers=bearer(native),
+                                  json={"code_or_token": request[selector]})
+        assert inspected.status_code == 200 and inspected.json()["status"] == "pending"
+        assert poll(web_api, request).json()["status"] == "pending"
+        assert poll(web_api, other).json()["status"] == "pending"
+        assert database.query("SELECT * FROM admin_web_login_requests ORDER BY id") == before
+        assert database.query("SELECT * FROM admin_web_sessions") == []
+    assert confirm(web_api, request, native, selector="request_token").status_code == 200
+    approved = poll(web_api, request)
+    assert approved.status_code == 200 and approved.json()["status"] == "approved"
+    assert poll(web_api, other).json()["status"] == "pending"
+    rows = database.query("SELECT * FROM admin_web_login_requests ORDER BY id")
+    assert rows[0]["approved_user_id"] == 1 and rows[0]["consumed_at"] is not None
+    assert rows[1] == before[1]
+    assert len(database.query("SELECT * FROM admin_web_sessions")) == 1
+
+
+@pytest.mark.parametrize("state", ["expired", "approved", "consumed", "malformed", "unknown"])
+def test_qr_raw_token_rejects_expired_used_and_invalid_requests_without_mutation(web_api, database, state):
+    native = database.staff_token()
+    request = start(web_api)
+    selector = request["request_token"]
+    if state == "expired":
+        database.query("""UPDATE admin_web_login_requests SET expires_at=NOW()-INTERVAL '1 second',
+            created_at=NOW()-INTERVAL '6 minutes'""")
+    elif state in ("approved", "consumed"):
+        assert confirm(web_api, request, native, selector="request_token").status_code == 200
+        if state == "consumed":
+            assert poll(web_api, request).json()["status"] == "approved"
+    elif state == "malformed":
+        selector += "!"
+    elif state == "unknown":
+        selector = "x" * 43
+    before = database.query("SELECT * FROM admin_web_login_requests ORDER BY id")
+    sessions = database.query("SELECT * FROM admin_web_sessions ORDER BY id")
+    for action in ("inspect", "confirm"):
+        response = web_api.post(f"/barista/web-login/{action}", headers=bearer(native),
+                                json={"code_or_token": selector})
+        assert response.status_code == 404
+        assert response.json()["detail"]["code"] == "LOGIN_NOT_AVAILABLE"
+    assert database.query("SELECT * FROM admin_web_login_requests ORDER BY id") == before
+    assert database.query("SELECT * FROM admin_web_sessions ORDER BY id") == sessions
 
 
 def test_poll_requires_browser_only_secret_not_just_qr(web_api, database):

@@ -249,8 +249,87 @@ def change_network_loyalty_mode(connection, network_id: int, old_mode: str, new_
 def network_dashboard(connection, network_id: int) -> dict:
     shops = connection.execute("""SELECT id AS shop_id,name FROM coffee_shops
         WHERE network_id=%s AND is_active IS TRUE ORDER BY id""", (network_id,)).fetchall()
+    return {"network_id": network_id, **_shops_dashboard(connection, shops)}
+
+
+def owner_shops_dashboard(connection, user_id: int) -> dict:
+    """Aggregate only this owner's current active points, including networks.
+
+    The shop set is read on every request; assigning another owner membership
+    never requires a replacement token or another onboarding code. Client
+    totals are distinct across the selected shops, and a new client is counted
+    from their first relationship with any of those shops.
+    """
+    shops = connection.execute("""SELECT DISTINCT s.id AS shop_id,s.name
+        FROM coffee_shops s JOIN shop_admins sa ON sa.shop_id=s.id
+        WHERE sa.user_id=%s AND s.is_active IS TRUE AND
+          (sa.role='owner' OR EXISTS (
+            SELECT 1 FROM network_memberships nm
+            WHERE nm.user_id=sa.user_id AND nm.network_id=s.network_id
+              AND nm.role='NETWORK_OWNER')) ORDER BY s.id""", (user_id,)).fetchall()
     if not shops:
-        return {"network_id": network_id, "stats": {}, "periods": {"7": {}, "30": {}}, "shops": []}
+        raise InviteError("OWNER_ACCESS_REQUIRED", 403)
+    dashboard = _shops_dashboard(connection, shops)
+    ids = [shop["shop_id"] for shop in shops]
+    client_fields = """COUNT(*) AS clients,
+        COUNT(*) FILTER (WHERE first_seen>=CURRENT_DATE) AS new_clients_today,
+        COUNT(*) FILTER (WHERE first_seen>=NOW()-INTERVAL '7 days') AS new_clients_7d,
+        COUNT(*) FILTER (WHERE first_seen>=NOW()-INTERVAL '30 days') AS new_clients_30d,
+        COUNT(*) FILTER (WHERE last_seen>=CURRENT_DATE) AS active_clients_today,
+        COUNT(*) FILTER (WHERE last_seen>=NOW()-INTERVAL '7 days') AS active_clients_7d,
+        COUNT(*) FILTER (WHERE last_seen>=NOW()-INTERVAL '30 days') AS active_clients_30d"""
+    aggregate = connection.execute("""WITH clients AS (
+        SELECT user_id,MIN(created_at) AS first_seen,MAX(last_activity_at) AS last_seen
+        FROM shop_clients WHERE shop_id=ANY(%s) GROUP BY user_id)
+        SELECT """ + client_fields + " FROM clients", (ids,)).fetchone()
+    by_shop = connection.execute("""WITH clients AS (
+        SELECT shop_id,created_at AS first_seen,last_activity_at AS last_seen
+        FROM shop_clients WHERE shop_id=ANY(%s))
+        SELECT shop_id,""" + client_fields + " FROM clients GROUP BY shop_id", (ids,)).fetchall()
+    dashboard["stats"].update(aggregate)
+    dashboard["stats"]["active_clients"] = aggregate["active_clients_30d"]
+    # A SHARED balance belongs to one (network,user) ledger, not to each
+    # relationship. Restrict even that ledger to clients of the owned points.
+    balances = connection.execute("""WITH balances AS (
+        SELECT sc.shop_id,sc.user_id,
+          CASE WHEN n.loyalty_mode='SHARED' THEN s.network_id END AS network_id,
+          CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.free_coffee_balance,0)
+               ELSE sc.free_coffee_balance END AS gifts_balance
+        FROM shop_clients sc JOIN coffee_shops s ON s.id=sc.shop_id
+        LEFT JOIN coffee_networks n ON n.id=s.network_id
+        LEFT JOIN network_client_loyalty ncl
+          ON ncl.network_id=s.network_id AND ncl.user_id=sc.user_id
+        WHERE sc.shop_id=ANY(%s)),
+      unique_balances AS (
+        SELECT DISTINCT network_id,
+          CASE WHEN network_id IS NULL THEN shop_id END AS balance_shop_id,
+          user_id,gifts_balance FROM balances)
+      SELECT shop_id,COALESCE(SUM(gifts_balance),0) AS gifts_balance
+        FROM balances GROUP BY shop_id
+      UNION ALL
+      SELECT NULL::BIGINT,COALESCE(SUM(gifts_balance),0) FROM unique_balances""", (ids,)).fetchall()
+    gifts_by_shop = {row["shop_id"]: row["gifts_balance"] for row in balances}
+    dashboard["stats"]["gifts_balance"] = gifts_by_shop[None]
+    client_metrics = {row["shop_id"]: row for row in by_shop}
+    zero_clients = {key: 0 for key in aggregate}
+    for shop in dashboard["shops"]:
+        shop.update(client_metrics.get(shop["shop_id"], zero_clients))
+        shop["active_clients"] = shop["active_clients_30d"]
+        shop["gifts_balance"] = gifts_by_shop.get(shop["shop_id"], 0)
+    dashboard["periods"] = {
+        "today": {key: dashboard["stats"][key] for key in (
+            "visits_today", "cups_today", "gifts_used_today", "new_clients_today", "active_clients_today")},
+        **{str(days): {key: dashboard["stats"][key] for key in (
+            f"visits_{days}d", f"cups_{days}d", f"gifts_{days}d",
+            f"new_clients_{days}d", f"active_clients_{days}d")} for days in (7, 30)},
+    }
+    return dashboard
+
+
+def _shops_dashboard(connection, shops: list[dict]) -> dict:
+    """Existing network metrics shared by explicitly authorized shop scopes."""
+    if not shops:
+        return {"stats": {}, "periods": {"7": {}, "30": {}}, "shops": []}
     ids = [shop["shop_id"] for shop in shops]
     by_shop = connection.execute("""SELECT s.id AS shop_id,s.name,
         COALESCE(sc.clients,0) AS clients,COALESCE(sc.active_clients,0) AS active_clients,
@@ -296,7 +375,7 @@ def network_dashboard(connection, network_id: int) -> dict:
               COUNT(*) FILTER (WHERE created_at>=NOW()-INTERVAL '30 days' AND type='add_cups') AS visits_30d
             FROM transactions WHERE shop_id=ANY(%s))
           SELECT * FROM clients CROSS JOIN activity""", (ids, ids)).fetchone()
-    return {"network_id": network_id, "stats": dict(aggregate),
+    return {"stats": dict(aggregate),
             "periods": {"7": {key: aggregate[key] for key in ("visits_7d","cups_7d","gifts_7d")},
                         "30": {key: aggregate[key] for key in ("visits_30d","cups_30d","gifts_30d")}},
             "shops": [dict(row) for row in by_shop]}

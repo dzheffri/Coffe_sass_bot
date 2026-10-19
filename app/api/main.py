@@ -769,91 +769,48 @@ def user_shops(telegram_user_id: int):
             cur.execute("SELECT id FROM users WHERE telegram_user_id=%s", (telegram_user_id,))
             user = cur.fetchone()
             rows = _user_shop_loyalty_rows(conn, user["id"]) if user else []
-
-    shops = []
-
-    for row in rows:
-        owner_id = row["owner_telegram_id"]
-        profile = {}
-
-        if owner_id:
-            profile_data = get_shop_profile(owner_id)
-
-            if profile_data and profile_data.get("ok"):
-                profile = profile_data.get("shop") or {}
-
-        shops.append({
-            "shop_id": row["shop_id"],
-            "owner_telegram_id": owner_id,
-            "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
-            "city": row["city"] or "",
-            "last_activity_at": (
-                row["last_activity_at"].isoformat()
-                if row["last_activity_at"]
-                else None
-            ),
-            "subtitle": profile.get("subtitle") or "",
-            "address": profile.get("address") or "",
-            "work_from": profile.get("work_from") or "",
-            "work_to": profile.get("work_to") or "",
-            "instagram": profile.get("instagram") or "",
-            "description": profile.get("description") or "",
-            "logo_url": profile.get("logo_url") or "",
-            "cover_url": profile.get("cover_url") or "",
-            "news": profile.get("news") or [],
-            "cups": row["cups"] or 0,
-            "free_coffee_balance": row["free_coffee_balance"] or 0,
-        })
-
-    return {
-        "ok": True,
-        "shops": shops
-    }
+        news = _consumer_shop_news(conn, [row["shop_id"] for row in rows])
+    return {"ok": True, "shops": [_consumer_shop_payload(
+        row, news.get(row["shop_id"], []), include_loyalty_activity=True) for row in rows]}
 
 @app.get("/account/{user_id}/shops")
 def account_shops(user_id: int):
     with get_connection() as conn:
         rows = _user_shop_loyalty_rows(conn, user_id)
+        news = _consumer_shop_news(conn, [row["shop_id"] for row in rows])
+    return {"ok": True, "shops": [_consumer_shop_payload(
+        row, news.get(row["shop_id"], []), include_loyalty_activity=True) for row in rows]}
 
-    shops = []
 
-    for row in rows:
-        owner_id = row["owner_telegram_id"]
-        profile = {}
+def _consumer_shop_news(connection, shop_ids: list[int]) -> dict:
+    if not shop_ids:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute("SELECT to_regclass('shop_news') AS news")
+        if cur.fetchone()["news"] is None:
+            return {}
+        cur.execute("""SELECT id,shop_id,title,price,image_url,sort_order FROM shop_news
+            WHERE shop_id=ANY(%s) ORDER BY shop_id,sort_order ASC,id ASC""", (shop_ids,))
+        result = {}
+        for item in cur.fetchall():
+            result.setdefault(item["shop_id"], []).append({
+                "id": item["id"], "title": item["title"] or "", "price": item["price"] or "",
+                "image_url": item["image_url"] or "", "sort_order": item["sort_order"] or 0,
+            })
+        return result
 
-        if owner_id:
-            profile_data = get_shop_profile(owner_id)
 
-            if profile_data and profile_data.get("ok"):
-                profile = profile_data.get("shop") or {}
-
-        shops.append({
-            "shop_id": row["shop_id"],
-            "owner_telegram_id": owner_id,
-            "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
-            "city": row["city"] or "",
-            "last_activity_at": (
-                row["last_activity_at"].isoformat()
-                if row["last_activity_at"]
-                else None
-            ),
-            "subtitle": profile.get("subtitle") or "",
-            "address": profile.get("address") or "",
-            "work_from": profile.get("work_from") or "",
-            "work_to": profile.get("work_to") or "",
-            "instagram": profile.get("instagram") or "",
-            "description": profile.get("description") or "",
-            "logo_url": profile.get("logo_url") or "",
-            "cover_url": profile.get("cover_url") or "",
-            "news": profile.get("news") or [],
-            "cups": row["cups"] or 0,
-            "free_coffee_balance": row["free_coffee_balance"] or 0,
-        })
-
-    return {
-        "ok": True,
-        "shops": shops,
+def _consumer_shop_payload(row: dict, news: list, *, include_loyalty_activity: bool = False) -> dict:
+    shop = {
+        "shop_id": row["shop_id"], "owner_telegram_id": row["owner_telegram_id"],
+        "name": row["db_shop_name"] or "Кавʼярня", "city": row.get("city") or "",
+        **{field: row.get(field) or "" for field in (
+            "subtitle", "address", "work_from", "work_to", "instagram", "description", "logo_url", "cover_url")},
+        "news": news, "cups": row["cups"] or 0, "free_coffee_balance": row["free_coffee_balance"] or 0,
     }
+    if include_loyalty_activity:
+        shop["last_activity_at"] = row["last_activity_at"].isoformat() if row["last_activity_at"] else None
+    return shop
 
 
 def _user_shop_loyalty_rows(connection, user_id: int):
@@ -862,30 +819,29 @@ def _user_shop_loyalty_rows(connection, user_id: int):
         cur.execute("SELECT to_regclass('coffee_networks') AS networks")
         networks_enabled = cur.fetchone()["networks"] is not None
         if networks_enabled:
-            cur.execute("""SELECT cs.id AS shop_id,cs.name AS db_shop_name,cs.city,
+            cur.execute("""SELECT cs.*,cs.id AS shop_id,cs.name AS db_shop_name,
                 CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.cups,0) ELSE COALESCE(sc.cups,0) END AS cups,
                 CASE WHEN n.loyalty_mode='SHARED' THEN COALESCE(ncl.free_coffee_balance,0)
                      ELSE COALESCE(sc.free_coffee_balance,0) END AS free_coffee_balance,
                 COALESCE(sc.last_activity_at,ncl.last_activity_at) AS last_activity_at,
-                owner.telegram_user_id AS owner_telegram_id
+                (SELECT owner.telegram_user_id FROM shop_admins sa JOIN users owner ON owner.id=sa.user_id
+                    WHERE sa.shop_id=cs.id AND sa.role='owner' ORDER BY sa.id LIMIT 1) AS owner_telegram_id
                 FROM coffee_shops cs
                 LEFT JOIN shop_clients sc ON sc.shop_id=cs.id AND sc.user_id=%s
                 LEFT JOIN coffee_networks n ON n.id=cs.network_id
                 LEFT JOIN network_client_loyalty ncl ON ncl.network_id=cs.network_id AND ncl.user_id=%s
-                LEFT JOIN shop_admins sa ON sa.shop_id=cs.id AND sa.role='owner'
-                LEFT JOIN users owner ON owner.id=sa.user_id
                 WHERE cs.is_active IS TRUE AND (sc.id IS NOT NULL OR
                     (n.loyalty_mode='SHARED' AND ncl.id IS NOT NULL))
-                ORDER BY COALESCE(sc.last_activity_at,ncl.last_activity_at) DESC NULLS LAST,cs.name""",
+                ORDER BY COALESCE(sc.last_activity_at,ncl.last_activity_at) DESC NULLS LAST,cs.name,cs.id""",
                 (user_id, user_id))
         else:
-            cur.execute("""SELECT cs.id AS shop_id,cs.name AS db_shop_name,cs.city,
-                sc.cups,sc.free_coffee_balance,sc.last_activity_at,owner.telegram_user_id AS owner_telegram_id
+            cur.execute("""SELECT cs.*,cs.id AS shop_id,cs.name AS db_shop_name,
+                sc.cups,sc.free_coffee_balance,sc.last_activity_at,
+                (SELECT owner.telegram_user_id FROM shop_admins sa JOIN users owner ON owner.id=sa.user_id
+                    WHERE sa.shop_id=cs.id AND sa.role='owner' ORDER BY sa.id LIMIT 1) AS owner_telegram_id
                 FROM shop_clients sc JOIN coffee_shops cs ON cs.id=sc.shop_id
-                LEFT JOIN shop_admins sa ON sa.shop_id=cs.id AND sa.role='owner'
-                LEFT JOIN users owner ON owner.id=sa.user_id
                 WHERE sc.user_id=%s AND cs.is_active IS TRUE
-                ORDER BY sc.last_activity_at DESC NULLS LAST,cs.name""", (user_id,))
+                ORDER BY sc.last_activity_at DESC NULLS LAST,cs.name,cs.id""", (user_id,))
         return cur.fetchall()
 
 
@@ -953,57 +909,19 @@ def all_shops():
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT
-                    cs.id AS shop_id,
-                    cs.name AS db_shop_name,
-                    cs.city AS city,
-                    owner.telegram_user_id AS owner_telegram_id
+                SELECT cs.*,cs.id AS shop_id,cs.name AS db_shop_name,
+                    0 AS cups,0 AS free_coffee_balance,
+                    (SELECT owner.telegram_user_id FROM shop_admins sa JOIN users owner ON owner.id=sa.user_id
+                        WHERE sa.shop_id=cs.id AND sa.role='owner' ORDER BY sa.id LIMIT 1) AS owner_telegram_id
                 FROM coffee_shops cs
-                LEFT JOIN shop_admins sa
-                    ON sa.shop_id = cs.id AND sa.role = 'owner'
-                LEFT JOIN users owner
-                    ON owner.id = sa.user_id
                 WHERE cs.is_active
-                ORDER BY cs.name
+                ORDER BY cs.name,cs.id
                 """
             )
 
             rows = cur.fetchall()
-
-    shops = []
-
-    for row in rows:
-        owner_id = row["owner_telegram_id"]
-        profile = {}
-
-        if owner_id:
-            profile_data = get_shop_profile(owner_id)
-
-            if profile_data and profile_data.get("ok"):
-                profile = profile_data.get("shop") or {}
-
-        shops.append({
-            "shop_id": row["shop_id"],
-            "owner_telegram_id": owner_id,
-            "name": profile.get("name") or row["db_shop_name"] or "Кавʼярня",
-            "city": row["city"] or "",
-            "subtitle": profile.get("subtitle") or "",
-            "address": profile.get("address") or "",
-            "work_from": profile.get("work_from") or "",
-            "work_to": profile.get("work_to") or "",
-            "instagram": profile.get("instagram") or "",
-            "description": profile.get("description") or "",
-            "logo_url": profile.get("logo_url") or "",
-            "cover_url": profile.get("cover_url") or "",
-            "news": profile.get("news") or [],
-            "cups": 0,
-            "free_coffee_balance": 0,
-        })
-
-    return {
-        "ok": True,
-        "shops": shops
-    }
+        news = _consumer_shop_news(conn, [row["shop_id"] for row in rows])
+    return {"ok": True, "shops": [_consumer_shop_payload(row, news.get(row["shop_id"], [])) for row in rows]}
 
 
 @app.post("/auth/telegram-miniapp")

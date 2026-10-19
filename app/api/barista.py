@@ -152,7 +152,7 @@ def build_barista_router(
 
     def identity_session(token: str, *, logout: bool = False) -> dict:
         try:
-            return resolve_onboarding_session(token, logout=logout)
+            return resolve_onboarding_session(token, logout=logout, upgrade_if_assigned=not logout)
         except BaristaSessionError:
             return authorize(token, logout=logout)
 

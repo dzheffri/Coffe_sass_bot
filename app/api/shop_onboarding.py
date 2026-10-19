@@ -2,7 +2,7 @@
 
 from typing import Callable
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from psycopg.errors import UndefinedColumn, UndefinedTable
 
@@ -10,6 +10,7 @@ from app.admin_invites import InviteError
 from app.db import get_connection
 from app.owner_onboarding import create_owner_invite
 from app.network_management import ensure_network_shop_memberships
+from app.owner_assignment import assign_shop_owner, assign_network_owner, search_owners
 
 
 class CreateShopRequest(BaseModel):
@@ -24,6 +25,7 @@ class CreateShopRequest(BaseModel):
     logo_url: str = Field(default="", strict=True, max_length=2048)
     cover_url: str = Field(default="", strict=True, max_length=2048)
     network_id: int | None = Field(default=None, strict=True, gt=0)
+    owner_user_id: int | None = Field(default=None, strict=True, gt=0)
 
     @field_validator("name")
     @classmethod
@@ -37,6 +39,13 @@ class CreateShopRequest(BaseModel):
 
 
 class OwnerInviteRequest(BaseModel):
+    class Config:
+        extra = "forbid"
+
+
+class OwnerAssignmentRequest(BaseModel):
+    user_id: int = Field(strict=True, gt=0)
+
     class Config:
         extra = "forbid"
 
@@ -57,6 +66,7 @@ def build_shop_onboarding_router(*, require_superadmin: Callable) -> APIRouter:
     @router.post("/superadmin/shops", status_code=201)
     def create(body: CreateShopRequest, current_user=Depends(require_superadmin)):
         values = body.model_dump()
+        owner = None
         with get_connection() as connection:
             with connection.transaction():
                 with connection.cursor() as cur:
@@ -83,6 +93,19 @@ def build_shop_onboarding_router(*, require_superadmin: Callable) -> APIRouter:
                     shop = cur.fetchone()
                     if network_id is not None:
                         ensure_network_shop_memberships(connection, network_id, shop["id"])
+                    if values["owner_user_id"] is not None:
+                        try:
+                            owner = assign_shop_owner(connection, shop["id"], values["owner_user_id"])["owner"]
+                        except InviteError as exc:
+                            raise HTTPException(exc.status, detail={"code": exc.code}) from exc
+                    elif network_id is not None:
+                        owner = cur.execute("""SELECT u.id AS user_id,u.telegram_user_id,
+                            COALESCE(NULLIF(u.full_name,''),NULLIF(u.username,''),'Власник') AS name,
+                            u.telegram_user_id IS NOT NULL OR EXISTS(SELECT 1 FROM user_identities ui
+                                WHERE ui.user_id=u.id AND ui.provider='telegram') AS telegram_connected
+                            FROM shop_admins sa JOIN users u ON u.id=sa.user_id
+                            WHERE sa.shop_id=%s AND sa.role='owner' ORDER BY sa.id LIMIT 1""",
+                            (shop["id"],)).fetchone()
                     # Match existing Telegram-created shop trial behavior.
                     cur.execute(
                         """INSERT INTO subscriptions(shop_id,plan,status,expires_at)
@@ -90,7 +113,34 @@ def build_shop_onboarding_router(*, require_superadmin: Callable) -> APIRouter:
                     )
         return {"ok": True, "shop": {"shop_id": shop["id"], **values,
                 "network_id": network_id, "is_active": shop["is_active"],
-                "owner_telegram_id": None, "news": [], **owner_metadata({})}}
+                "owner_telegram_id": owner["telegram_user_id"] if owner else None, "news": [],
+                **owner_metadata({"owner_info": {"user_id": owner["user_id"], "name": owner["name"],
+                    "telegram_connected": owner.get("telegram_connected", owner["telegram_user_id"] is not None)}} if owner else {})}}
+
+    @router.get("/superadmin/owners")
+    def owners(query: str = Query(default="", max_length=200), current_user=Depends(require_superadmin)):
+        with get_connection() as connection:
+            return {"ok": True, "owners": search_owners(connection, query)}
+
+    @router.post("/superadmin/shops/{shop_id}/owner")
+    def shop_owner(shop_id: int, body: OwnerAssignmentRequest, current_user=Depends(require_superadmin)):
+        try:
+            with get_connection() as connection:
+                with connection.transaction():
+                    result = assign_shop_owner(connection, shop_id, body.user_id)
+        except InviteError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from exc
+        return {"ok": True, **result}
+
+    @router.post("/superadmin/networks/{network_id}/owner")
+    def network_owner(network_id: int, body: OwnerAssignmentRequest, current_user=Depends(require_superadmin)):
+        try:
+            with get_connection() as connection:
+                with connection.transaction():
+                    result = assign_network_owner(connection, network_id, body.user_id)
+        except InviteError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from exc
+        return {"ok": True, **result}
 
     @router.post("/superadmin/shops/{shop_id}/owner-invite", status_code=201)
     def invite(shop_id: int, body: OwnerInviteRequest, current_user=Depends(require_superadmin)):

@@ -114,11 +114,14 @@ def approve_request(code_or_token, token, authorize, *, confirm):
 
 def memberships(conn, user_id):
     if conn.execute("SELECT to_regclass('coffee_networks') AS networks").fetchone()["networks"] is not None:
-        return conn.execute("""SELECT sa.id AS membership_id,sa.shop_id,sa.role,cs.name,
+        return conn.execute("""SELECT sa.id AS membership_id,sa.shop_id,
+        CASE WHEN nm.id IS NOT NULL THEN 'owner' ELSE sa.role END AS role,cs.name,
         cs.network_id,n.name AS network_name
         FROM shop_admins sa JOIN coffee_shops cs ON cs.id=sa.shop_id
         LEFT JOIN coffee_networks n ON n.id=cs.network_id
-        WHERE sa.user_id=%s AND sa.role='owner' AND cs.is_active IS TRUE
+        LEFT JOIN network_memberships nm ON nm.user_id=sa.user_id
+            AND nm.network_id=cs.network_id AND nm.role='NETWORK_OWNER'
+        WHERE sa.user_id=%s AND (sa.role='owner' OR nm.id IS NOT NULL) AND cs.is_active IS TRUE
         ORDER BY sa.id FOR SHARE OF sa,cs""", (user_id,)).fetchall()
     return conn.execute("""SELECT sa.id AS membership_id,sa.shop_id,sa.role,cs.name
         FROM shop_admins sa JOIN coffee_shops cs ON cs.id=sa.shop_id

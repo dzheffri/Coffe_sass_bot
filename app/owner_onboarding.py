@@ -7,6 +7,7 @@ from psycopg.errors import UniqueViolation
 from app.admin_invites import InviteError, _digest, _pepper, _public_invite, _record_attempt
 from app.barista_sessions import BaristaSessionError, resolve_barista_session
 from app.db import _hash_barista_session_token, create_app_session, get_connection
+from app.owner_assignment import has_owner_access
 
 
 def create_onboarding_identity(provider: str, subject: str) -> dict:
@@ -47,11 +48,12 @@ def create_onboarding_identity(provider: str, subject: str) -> dict:
 
 
 def resolve_onboarding_session(token: str, *, connection=None, logout: bool = False,
-                               lock: bool = False) -> dict:
+                               lock: bool = False, upgrade_if_assigned: bool = False) -> dict:
     if connection is None:
         with get_connection() as connection:
             with connection.transaction():
-                return resolve_onboarding_session(token, connection=connection, logout=logout, lock=lock)
+                return resolve_onboarding_session(token, connection=connection, logout=logout, lock=lock,
+                                                  upgrade_if_assigned=upgrade_if_assigned)
     digest = _hash_barista_session_token(token)
     if not digest:
         raise BaristaSessionError("INVALID_SESSION")
@@ -74,6 +76,26 @@ def resolve_onboarding_session(token: str, *, connection=None, logout: bool = Fa
             raise BaristaSessionError("INVALID_SESSION")
         if logout:
             cur.execute("UPDATE app_sessions SET revoked_at=clock_timestamp() WHERE id=%s", (session["session_id"],))
+        elif upgrade_if_assigned:
+            # Match staff authorization's shop -> membership -> session lock order.
+            # A Super Admin can assign access while this device is on onboarding.
+            cur.execute("""SELECT cs.id FROM coffee_shops cs
+                WHERE cs.is_active IS TRUE AND EXISTS(SELECT 1 FROM shop_admins sa
+                    WHERE sa.shop_id=cs.id AND sa.user_id=%s AND sa.role IN ('admin','owner'))
+                ORDER BY cs.id FOR NO KEY UPDATE OF cs""", (session["user_id"],))
+            cur.fetchall()
+            memberships = cur.execute("""SELECT sa.id FROM shop_admins sa
+                JOIN coffee_shops cs ON cs.id=sa.shop_id WHERE sa.user_id=%s
+                AND sa.role IN ('admin','owner') AND cs.is_active IS TRUE
+                ORDER BY sa.id FOR SHARE OF sa""", (session["user_id"],)).fetchall()
+            if memberships:
+                promoted = cur.execute("""UPDATE app_sessions SET purpose='barista',selected_membership_id=%s
+                    WHERE id=%s AND purpose='barista_onboarding' AND selected_membership_id IS NULL
+                    AND revoked_at IS NULL AND expires_at>clock_timestamp() RETURNING id""",
+                    (memberships[0]["id"], session["session_id"])).fetchone()
+                if promoted is None:
+                    raise BaristaSessionError("INVALID_SESSION")
+                return resolve_barista_session(token, connection=connection)
         session.update(memberships=[], selected_membership_id=None, onboarding_required=True)
         return session
 
@@ -176,7 +198,8 @@ def claim_invite(*, token: str, code: str) -> tuple[str, dict]:
                     if error is None:
                         # Shop first, then account/session/invite: deletion cannot
                         # win after this bearer has been checked under its lock.
-                        cur.execute("SELECT id FROM users WHERE id=%s FOR SHARE", (actor["user_id"],))
+                        cur.execute("SELECT id FROM users WHERE id=%s FOR " +
+                                    ("UPDATE" if candidate["role"] == "owner" else "SHARE"), (actor["user_id"],))
                         resolve_onboarding_session(token, connection=connection, lock=True)
                         cur.execute(
                             """SELECT * FROM barista_admin_invites WHERE id=%s
@@ -188,6 +211,8 @@ def claim_invite(*, token: str, code: str) -> tuple[str, dict]:
                             "SELECT %s>clock_timestamp() AS valid", (invite["expires_at"],),
                         ).fetchone()["valid"]:
                             error = InviteError("INVALID_INVITE")
+                        elif invite["role"] == "owner" and has_owner_access(connection, actor["user_id"]):
+                            error = InviteError("OWNER_ACCESS_ALREADY_EXISTS", 409)
                         else:
                             try:
                                 with connection.transaction():
