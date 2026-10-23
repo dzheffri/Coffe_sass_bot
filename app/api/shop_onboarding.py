@@ -10,7 +10,7 @@ from app.admin_invites import InviteError
 from app.db import get_connection
 from app.owner_onboarding import create_owner_invite
 from app.network_management import ensure_network_shop_memberships
-from app.owner_assignment import assign_shop_owner, assign_network_owner, search_owners
+from app.owner_assignment import assign_shop_owner, assign_network_owner, search_owners, search_owners_by_shop
 
 
 class CreateShopRequest(BaseModel):
@@ -121,6 +121,11 @@ def build_shop_onboarding_router(*, require_superadmin: Callable) -> APIRouter:
     def owners(query: str = Query(default="", max_length=200), current_user=Depends(require_superadmin)):
         with get_connection() as connection:
             return {"ok": True, "owners": search_owners(connection, query)}
+
+    @router.get("/superadmin/owners/by-shop")
+    def owners_by_shop(query: str = Query(default="", max_length=200), current_user=Depends(require_superadmin)):
+        with get_connection() as connection:
+            return {"ok": True, "shops": search_owners_by_shop(connection, query)}
 
     @router.post("/superadmin/shops/{shop_id}/owner")
     def shop_owner(shop_id: int, body: OwnerAssignmentRequest, current_user=Depends(require_superadmin)):

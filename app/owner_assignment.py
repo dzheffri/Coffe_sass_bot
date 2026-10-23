@@ -33,6 +33,54 @@ def search_owners(connection, query: str = "") -> list[dict]:
     return [public_owner(row) for row in rows]
 
 
+def search_owners_by_shop(connection, query: str = "") -> list[dict]:
+    """Find existing owners through real active locations, without changing access."""
+    query = query.strip()
+    if not query:
+        return []
+    network_edges = ""
+    if connection.execute("SELECT to_regclass('network_memberships') AS memberships").fetchone()["memberships"] is not None:
+        network_edges = """UNION SELECT cs.id,nm.user_id FROM visible_shops cs
+            JOIN network_memberships nm ON nm.network_id=cs.network_id AND nm.role='NETWORK_OWNER'"""
+    pattern = "%" + query.casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    # Some existing PostgreSQL databases use the C locale, where lower() leaves
+    # Ukrainian letters unchanged. Keep name search and demo filtering consistent.
+    uppercase = "АБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯЫЭЁЪ"
+    lowercase = "абвгґдеєжзиіїйклмнопрстуфхцчшщьюяыэёъ"
+    rows = connection.execute("""WITH visible_shops AS (
+            SELECT cs.id,cs.name,(to_jsonb(cs)->>'network_id')::bigint AS network_id,
+                   translate(lower(cs.name),%s,%s) AS search_name
+            FROM coffee_shops cs
+            WHERE cs.is_active IS TRUE AND to_jsonb(cs)->>'deleted_at' IS NULL
+              AND COALESCE(lower(to_jsonb(cs)->>'is_test'),'false') NOT IN ('true','1')
+              AND COALESCE(lower(to_jsonb(cs)->>'is_demo'),'false') NOT IN ('true','1')
+              AND translate(COALESCE(lower(btrim(to_jsonb(cs)->>'city')),''),%s,%s)
+                    NOT IN ('test','demo','тест','демо')
+              AND translate(lower(cs.name),%s,%s)
+                    !~ '(^|[^[:alnum:]а-яіїєґ])(test|demo|тест|демо)([^[:alnum:]а-яіїєґ]|$)'
+        ), owner_edges AS (
+            SELECT cs.id AS shop_id,sa.user_id FROM visible_shops cs
+            JOIN shop_admins sa ON sa.shop_id=cs.id AND sa.role='owner'
+            """ + network_edges + """
+        ), owner_counts AS (
+            SELECT user_id,COUNT(DISTINCT shop_id)::integer AS shops_count
+            FROM owner_edges GROUP BY user_id
+        ), matches AS (
+            SELECT id,name,search_name FROM visible_shops WHERE search_name LIKE %s ORDER BY search_name,id LIMIT 50
+        )
+        SELECT m.id AS shop_id,m.name AS shop_name,u.id,u.full_name,u.username,u.telegram_user_id,
+               oc.shops_count
+        FROM matches m LEFT JOIN owner_edges oe ON oe.shop_id=m.id
+        LEFT JOIN users u ON u.id=oe.user_id LEFT JOIN owner_counts oc ON oc.user_id=u.id
+        ORDER BY m.search_name,m.id,u.id""", (uppercase, lowercase, uppercase, lowercase, uppercase, lowercase, pattern)).fetchall()
+    shops = {}
+    for row in rows:
+        shop = shops.setdefault(row["shop_id"], {"shop_id": row["shop_id"], "name": row["shop_name"], "owners": []})
+        if row["id"] is not None:
+            shop["owners"].append({**public_owner(row), "shops_count": row["shops_count"]})
+    return list(shops.values())
+
+
 def _existing_owner(connection, user_id: int) -> dict:
     user = connection.execute("SELECT id,full_name,username,telegram_user_id FROM users WHERE id=%s FOR KEY SHARE",
                               (user_id,)).fetchone()
