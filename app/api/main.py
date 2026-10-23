@@ -83,6 +83,7 @@ from app.api.broadcasts import build_broadcast_inbox_router
 from app.api.community import build_community_router
 from app.api.shop_onboarding import build_shop_onboarding_router, owner_metadata
 from app.api.networks import build_superadmin_network_router
+from app.api.qr_materials import build_qr_materials_router
 from app.telegram_link import confirm_telegram_link_session
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 UPLOADS_DIR = "/data/uploads"
@@ -371,6 +372,11 @@ def require_superadmin(
 
 app.include_router(build_shop_onboarding_router(require_superadmin=require_superadmin))
 app.include_router(build_superadmin_network_router(require_superadmin=require_superadmin))
+app.include_router(build_qr_materials_router(
+    verify_actor=get_verified_telegram_actor,
+    superadmin_telegram_ids=SUPERADMIN_TELEGRAM_IDS,
+    connection_factory=get_connection,
+))
 
 app.include_router(build_sales_router(
     verify_actor=get_verified_telegram_actor,
