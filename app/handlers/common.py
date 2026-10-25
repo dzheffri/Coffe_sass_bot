@@ -15,7 +15,7 @@ from app.db import (
     create_admin_login_ticket,
     get_admin_shops_for_telegram,
 )
-from app.keyboards import user_main_keyboard, admin_main_keyboard
+from app.keyboards import user_main_keyboard, admin_main_keyboard, community_channel_keyboard
 from app.config import SUPER_ADMIN_IDS, SCANNER_URL, ADMIN_PANEL_URL
 from app.telegram_link import bind_telegram_link_session, confirm_telegram_link_session
 from app.handlers.support import support_start
@@ -46,6 +46,13 @@ async def send_correct_panel(message: types.Message, *, actor_id: int | None = N
             "🏪 Один QR-код працює у всіх кав’ярнях,\n"
             "які підключені до програми «Наші»",
             reply_markup=user_main_keyboard()
+        )
+        # Telegram reply keyboards cannot contain URL buttons. Keep the loyalty
+        # menu intact and expose the direct channel link alongside it.
+        await message.answer(
+            "☕️ Кавова спільнота «Наші»",
+            reply_markup=community_channel_keyboard(),
+            disable_notification=True,
         )
         return
 

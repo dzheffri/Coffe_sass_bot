@@ -4,7 +4,7 @@ from contextlib import contextmanager
 import logging
 from typing import Callable, Collection, Literal
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Request, Response
 from pydantic import BaseModel, Field
 from psycopg.errors import UndefinedColumn, UndefinedTable
 from starlette.datastructures import UploadFile
@@ -127,6 +127,7 @@ def build_community_router(
     connection_factory: Callable,
     media_storage_factory: Callable = CommunityMediaStorage,
     push_sender: Callable | None = None,
+    telegram_bot_factory: Callable | None = None,
 ) -> APIRouter:
     router = APIRouter(tags=["community"])
 
@@ -288,7 +289,7 @@ def build_community_router(
             raise HTTPException(503, detail={"code": "COMMUNITY_MEDIA_UNAVAILABLE"}) from exc
 
     @router.post("/community/admin/posts/{post_id}/publish")
-    async def admin_publish(post_id: int = Path(gt=0, le=_MAX_ID), body: CommunityPublishRequest = Body(...),
+    async def admin_publish(background_tasks: BackgroundTasks, post_id: int = Path(gt=0, le=_MAX_ID), body: CommunityPublishRequest = Body(...),
                              actor=Depends(admin_response)):
         with database(readonly=False) as connection:
             try:
@@ -325,6 +326,38 @@ def build_community_router(
                 logger.warning("Community push delivery failed (%s)", type(exc).__name__)
         elif should_notify:
             logger.info("Community push skipped: no enabled iOS devices (sent=0 failed=0 invalid=0)")
-        return post
+        if post.get("telegram_status") == "pending":
+            await deliver_telegram(post_id, actor["user_id"], deliver_personal=False)
+        with database() as connection:
+            result = repository(connection).get_post(post_id, actor["user_id"], published_only=False, admin=True)
+        if post.get("telegram_status") == "pending" and result["telegram_status"] == "published" and result["telegram_dm_pending_count"]:
+            background_tasks.add_task(deliver_telegram, post_id, actor["user_id"], personal_only=True)
+        return result
+
+    async def deliver_telegram(post_id, actor_user_id, *, retry=False, deliver_personal=True, personal_only=False):
+        from app.community_telegram import deliver_community_telegram
+        try:
+            await deliver_community_telegram(
+                post_id=post_id, actor_user_id=actor_user_id, connection_factory=connection_factory,
+                bot_factory=telegram_bot_factory, media_storage_factory=media_storage_factory, retry=retry,
+                deliver_personal=deliver_personal, personal_only=personal_only,
+            )
+        except CommunityError as exc:
+            if retry and not personal_only:
+                raise _error(exc) from exc
+            logger.warning("Community Telegram delivery stopped (%s)", exc.code)
+        except Exception as exc:
+            # App publication is committed independently of external delivery.
+            # Persisted in-flight claims must not be reset on ambiguous errors.
+            logger.warning("Community Telegram delivery interrupted (%s)", type(exc).__name__)
+
+    @router.post("/community/admin/posts/{post_id}/telegram/retry")
+    async def admin_telegram_retry(background_tasks: BackgroundTasks, post_id: int = Path(gt=0, le=_MAX_ID), actor=Depends(admin_response)):
+        await deliver_telegram(post_id, actor["user_id"], retry=True, deliver_personal=False)
+        with database() as connection:
+            result = repository(connection).get_post(post_id, actor["user_id"], published_only=False, admin=True)
+        if result["telegram_status"] == "published" and result["telegram_dm_pending_count"] + result["telegram_dm_failed_count"]:
+            background_tasks.add_task(deliver_telegram, post_id, actor["user_id"], retry=True, personal_only=True)
+        return result
 
     return router

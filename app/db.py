@@ -1384,6 +1384,61 @@ def merge_users(source_user_id: int, target_user_id: int):
                     WHERE user_id = %s
                 """, (target_user_id, source_user_id))
 
+            # A delivered/ambiguous Community DM remains a delivery receipt
+            # after account linking. Losing it through ON DELETE CASCADE would
+            # allow a later Telegram retry to contact the same person again.
+            cur.execute("SELECT to_regclass('community_telegram_deliveries') AS deliveries_table")
+            if cur.fetchone()["deliveries_table"] is not None:
+                cur.execute("""
+                    SELECT * FROM community_telegram_deliveries
+                    WHERE user_id IN (%s, %s)
+                    ORDER BY post_id, user_id FOR UPDATE
+                """, (source_user_id, target_user_id))
+                deliveries = cur.fetchall()
+                target_deliveries = {
+                    row["post_id"]: row for row in deliveries
+                    if row["user_id"] == target_user_id
+                }
+                # Uncertain/in-flight sends cannot be replayed. A confirmed
+                # receipt is strongest, even if the other account had failed.
+                delivery_priority = {
+                    "pending": 0, "failed": 1, "skipped": 2,
+                    "sending": 3, "unknown": 3, "sent": 4,
+                }
+                for source_delivery in deliveries:
+                    if source_delivery["user_id"] != source_user_id:
+                        continue
+                    target_delivery = target_deliveries.get(source_delivery["post_id"])
+                    if target_delivery is None:
+                        cur.execute("""
+                            UPDATE community_telegram_deliveries SET user_id=%s
+                            WHERE post_id=%s AND user_id=%s
+                        """, (target_user_id, source_delivery["post_id"], source_user_id))
+                        continue
+                    receipt = (
+                        source_delivery
+                        if delivery_priority[source_delivery["status"]]
+                        > delivery_priority[target_delivery["status"]]
+                        else target_delivery
+                    )
+                    # Remove the overlapping source before copying its chat
+                    # receipt, preserving UNIQUE(post_id, telegram_user_id).
+                    cur.execute("""
+                        DELETE FROM community_telegram_deliveries
+                        WHERE post_id=%s AND user_id=%s
+                    """, (source_delivery["post_id"], source_user_id))
+                    cur.execute("""
+                        UPDATE community_telegram_deliveries
+                        SET telegram_user_id=%s,status=%s,message_id=%s,
+                            error_code=%s,attempted_at=%s,created_at=%s
+                        WHERE post_id=%s AND user_id=%s
+                    """, (
+                        receipt["telegram_user_id"], receipt["status"], receipt["message_id"],
+                        receipt["error_code"], receipt["attempted_at"],
+                        min(source_delivery["created_at"], target_delivery["created_at"]),
+                        source_delivery["post_id"], target_user_id,
+                    ))
+
             # -------------------------------------------------
             # 9. shop_admins
             #

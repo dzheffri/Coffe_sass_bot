@@ -5,6 +5,7 @@ import importlib
 import sys
 from types import ModuleType
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ from conftest import PROJECT, bearer
 MIGRATION = PROJECT / "migrations/20261015_community_posts.sql"
 SOFT_DELETE_MIGRATION = PROJECT / "migrations/20261015_community_soft_delete.sql"
 ACTIVE_SERIES_MIGRATION = PROJECT / "migrations/20261019_community_series_active_uniqueness.sql"
+TELEGRAM_MIGRATION = PROJECT / "migrations/20261025_community_telegram.sql"
 
 
 def _photo_bytes(kind="PNG"):
@@ -31,6 +33,7 @@ def community_api(database, tmp_path):
     database.query(MIGRATION.read_text(encoding="utf-8"))
     database.query(SOFT_DELETE_MIGRATION.read_text(encoding="utf-8"))
     database.query(ACTIVE_SERIES_MIGRATION.read_text(encoding="utf-8"))
+    database.query(TELEGRAM_MIGRATION.read_text(encoding="utf-8"))
     module = importlib.import_module("app.api.community")
 
     def auth(authorization: str | None = Header(default=None)):
@@ -52,6 +55,8 @@ def community_api(database, tmp_path):
         superadmin_telegram_ids={1001},
         connection_factory=database.db.get_connection,
         media_storage_factory=lambda: module.CommunityMediaStorage(tmp_path / "community-upload"),
+        telegram_bot_factory=lambda: SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+            send_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)), session=SimpleNamespace(close=AsyncMock())),
     ))
     with TestClient(app) as client:
         yield client, database

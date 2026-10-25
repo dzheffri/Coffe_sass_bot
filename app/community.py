@@ -44,6 +44,8 @@ class CommunityRepository:
 
     def _serialized(self, row: dict, user_id: int, *, include_series: bool = False,
                     admin: bool = False) -> dict:
+        from app.community_telegram import telegram_admin_status
+
         post_id = row["id"]
         options = _json_options(row["options"])
         is_poll = row["type"] == "poll"
@@ -102,6 +104,7 @@ class CommunityRepository:
             "series_posts": series_posts,
             **({"notification_attempted": bool(row["notification_attempted"])}
                if admin and "notification_attempted" in row else {}),
+            **(telegram_admin_status(self.connection, row) if admin else {}),
         }
 
     def list_posts(self, user_id: int, *, limit: int, offset: int,
@@ -175,9 +178,12 @@ class CommunityRepository:
         if row["published_at"] is None:
             row = self.connection.execute(
                 """UPDATE community_posts
-                   SET published_at=NOW(), notification_attempted=%s
+                   SET published_at=NOW(), notification_attempted=%s,telegram_status='pending'
                    WHERE id=%s RETURNING *""", (bool(notify), post_id),
             ).fetchone()
+            if should_notify:
+                from app.community_telegram import queue_telegram_only_recipients
+                queue_telegram_only_recipients(self.connection, post_id)
         return self._serialized(row, actor_user_id, admin=True), should_notify
 
     def delete_post(self, post_id: int) -> None:

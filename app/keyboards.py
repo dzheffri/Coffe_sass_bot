@@ -7,6 +7,20 @@ from aiogram.types import (
 )
 
 
+COMMUNITY_CHANNEL_URL = "https://t.me/nashi_coffee_community"
+
+
+def community_channel_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="☕️ Кавова спільнота",
+                url=COMMUNITY_CHANNEL_URL,
+            )
+        ]]
+    )
+
+
 def user_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[

@@ -101,3 +101,24 @@ class CommunityMediaStorage:
         except FileNotFoundError:
             return False
         return True
+
+    def read(self, url: str) -> bytes | None:
+        """Read our own regular asset only; never fetch client-provided URLs."""
+        prefix = "/uploads/community/"
+        if not isinstance(url, str) or not url.startswith(prefix):
+            raise ValueError("Invalid community image reference")
+        key = url[len(prefix):]
+        if _MEDIA_KEY.fullmatch(key) is None:
+            raise ValueError("Invalid community image reference")
+        try:
+            with self._directory() as directory:
+                descriptor = os.open(key, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+                with os.fdopen(descriptor, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise ValueError("Invalid community image file")
+                    from app.broadcast_media import PHOTO_LIMIT
+                    data = stream.read(PHOTO_LIMIT + 1)
+                    return validate_media("photo", key, data)["bytes"]
+        except FileNotFoundError:
+            return None
