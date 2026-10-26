@@ -20,13 +20,36 @@ Shop routes (network equivalents live under `/barista/owner/networks/{id}`):
 - `GET /barista/owner/broadcasts?limit=20&offset=0` — bounded history.
 
 Each route rechecks current authenticated owner access and tenant scope.
-Delivery retains APNs priority and Telegram fallback. Telegram renders the
+New confirmations persist an APP, TELEGRAM or NONE route for each recipient.
+Existing Apple/Google identity, any consumer session or any registered device
+is app evidence, including disabled devices and expired/revoked sessions.
+APP recipients keep their inbox delivery even without a usable push token;
+they never receive Telegram fallback. Only Telegram-only recipients receive a
+Telegram message. Before an untouched Telegram attempt, new app evidence
+promotes that recipient to APP. Telegram renders the
 shop/network name separately; original database text is untouched. Claims and
 acknowledgements are persisted per recipient/channel. A worker restart resumes
 only untouched attempts. An external call with an unknown outcome is never
 resent or followed by Telegram merely because its acknowledgement was lost.
 
 Statuses: `queued`, `sending`, `completed`, `partial`; older objects are `legacy`.
+For old App Store clients, the confirmation POST keeps HTTP 202 but maps an
+unfinished `status` to `partial`, which their existing success guard accepts.
+The additive `delivery_status` always contains the actual state. Read-only
+status, token reconciliation and history continue returning actual `status`.
+
+Apply additive `20261027_broadcast_routing_accounting.sql` for this contract.
+It does not classify historical recipients, queue work or replay a broadcast.
+New job accounting persists independently of later account deletion/merging:
+`target_users = app_routed_users + telegram_routed_users + no_delivery_channel`.
+`app_inbox_created` counts APP recipients; the older
+`app_notifications_created` remains the number of all physical recipient rows
+created at publication. `sent` is APP inbox deliveries plus successful Telegram
+deliveries, never APNs devices added a second time. `apns_users` counts users
+with a known APNs attempt; `apns_devices_sent` and `apns_failed` count device
+acknowledgements. Telegram success/failure counts users, with error-class
+summaries and unknown outcomes recorded separately. Unrecoverable historical
+route metrics remain null, not fabricated zeroes.
 Legacy channel counters are null: their old mixed `recipients_count` cannot prove
 how many APNs/Telegram sends occurred. Delivery success never means read.
 

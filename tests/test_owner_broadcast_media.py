@@ -54,17 +54,18 @@ def test_valid_native_media_is_pinned_to_shop_preview_and_cleared_before_deliver
     stored = owner_database.query("SELECT * FROM admin_broadcast_previews")[0]
     assert bytes(stored["media_bytes"]) == data
     result = send(client,token,body["confirmation_token"])
-    assert result.status_code == 202 and result.json()["status"] == "queued"
+    assert result.status_code == 202 and result.json()["status"] == "partial"
+    assert result.json()["delivery_status"] == "queued"
     delivery.assert_not_awaited()
     delivery.drain()
-    captured = delivery.worker_push.await_args.args[0]
+    captured = owner_database.query("SELECT * FROM broadcasts")[0]
     assert owner_database.broadcast_storage.get(captured["media_key"])["bytes"] == data
-    assert captured["media_type"] == kind and captured["shop_name"] == "Наші"
-    assert [{key:call.args[1][key] for key in ("user_id", "telegram_user_id")}
-            for call in delivery.worker_push.await_args_list] == [
+    assert captured["media_type"] == kind and captured["shop_id"] == 1
+    assert owner_database.query("SELECT user_id,telegram_user_id FROM broadcast_recipient_deliveries ORDER BY user_id") == [
         {"user_id":4,"telegram_user_id":1004},
         {"user_id":6,"telegram_user_id":1006},
     ]
+    delivery.worker_push.assert_not_awaited()
     assert captured["text"] == "Запрошуємо на каву"
     stored = owner_database.query("SELECT * FROM admin_broadcast_previews")[0]
     assert stored["media_bytes"] is None and stored["used_at"] is not None
@@ -73,6 +74,7 @@ def test_valid_native_media_is_pinned_to_shop_preview_and_cleared_before_deliver
     delivery.drain()
     sender = delivery.worker_bot.send_photo if kind == "photo" else delivery.worker_bot.send_video
     assert sender.await_count == 2
+    assert all(call.kwargs["caption"].startswith("☕️ Наші\n\n") for call in sender.await_args_list)
     assert all(call.kwargs[kind].data == data for call in sender.await_args_list)
 
 

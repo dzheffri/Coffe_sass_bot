@@ -7,9 +7,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.methods import SendMessage
 
 from app.broadcast_jobs import (delivery_status, enqueue_broadcast, merge_job_recipient_receipts,
-                                owner_history, process_broadcast_jobs_once, telegram_plan)
+                                owner_history, process_broadcast_jobs_once, telegram_plan,confirmation_response)
 from app.broadcast_publication import BroadcastPublication
 from conftest import bearer
 from test_barista_operations import operations_database
@@ -21,6 +23,7 @@ from test_owner_broadcast_media import photo_data, video_data
 def jobs_database(owner_database, monkeypatch):
     db = owner_database
     db.query((Path(__file__).parents[1] / 'migrations/20261026_broadcast_delivery_jobs.sql').read_text())
+    db.query((Path(__file__).parents[1] / 'migrations/20261027_broadcast_routing_accounting.sql').read_text())
     import app.api.barista_owner as owner_module
     monkeypatch.setattr(owner_module, 'broadcast_job_loop', AsyncMock())
     return db
@@ -68,7 +71,7 @@ def test_confirmation_queues_immediately_and_reconciles_same_action(jobs_databas
     response = send(client, token, body['confirmation_token'])
     assert response.status_code == 202, response.text
     result = response.json()
-    assert result['status'] == 'queued' and result['broadcast_id'] > 0
+    assert result['status'] == 'partial' and result['delivery_status'] == 'queued' and result['broadcast_id'] > 0
     assert result['target_users'] == result['app_notifications_created'] == 2
     assert result['apns_attempted'] == result['telegram_attempted'] == 0
     assert db.query('SELECT * FROM touch_logs') == []
@@ -79,10 +82,11 @@ def test_confirmation_queues_immediately_and_reconciles_same_action(jobs_databas
     assert repeated.status_code == 202 and repeated.json() == result
     reconciled = client.post('/barista/owner/broadcast/status', headers=bearer(refreshed),
                              json={'confirmation_token':body['confirmation_token']})
-    assert reconciled.status_code == 200 and reconciled.json() == result
+    actual = dict(result,status='queued')
+    assert reconciled.status_code == 200 and reconciled.json() == actual
     assert len(db.query('SELECT id FROM broadcasts')) == 1
     assert len(db.query('SELECT * FROM broadcast_delivery_jobs')) == 1
-    assert client.get('/barista/owner/broadcasts',headers=bearer(refreshed)).json()['items'] == [result]
+    assert client.get('/barista/owner/broadcasts',headers=bearer(refreshed)).json()['items'] == [actual]
 
 
 def test_concurrent_confirmation_returns_one_same_job(jobs_database, jobs_api):
@@ -114,6 +118,8 @@ def test_status_history_and_reconcile_require_current_owner_and_tenant(jobs_data
 
 def test_app_priority_full_snapshot_counts_and_no_repeat(jobs_database):
     db = jobs_database
+    db.db.create_app_session(2)
+    db.db.create_app_session(4)
     bid = queue(db)
     bot = fake_bot()
     async def push(broadcast, recipient, *, audit):
@@ -135,12 +141,13 @@ def test_app_priority_full_snapshot_counts_and_no_repeat(jobs_database):
     assert db.query('SELECT text FROM broadcasts')[0]['text'] == 'Власний текст ☕️'
     assert {r['user_id'] for r in db.query('SELECT user_id FROM touch_logs')} == {2,4,6}
     drain(db,sender,bot)
-    assert sender.await_count == 3 and bot.send_message.await_count == 1
+    assert sender.await_count == 2 and bot.send_message.await_count == 1
     assert len(db.query('SELECT * FROM touch_logs')) == 3
 
 
 def test_temporary_app_error_never_falls_back_to_telegram(jobs_database):
     db = jobs_database
+    db.db.create_app_session(4)
     bid = queue(db,users=(4,))
     async def push(*args, audit):
         audit.update(attempted=1,sent=0,failed=1)
@@ -156,6 +163,8 @@ def test_temporary_app_error_never_falls_back_to_telegram(jobs_database):
 @pytest.mark.parametrize('interrupted', ['app','telegram'])
 def test_interrupted_external_attempt_is_unknown_and_never_replayed(jobs_database,interrupted):
     db = jobs_database
+    if interrupted == 'app':
+        db.db.create_app_session(4)
     bid = queue(db,users=(4,6))
     if interrupted == 'app':
         db.query("UPDATE broadcast_recipient_deliveries SET app_status='sending' WHERE user_id=4")
@@ -165,7 +174,7 @@ def test_interrupted_external_attempt_is_unknown_and_never_replayed(jobs_databas
     push = AsyncMock(return_value=None)
     bot = fake_bot()
     drain(db,push,bot)
-    assert push.await_count == 1 and push.await_args.args[1]['user_id'] == 6
+    push.assert_not_awaited()
     assert bot.send_message.await_count == 1 and bot.send_message.await_args.kwargs['chat_id'] == 1006
     result = status(db,bid)
     assert result['status'] == 'partial'
@@ -173,7 +182,7 @@ def test_interrupted_external_attempt_is_unknown_and_never_replayed(jobs_databas
     if interrupted == 'app':
         assert result['apns_attempted'] is None
     drain(db,push,bot)
-    assert push.await_count == 1 and bot.send_message.await_count == 1
+    assert push.await_count == 0 and bot.send_message.await_count == 1
 
 
 def test_concurrent_workers_claim_one_job_and_send_once(jobs_database):
@@ -182,17 +191,18 @@ def test_concurrent_workers_claim_one_job_and_send_once(jobs_database):
     bot = fake_bot()
     async def scenario():
         entered,release = asyncio.Event(),asyncio.Event()
-        async def push(*args, audit):
+        async def telegram(**kwargs):
             entered.set()
             await release.wait()
-            return None
-        sender = AsyncMock(side_effect=push)
+            return SimpleNamespace(message_id=101)
+        bot.send_message.side_effect = telegram
+        sender = AsyncMock(return_value=None)
         first = asyncio.create_task(process_broadcast_jobs_once(connection_factory=db.db.get_connection,
             push_sender=sender,bot_factory=lambda:bot))
         await entered.wait()
         await process_broadcast_jobs_once(connection_factory=db.db.get_connection,
             push_sender=sender,bot_factory=lambda:bot)
-        assert sender.await_count == 1
+        assert sender.await_count == 0 and bot.send_message.await_count == 1
         release.set()
         await first
     asyncio.run(scenario())
@@ -246,6 +256,7 @@ def test_legacy_history_unknown_channel_counts_and_never_replayed(jobs_database)
     push.assert_not_awaited()
     bot.send_message.assert_not_awaited()
     db.query((Path(__file__).parents[1] / 'migrations/20261026_broadcast_delivery_jobs.sql').read_text())
+    db.query((Path(__file__).parents[1] / 'migrations/20261027_broadcast_routing_accounting.sql').read_text())
     assert db.query('SELECT recipients_count FROM broadcasts')[0]['recipients_count'] == 144
     assert db.query('SELECT * FROM broadcast_delivery_jobs') == []
 
@@ -272,6 +283,7 @@ def test_initial_target_counts_survive_recipient_account_cleanup(jobs_database):
 
 def test_merge_during_inflight_attempt_records_unknown_without_new_send(jobs_database):
     db = jobs_database
+    db.db.create_app_session(2)
     bid = queue(db,users=(2,))
     db.query("UPDATE broadcast_recipient_deliveries SET app_status='sending'")
     with db.db.get_connection() as connection:
@@ -288,6 +300,7 @@ def test_merge_during_inflight_attempt_records_unknown_without_new_send(jobs_dat
 
 def test_successful_app_device_plus_failed_device_keeps_priority_and_partial_status(jobs_database):
     db = jobs_database
+    db.db.create_app_session(4)
     bid = queue(db,users=(4,))
     bot = fake_bot()
     async def push(*args,audit):
@@ -314,3 +327,90 @@ def test_first_upload_telegram_file_id_is_persisted_and_reused(jobs_database,kin
     assert first.data == data and second == attachment.file_id
     assert db.query('SELECT telegram_file_id FROM broadcast_delivery_jobs')[0]['telegram_file_id'] == attachment.file_id
     assert status(db,bid)['telegram_success'] == 2
+
+
+def test_old_app_store_send_receipt_accepts_pending_and_new_status_stays_truthful(jobs_database,jobs_api):
+    db,client = jobs_database,jobs_api
+    token = db.staff_token()
+    action = preview(client,token).json()['confirmation_token']
+    response = send(client,token,action)
+    assert response.status_code == 202
+    body = response.json()
+    # Exact old Codable types and service success guard; additive keys ignored.
+    assert type(body['ok']) is bool and type(body['shop']['id']) is int
+    assert type(body['shop']['name']) is str
+    assert type(body['sent']) is int and type(body['failed']) is int
+    assert body['status'] in ('completed','partial')
+    assert body['delivery_status'] == 'queued' and body['broadcast_id'] > 0
+    assert send(client,token,action).json()['broadcast_id'] == body['broadcast_id']
+    actual = client.get(f"/barista/owner/broadcasts/{body['broadcast_id']}",headers=bearer(token)).json()
+    assert actual['status'] == actual['delivery_status'] == 'queued'
+    network = confirmation_response(dict(actual,scope='NETWORK',network={'id':5,'name':'TEST network'}))
+    assert network['status'] == 'partial' and network['delivery_status'] == 'queued'
+
+
+def test_app_evidence_without_enabled_token_never_falls_back_to_telegram(jobs_database):
+    db = jobs_database
+    db.query("INSERT INTO user_identities(user_id,provider,provider_user_id) VALUES(2,'google','local-app-account') ON CONFLICT(user_id,provider) DO NOTHING")
+    db.query('''CREATE TABLE app_push_devices(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES users(id),
+        notifications_enabled BOOLEAN); INSERT INTO app_push_devices(user_id,notifications_enabled) VALUES(4,FALSE)''')
+    db.db.create_app_session(6)
+    db.query("UPDATE app_sessions SET revoked_at=NOW() WHERE user_id=6 AND purpose='client'")
+    bid = queue(db)
+    async def push(broadcast,recipient,*,audit):
+        audit.update(attempted=1 if recipient['user_id']==6 else 0,sent=0,failed=1 if recipient['user_id']==6 else 0)
+        return None  # No token/disabled or all invalid: none is no longer a TG route.
+    bot = fake_bot()
+    drain(db,push,bot)
+    result = status(db,bid)
+    assert result['app_routed_users'] == result['app_inbox_created'] == result['sent'] == 3
+    assert result['telegram_routed_users'] == result['telegram_sent'] == result['telegram_attempted'] == 0
+    assert result['apns_users'] == result['apns_failed'] == 1
+    assert result['apns_devices_sent'] == 0 and result['status'] == 'partial'
+    assert {row['delivery_route'] for row in db.query('SELECT delivery_route FROM broadcast_recipient_deliveries')} == {'APP'}
+    bot.send_message.assert_not_awaited()
+
+
+def test_route_snapshot_exact_counts_and_acknowledgements_survive_account_cleanup(jobs_database):
+    db = jobs_database
+    db.db.create_app_session(2)
+    db.query('UPDATE users SET telegram_user_id=NULL WHERE id=6')
+    bid = queue(db)
+    async def push(*args,audit):
+        audit.update(attempted=2,sent=1,failed=1)
+        return True
+    bot = fake_bot()
+    drain(db,push,bot)
+    before = status(db,bid)
+    assert before['target_users'] == sum(before[key] for key in ('app_routed_users','telegram_routed_users','no_delivery_channel')) == 3
+    assert before['app_inbox_created'] == before['apns_users'] == before['apns_devices_sent'] == before['apns_failed'] == 1
+    assert before['telegram_sent'] == before['telegram_routed_users'] == 1 and before['telegram_failed'] == 0
+    assert before['app_notifications_created'] == 3 and before['sent'] == 2
+    assert before['status'] == 'partial' and before['completed_at'] is not None
+    with db.db.get_connection() as connection:
+        with connection.transaction():
+            merge_job_recipient_receipts(connection.cursor(),2,6)
+            connection.execute('DELETE FROM broadcast_recipients WHERE broadcast_id=%s AND user_id IN(2,4)',(bid,))
+    assert status(db,bid) == before
+    drain(db,AsyncMock(return_value=None),bot)
+    bot.send_message.assert_awaited_once()
+
+
+def test_telegram_error_summary_and_new_app_identity_before_delivery_are_safe(jobs_database):
+    db = jobs_database
+    bid = queue(db,users=(4,6))
+    db.query("INSERT INTO user_identities(user_id,provider,provider_user_id) VALUES(6,'apple','local-new-app-account')")
+    bot,push = fake_bot(),AsyncMock(return_value=None)
+    bot.send_message.side_effect = TelegramForbiddenError(method=SendMessage(chat_id=1004,text='safe'),message='blocked')
+    drain(db,push,bot)
+    result = status(db,bid)
+    assert result['telegram_routed_users'] == result['app_routed_users'] == 1
+    assert result['target_users'] == result['telegram_routed_users'] + result['app_routed_users'] + result['no_delivery_channel']
+    assert result['app_inbox_created'] == result['sent'] == 1 and result['status']=='queued'
+    assert result['telegram_attempted'] == result['telegram_failed'] == 1
+    assert result['telegram_sent'] == 0 and result['telegram_error_classes'] == {'TelegramForbiddenError':1}
+    assert bot.send_message.await_args.kwargs['chat_id'] == 1004
+    push.assert_not_awaited()
+    drain(db,push,bot)
+    assert bot.send_message.await_count == push.await_count == 1
+    assert push.await_args.args[1]['user_id']==6 and status(db,bid)['status']=='partial'

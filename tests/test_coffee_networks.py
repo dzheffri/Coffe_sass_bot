@@ -68,6 +68,7 @@ def network_api(database, monkeypatch, request):
     database.query((PROJECT / "migrations/20261017_admin_web_login.sql").read_text())
     database.query((PROJECT / "migrations/20261013_broadcast_recipients.sql").read_text())
     database.query((PROJECT / "migrations/20261026_broadcast_delivery_jobs.sql").read_text())
+    database.query((PROJECT / "migrations/20261027_broadcast_routing_accounting.sql").read_text())
     migration = (PROJECT / "migrations/20261018_coffee_networks.sql").read_text()
     database.query(migration)
     network_router = importlib.import_module("app.api.networks")

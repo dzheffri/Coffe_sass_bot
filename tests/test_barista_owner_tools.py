@@ -40,6 +40,7 @@ def owner_database(operations_database, tmp_path, monkeypatch):
     database.query((Path(__file__).parents[1] / "migrations/20261013_broadcast_recipients.sql").read_text())
     database.query((Path(__file__).parents[1] / "migrations/20261014_broadcast_recipient_delete.sql").read_text())
     database.query((Path(__file__).parents[1] / "migrations/20261026_broadcast_delivery_jobs.sql").read_text())
+    database.query((Path(__file__).parents[1] / "migrations/20261027_broadcast_routing_accounting.sql").read_text())
     # Patch before api/TestClient startup; no real polling sender may run.
     owner_module = importlib.import_module("app.api.barista_owner")
     monkeypatch.setattr(owner_module, "broadcast_job_loop", AsyncMock())
@@ -356,16 +357,15 @@ def test_broadcast_preview_and_send_snapshots_all_own_shop_clients(owner_api, ow
     assert stored["used_at"] is None
     response = send(client, token, body["confirmation_token"])
     assert response.status_code == 202
-    assert response.json()["sent"] == 0 and response.json()["status"] == "queued"
+    assert response.json()["sent"] == 0 and response.json()["status"] == "partial"
+    assert response.json()["delivery_status"] == "queued"
     assert database.query("SELECT * FROM touch_logs") == []
     delivery.assert_not_awaited()
     delivery.drain()
-    assert delivery.worker_push.await_args.args[0]["shop_name"] == "Наші"
-    assert [{key:call.args[1][key] for key in ("telegram_user_id", "user_id")}
-            for call in delivery.worker_push.await_args_list] == [
-        {"telegram_user_id":1004,"user_id":4},
-        {"telegram_user_id":1006,"user_id":6},
-    ]
+    delivery.worker_push.assert_not_awaited()
+    assert [call.kwargs["chat_id"] for call in delivery.worker_bot.send_message.await_args_list] == [1004, 1006]
+    assert all(call.kwargs["text"].startswith("☕️ Наші\n\n")
+               for call in delivery.worker_bot.send_message.await_args_list)
     assert database.query("SELECT user_id,shop_id,type FROM touch_logs") == [
         {"user_id":4,"shop_id":1,"type":"broadcast"},
         {"user_id":6,"shop_id":1,"type":"broadcast"},

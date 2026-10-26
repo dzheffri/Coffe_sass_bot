@@ -37,6 +37,7 @@ MIGRATIONS = (
     "20261014_broadcast_recipient_delete.sql",
     "20261026_shop_novelty_notifications.sql",
     "20261026_broadcast_delivery_jobs.sql",
+    "20261027_broadcast_routing_accounting.sql",
 )
 
 

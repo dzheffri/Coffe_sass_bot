@@ -46,7 +46,8 @@ def test_native_text_confirmation_snapshots_all_shop_clients_without_changing_te
     assert body["recipients_count"] == 4
     assert db.query("SELECT * FROM broadcasts") == []
     accepted = send(client, token, body["confirmation_token"])
-    assert accepted.status_code == 202 and accepted.json()["status"] == "queued"
+    assert accepted.status_code == 202 and accepted.json()["status"] == "partial"
+    assert accepted.json()["delivery_status"] == "queued"
     assert db.query("SELECT * FROM touch_logs") == []
     delivery.drain()
     row = db.query("SELECT * FROM broadcasts")[0]
@@ -55,12 +56,11 @@ def test_native_text_confirmation_snapshots_all_shop_clients_without_changing_te
     assert snapshot(db) == [
         {"broadcast_id": row["id"], "user_id": user, "read_at": None, "delivery_status": None}
         for user in (2, 4, 6, 7)]
-    # Publication delivery receives the complete inbox snapshot, including
-    # users without Telegram.  The APNs-first adapter decides per recipient
-    # whether Telegram fallback is needed after the claim.
-    assert {call.args[1]["user_id"] for call in delivery.worker_push.await_args_list} == {2, 4, 6, 7}
+    # Every recipient has an inbox snapshot. Only the app user reaches APNs;
+    # Telegram-only users use their separately frozen delivery route.
+    assert {call.args[1]["user_id"] for call in delivery.worker_push.await_args_list} == {2}
     assert delivery.worker_push.await_args.args[0]["shop_name"] == "Наші"
-    assert row["recipients_count"] == 3
+    assert row["recipients_count"] == 4
     assert {row["user_id"] for row in db.query("SELECT user_id FROM touch_logs")} == {4, 6, 7}
     repeated = send(client, token, body["confirmation_token"])
     assert repeated.status_code == 202 and repeated.json()["broadcast_id"] == accepted.json()["broadcast_id"]
@@ -94,7 +94,7 @@ def test_native_media_persists_original_content_and_private_key(audience, owner_
     payload = delivery.worker_push.await_args.args[0]
     assert db.broadcast_storage.get(payload["media_key"])["bytes"] == data and payload["text"] == text
     assert payload["shop_name"] == "Наші"
-    assert {call.args[1]["user_id"] for call in delivery.worker_push.await_args_list} == {2, 4, 6, 7}
+    assert {call.args[1]["user_id"] for call in delivery.worker_push.await_args_list} == {2}
     stored = db.query("SELECT media_bytes,used_at FROM admin_broadcast_previews")[0]
     assert stored["media_bytes"] is None and stored["used_at"] is not None
 
@@ -131,7 +131,7 @@ def test_app_only_audience_can_publish_without_telegram_devices(owner_database, 
     body = preview(client, token).json()
     assert body["recipients_count"] == 1
     result = send(client, token, body["confirmation_token"])
-    assert result.status_code == 202 and result.json()["sent"] == 0
+    assert result.status_code == 202 and result.json()["sent"] == 1
     delivery.drain()
     assert [row["user_id"] for row in snapshot(db)] == [2]
     recipient = delivery.worker_push.await_args.args[1]
@@ -155,7 +155,7 @@ def test_native_snapshot_includes_null_activity_client_and_excludes_other_shop(o
     assert body["recipients_count"] == 3
     assert send(client, token, body["confirmation_token"]).status_code == 202
     delivery.drain()
-    recipients = [call.args[1] for call in delivery.worker_push.await_args_list]
+    recipients = db.query("SELECT user_id FROM broadcast_recipient_deliveries ORDER BY user_id")
     assert {row["user_id"] for row in recipients} == {4, 6, 8}
     assert {row["user_id"] for row in snapshot(db)} == {4, 6, 8}
     assert 5 not in {row["user_id"] for row in recipients}

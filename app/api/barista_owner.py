@@ -22,7 +22,7 @@ from app.broadcast_media import JSON_LIMIT, bounded_body, multipart_media, valid
 from app.broadcast_publication import BroadcastPublication
 from app.broadcast_delivery import send_broadcast_app_push
 from app.broadcast_jobs import (broadcast_job_loop, delivery_status, enqueue_broadcast,
-                                existing_confirmation, owner_history, telegram_plan)
+                                existing_confirmation, owner_history, telegram_plan,confirmation_response)
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +265,7 @@ def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
     @router.post("/owner/broadcast", status_code=202)
     async def send(body: BroadcastSendRequest, authorization: str | None = Header(default=None)):
         try:
-            return await run_in_threadpool(prepare_send, parse_bearer(authorization), body.confirmation_token)
+            return confirmation_response(await run_in_threadpool(prepare_send, parse_bearer(authorization), body.confirmation_token))
         except (UndefinedTable, UndefinedColumn) as exc:
             raise HTTPException(503, detail={"code": "BROADCAST_NOT_CONFIGURED"}) from exc
 
@@ -378,7 +378,7 @@ def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
     async def send_network(body: BroadcastSendRequest, network_id: int,
                            authorization: str | None = Header(default=None)):
         try:
-            return await run_in_threadpool(prepare_network_send, parse_bearer(authorization),network_id,body.confirmation_token)
+            return confirmation_response(await run_in_threadpool(prepare_network_send, parse_bearer(authorization),network_id,body.confirmation_token))
         except (UndefinedTable, UndefinedColumn) as exc:
             raise HTTPException(503, detail={"code":"BROADCAST_NOT_CONFIGURED"}) from exc
 

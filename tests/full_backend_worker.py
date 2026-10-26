@@ -623,21 +623,21 @@ def _real_native_admin_tools(db, client, query, auth, jwt, report):
     bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=101)),
                           session=SimpleNamespace(close=AsyncMock()))
     sent = client.post('/barista/owner/broadcast',headers=auth(owner),json={'confirmation_token':confirmation})
-    assert sent.status_code == 202 and sent.json()['status'] == 'queued',sent.text
+    assert sent.status_code == 202 and sent.json()['status'] == 'partial' and sent.json()['delivery_status']=='queued',sent.text
     bid = sent.json()['broadcast_id']
     assert sent.json()['target_users'] == sent.json()['app_notifications_created'] == 2
     assert sent.json()['apns_attempted'] == sent.json()['telegram_attempted'] == 0
     asyncio.run(process_broadcast_jobs_once(connection_factory=db.get_connection,push_sender=push,bot_factory=lambda:bot))
     assert {call.args[1]['user_id'] for call in push.await_args_list} == {1,32650}
-    bot.send_message.assert_awaited_once_with(chat_id=71001,text='☕️ Local cafe\n\nOffline only',
-                                            parse_mode=None,request_timeout=15)
+    bot.send_message.assert_not_awaited()
     result = client.get(f'/barista/owner/broadcasts/{bid}',headers=auth(owner))
     assert result.status_code == 200 and result.json()['status'] == 'completed'
-    assert result.json()['sent'] == result.json()['telegram_success'] == 1
+    assert result.json()['sent'] == result.json()['app_inbox_created'] == 2
+    assert result.json()['telegram_success'] == 0
     again = client.post('/barista/owner/broadcast',headers=auth(owner),json={'confirmation_token':confirmation})
     assert again.status_code == 202 and again.json()['broadcast_id'] == bid
     asyncio.run(process_broadcast_jobs_once(connection_factory=db.get_connection,push_sender=push,bot_factory=lambda:bot))
-    assert push.await_count == 2 and bot.send_message.await_count == 1
+    assert push.await_count == 2 and bot.send_message.await_count == 0
     assert query("""SELECT user_id,read_at,delivery_status FROM broadcast_recipients
         ORDER BY user_id""") == [
         {"user_id": user_id, "read_at": None, "delivery_status": None}
