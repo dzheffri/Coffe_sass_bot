@@ -12,7 +12,7 @@ import logging
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputPollOption
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputPollOption, InputMediaPhoto
 
 from app.community import CommunityError
 from app.community_media import CommunityMediaStorage
@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 _CATEGORIES = {"fact": "Кавовий факт", "tip": "Порада бариста", "history": "Кавова історія",
                "news": "Новина", "poll": "Опитування", "series": "Серія публікацій"}
+
+
+class TelegramPollDescriptionTooLong(ValueError):
+    """A native poll has one 1024-character description, not extra posts."""
 
 
 def channel_post_url(message_id):
@@ -236,23 +240,33 @@ async def deliver_community_telegram(*, post_id, actor_user_id, connection_facto
 
         if send_channel:
             is_poll = post["type"] == "poll"
+            single_poll = is_poll and not receipts
             try:
-                plan = channel_content(post)
+                plan = [] if single_poll else channel_content(post)
                 poll = channel_poll(post) if is_poll else None
+                if single_poll:
+                    description = channel_text(post)
+                    if len(description.encode('utf-16-le')) // 2 > 1024:
+                        raise TelegramPollDescriptionTooLong('Telegram poll description limit is 1024 characters')
+                    poll.update(description=description,description_parse_mode=None)
                 if len(receipts) > len(plan):
                     raise ValueError("Content receipt plan mismatch")
                 # Only load an unsent photo. A poll retry must not depend on
                 # an image that Telegram already accepted and we recorded.
                 image_data = None
-                if len(receipts) == 0 and plan[0]["kind"] == "photo":
+                if len(receipts) == 0 and (post.get('image_url') if single_poll else plan[0]["kind"] == "photo"):
                     image_data = media_storage_factory().read(post["image_url"])
                     if image_data is None:
                         raise FileNotFoundError("Community image unavailable")
+                    if single_poll:
+                        poll['media'] = InputMediaPhoto(media=BufferedInputFile(image_data,
+                            filename=post['image_url'].rsplit('/',1)[-1]),parse_mode=None)
             except Exception as error:
                 with _database(connection_factory) as connection:
                     connection.execute("""UPDATE community_posts SET telegram_status='failed',
                         telegram_error_code=%s WHERE id=%s AND telegram_status='sending'""",
-                        (type(error).__name__, post_id))
+                        ('TELEGRAM_POLL_DESCRIPTION_TOO_LONG_1024' if isinstance(error,TelegramPollDescriptionTooLong)
+                         else type(error).__name__, post_id))
                 logger.warning("Community Telegram content unavailable (%s)", type(error).__name__)
                 return
 
@@ -301,8 +315,9 @@ async def deliver_community_telegram(*, post_id, actor_user_id, connection_facto
                 message_id = receipts[0]
             with _database(connection_factory) as connection:
                 connection.execute("""UPDATE community_posts SET telegram_status='published',
-                    telegram_message_id=%s,telegram_error_code=NULL
-                    WHERE id=%s AND telegram_status='sending'""", (message_id, post_id))
+                    telegram_message_id=%s,telegram_error_code=NULL,
+                    telegram_content_message_ids=CASE WHEN %s THEN %s::jsonb ELSE telegram_content_message_ids END
+                    WHERE id=%s AND telegram_status='sending'""", (message_id,single_poll,json.dumps([message_id]),post_id))
 
         if not deliver_personal:
             return

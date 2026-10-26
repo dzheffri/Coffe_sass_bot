@@ -59,8 +59,15 @@ All remaining content follows in messages of up to 4096 UTF-16 units. Without a
 photo, the complete content uses those text messages directly. Splitting never
 truncates text or adds a placeholder directing Telegram-only readers to the app.
 
-Polls first send the same full editorial content/photo and then immediately
-send the native anonymous, single-choice regular poll. The canonical
+New polls use one native anonymous, single-choice regular `sendPoll` message:
+the complete category/title/body goes into `description` and the photo, when
+present, into `media=InputMediaPhoto` read from validated local storage. There
+is no separate photo/text channel message. Telegram limits descriptions to
+1024 characters; overflow fails before HTTP with
+`TELEGRAM_POLL_DESCRIPTION_TOO_LONG_1024`, preserving full app content.
+See the official [sendPoll](https://core.telegram.org/bots/api#sendpoll) and
+[InputPollMedia](https://core.telegram.org/bots/api#inputpollmedia) contracts.
+The canonical
 `telegram_message_id` points to the native poll; for other types it points to
 the first content message. App and Telegram votes remain independent.
 Telegram poll questions are limited to 300 characters and answer labels to 100;
@@ -68,8 +75,10 @@ only the Telegram poll labels may be shortened/disambiguated, never app content.
 
 Each acknowledged photo/text chunk is committed into
 `telegram_content_message_ids` before attempting the next chunk or poll. A
-confirmed rejection retries only the unfinished stage. A poll rejection never
-resends already-recorded full content. Timeout/5xx/crash keeps the outcome
+confirmed rejection retries only the unfinished stage. A previously failed
+legacy two-message poll with content receipts still retries only its final
+poll stage, preserving the visible content. A new one-message poll records
+its canonical/content receipt atomically. Timeout/5xx/crash keeps the outcome
 unknown/in flight and blocks blind resend, including partial publications.
 Existing published posts without content receipts are never recreated.
 Personal messages still contain only a short announcement and an exact post URL.
