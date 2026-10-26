@@ -11,7 +11,7 @@ import logging
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputPollOption
 
 from app.community import CommunityError
 from app.community_media import CommunityMediaStorage
@@ -88,10 +88,6 @@ def channel_text(post, *, with_photo=False):
         parts.append(f"{post['series_title']} · Частина {post['series_part']} із {post['series_total']}")
     if post["text"]:
         parts.append(post["text"])
-    if post["type"] == "poll":
-        parts.append(post["question"])
-        parts.append("\n".join(f"○ {option['text']}" for option in post["options"]))
-        parts.append("Голосуйте у застосунку «Наші».")
     value = "\n\n".join(parts)
     # Telegram limits text/captions in UTF-16 code units, not Python code points.
     limit = 1024 if with_photo else 4096
@@ -101,6 +97,42 @@ def channel_text(post, *, with_photo=False):
         room = limit - len(suffix.encode("utf-16-le")) // 2
         value = encoded[:room * 2].decode("utf-16-le", errors="ignore") + suffix
     return value
+
+
+def _poll_text(value, limit):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Invalid Telegram poll text")
+    value = value.strip()
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+
+def channel_poll(post):
+    """Native Telegram votes stay independent of the app's poll records."""
+    options = post.get("options") or []
+    if not 2 <= len(options) <= 12:
+        raise ValueError("Invalid Telegram poll options")
+    texts = [_poll_text(option["text"], 100) for option in options]
+    # App options allow 160 characters. Preserve distinct answers when their
+    # first 100 characters match, without changing the stored app options.
+    used = set()
+    output = []
+    for index, text in enumerate(texts, 1):
+        candidate = text
+        suffix_index = index
+        while candidate.casefold() in used:
+            suffix = f"… ({suffix_index})"
+            candidate = text[:100 - len(suffix)] + suffix
+            suffix_index += 1
+        used.add(candidate.casefold())
+        output.append(InputPollOption(text=candidate, text_parse_mode=None))
+    return {
+        "question": _poll_text(post.get("question") or post.get("title"), 300),
+        "options": output,
+        "type": "regular",
+        "is_anonymous": True,
+        "allows_multiple_answers": False,
+        "question_parse_mode": None,
+    }
 
 
 def _failure_status(error):
@@ -170,8 +202,20 @@ async def deliver_community_telegram(*, post_id, actor_user_id, connection_facto
             return
 
         if send_channel:
-            image = post.get("image_url")
+            is_poll = post["type"] == "poll"
+            image = None if is_poll else post.get("image_url")
             data = None
+            poll = None
+            if is_poll:
+                try:
+                    poll = channel_poll(post)
+                except Exception as error:
+                    with _database(connection_factory) as connection:
+                        connection.execute("""UPDATE community_posts SET telegram_status='failed',
+                            telegram_error_code=%s WHERE id=%s AND telegram_status='sending'""",
+                            (type(error).__name__, post_id))
+                    logger.warning("Community Telegram poll invalid (%s)", type(error).__name__)
+                    return
             if image:
                 try:
                     # Preparation cannot have published anything to Telegram.
@@ -186,7 +230,10 @@ async def deliver_community_telegram(*, post_id, actor_user_id, connection_facto
                     logger.warning("Community Telegram media unavailable (%s)", type(error).__name__)
                     return
             try:
-                if image:
+                if is_poll:
+                    message = await bot.send_poll(chat_id=CHANNEL_USERNAME, **poll,
+                        disable_notification=True, request_timeout=15)
+                elif image:
                     # Read only our randomized local Community storage asset.
                     message = await bot.send_photo(chat_id=CHANNEL_USERNAME,
                         photo=BufferedInputFile(data, filename=image.rsplit("/", 1)[-1]),

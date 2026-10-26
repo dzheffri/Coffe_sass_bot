@@ -8,13 +8,14 @@ from aiogram.types import (
 
 
 COMMUNITY_CHANNEL_URL = "https://t.me/nashi_coffee_community"
+COMMUNITY_BUTTON_TEXT = "☕️ Кавова спільнота"
 
 
 def community_channel_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(
-                text="☕️ Кавова спільнота",
+                text=COMMUNITY_BUTTON_TEXT,
                 url=COMMUNITY_CHANNEL_URL,
             )
         ]]
@@ -30,9 +31,11 @@ def user_main_keyboard():
                 KeyboardButton(text="🎁 Мої безкоштовні кави"),
             ],
             [KeyboardButton(text="🏪 Мої кав’ярні")],
+            [KeyboardButton(text=COMMUNITY_BUTTON_TEXT)],
             [KeyboardButton(text="🛟 Служба підтримки")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -101,9 +104,12 @@ def admin_main_keyboard(
     if can_switch_to_super_admin:
         keyboard.append([KeyboardButton(text="🛠 Режим super admin")])
 
+    keyboard.append([KeyboardButton(text=COMMUNITY_BUTTON_TEXT)])
+
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
-        resize_keyboard=True
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 

@@ -56,7 +56,8 @@ def community_api(database, tmp_path):
         connection_factory=database.db.get_connection,
         media_storage_factory=lambda: module.CommunityMediaStorage(tmp_path / "community-upload"),
         telegram_bot_factory=lambda: SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)),
-            send_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)), session=SimpleNamespace(close=AsyncMock())),
+            send_photo=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+            send_poll=AsyncMock(return_value=SimpleNamespace(message_id=1)), session=SimpleNamespace(close=AsyncMock())),
     ))
     with TestClient(app) as client:
         yield client, database

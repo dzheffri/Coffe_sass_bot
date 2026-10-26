@@ -44,9 +44,19 @@ Such an outcome requires checking the channel before any manual reconciliation.
 ## Content
 
 All six existing Community types are supported. Series retain their title and
-part number. Polls show their question/options; voting stays in the app so there
-is one canonical vote per user. Photos are read from the existing validated
-Community storage, never fetched from arbitrary URLs.
+part number. A poll is mirrored as one native anonymous, single-choice, regular
+Telegram poll using its existing question and answers. Its stored Telegram
+message ID and all links refer to that poll. App and Telegram votes are separate:
+no Telegram vote is written to the app voting tables or API.
+
+Telegram poll questions are limited to 300 characters and answer text to 100.
+Long answers are shortened, preserving distinct labels if truncation creates a
+collision. The existing app content and options remain unchanged. Additional
+text and photos stay in the app; no extra channel message is created for a poll.
+This keeps the same single-message delivery claim and retry protection.
+
+Other posts retain their existing text/photo rendering. Photos are read from
+the existing validated Community storage, never fetched from arbitrary URLs.
 
 Telegram limits a message to 4096 UTF-16 units and a photo caption to 1024.
 Long channel content is shortened with a note to read the full text in the app;
@@ -55,10 +65,13 @@ a URL button linking to the exact channel message.
 
 ## Bot menu and rollout
 
-The regular user's existing reply keyboard stays intact. A companion inline
-menu message contains the ordinary URL button **☕️ Кавова спільнота**, opening
-`https://t.me/nashi_coffee_community` directly. Reply-keyboard buttons cannot
-contain URLs, so no callback or intermediate screen is added.
+The regular user, Owner, Admin and Super Admin reply keyboards include a
+separate persistent **☕️ Кавова спільнота** button. Existing menu actions retain
+their order. Reply-keyboard buttons send text rather than opening URLs: tapping
+this button returns an ordinary URL button opening
+`https://t.me/nashi_coffee_community` directly. The common handler works during
+pending scan, broadcast and support flows without changing their FSM state.
+The bot no longer sends an extra inline menu message automatically after /start.
 
 No new bot, token, webhook, scheduler, or automatic launch announcement is
 introduced. The existing bot must retain permission to publish in the channel.

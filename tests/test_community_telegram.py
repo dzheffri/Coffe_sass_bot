@@ -3,11 +3,11 @@
 import asyncio
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramServerError
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.methods import SendMessage
+from aiogram.methods import SendMessage, SendPoll
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -29,6 +29,7 @@ def telegram_api(database, tmp_path):
     from app.community_media import CommunityMediaStorage
     bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=27)),
                           send_photo=AsyncMock(return_value=SimpleNamespace(message_id=28)),
+                          send_poll=AsyncMock(return_value=SimpleNamespace(message_id=29)),
                           session=SimpleNamespace(close=AsyncMock()))
     pushes = AsyncMock(return_value={"sent": 1, "failed": 0})
     storage = CommunityMediaStorage(tmp_path / "media")
@@ -82,21 +83,32 @@ def test_all_types_channel_silent_once_and_consumer_unchanged(telegram_api, kind
     if kind == "series":
         extra = {"series_title": "Кавові міфи", "series_part": 3, "series_total": 5}
     post = _draft(h.client, h.token, type=kind, title="<Публікація> ☕", **extra)
-    assert h.bot.send_message.await_count == 0
+    assert h.bot.send_message.await_count == h.bot.send_poll.await_count == 0
     result = publish(h, post)
     assert result["telegram_status"] == "published"
-    assert result["telegram_message_id"] == 27
-    assert result["telegram_url"] == "https://t.me/nashi_coffee_community/27"
+    expected_id = 29 if kind == "poll" else 27
+    assert result["telegram_message_id"] == expected_id
+    assert result["telegram_url"] == f"https://t.me/nashi_coffee_community/{expected_id}"
     assert result["telegram_retry_allowed"] is False
     publish(h, post, notify=True)
-    assert h.bot.send_message.await_count == 1
     h.pushes.assert_not_awaited()
-    call = h.bot.send_message.await_args.kwargs
-    assert call["chat_id"] == "@nashi_coffee_community"
-    assert call["disable_notification"] is True and call["parse_mode"] is None
-    assert "<Публікація>" in call["text"]
     if kind == "poll":
-        assert "○ Фільтр" in call["text"] and "Голосуйте у застосунку" in call["text"]
+        h.bot.send_poll.assert_awaited_once()
+        h.bot.send_message.assert_not_awaited()
+        call = h.bot.send_poll.await_args.kwargs
+        assert call["question"] == "Що обираєш?"
+        assert [option.text for option in call["options"]] == ["Фільтр", "Лате"]
+        assert all(option.text_parse_mode is None for option in call["options"])
+        assert call["type"] == "regular" and call["is_anonymous"] is True
+        assert call["allows_multiple_answers"] is False
+        assert call["question_parse_mode"] is None
+    else:
+        h.bot.send_poll.assert_not_awaited()
+        h.bot.send_message.assert_awaited_once()
+        call = h.bot.send_message.await_args.kwargs
+        assert call["parse_mode"] is None and "<Публікація>" in call["text"]
+    assert call["chat_id"] == "@nashi_coffee_community"
+    assert call["disable_notification"] is True
     if kind == "series":
         assert "Кавові міфи · Частина 3 із 5" in call["text"]
     public = h.client.get(f"/me/community/posts/{post['id']}", headers=bearer(h.token)).json()
@@ -300,11 +312,13 @@ def test_inflight_channel_and_dm_claims_never_replay(telegram_api):
     h.bot.send_message.assert_not_awaited()
 
 
-def test_concurrent_channel_workers_claim_exactly_once(telegram_api):
+@pytest.mark.parametrize("kind", ["news", "poll"])
+def test_concurrent_channel_workers_claim_exactly_once(telegram_api, kind):
     from app.community import CommunityRepository
     from app.community_telegram import deliver_community_telegram
     h = telegram_api
-    post = _draft(h.client, h.token)
+    extra = {"question": "Кава?", "options": ["Фільтр", "Лате"]} if kind == "poll" else {}
+    post = _draft(h.client, h.token, type=kind, **extra)
     with h.db.db.get_connection() as connection:
         with connection.transaction():
             CommunityRepository(connection).claim_publication(post["id"], 1, True)
@@ -316,7 +330,10 @@ def test_concurrent_channel_workers_claim_exactly_once(telegram_api):
                 started.set()
                 await release.wait()
             return SimpleNamespace(message_id=27)
-        h.bot.send_message.side_effect = send
+        if kind == "poll":
+            h.bot.send_poll.side_effect = send
+        else:
+            h.bot.send_message.side_effect = send
         options = dict(post_id=post["id"], actor_user_id=1, connection_factory=h.db.db.get_connection,
                        bot_factory=lambda: h.bot, media_storage_factory=lambda: h.storage)
         first = asyncio.create_task(deliver_community_telegram(**options))
@@ -326,8 +343,13 @@ def test_concurrent_channel_workers_claim_exactly_once(telegram_api):
         release.set()
         await first
     asyncio.run(run())
-    assert [call.kwargs["chat_id"] for call in h.bot.send_message.await_args_list] == [
-        "@nashi_coffee_community", 1003]
+    if kind == "poll":
+        h.bot.send_poll.assert_awaited_once()
+        assert [call.kwargs["chat_id"] for call in h.bot.send_message.await_args_list] == [1003]
+    else:
+        h.bot.send_poll.assert_not_awaited()
+        assert [call.kwargs["chat_id"] for call in h.bot.send_message.await_args_list] == [
+            "@nashi_coffee_community", 1003]
     assert h.db.query("SELECT status FROM community_telegram_deliveries") == [{"status": "sent"}]
 
 
@@ -364,3 +386,164 @@ def test_rejected_channel_retry_makes_only_one_attempt_not_background_retry(tele
     assert retry(h, post).json()["telegram_status"] == "failed"
     assert h.bot.send_message.await_count == 2
     assert h.db.query("SELECT status FROM community_telegram_deliveries") == [{"status": "pending"}]
+
+
+def _poll_draft(harness, **overrides):
+    body = {"type": "poll", "title": "Вибір ранкової кави", "text": "Обери свій напій",
+            "question": "Що обираєш зранку?", "options": ["Капучино", "Фільтр", "Еспресо"]}
+    body.update(overrides)
+    return _draft(harness.client, harness.token, **body)
+
+
+def _poll_error(cls=TelegramBadRequest):
+    return cls(method=SendPoll(chat_id="@nashi_coffee_community", question="Кава?",
+                              options=[{"text": "Так"}, {"text": "Ні"}]), message="fake failure")
+
+
+def test_native_poll_receipt_links_dm_to_poll_and_keeps_app_vote_api_independent(telegram_api):
+    h = telegram_api
+    add_devices(h)
+    h.db.query("INSERT INTO app_push_devices(user_id,device_token) VALUES(1,'enabled')")
+    post = _poll_draft(h)
+    result = publish(h, post, notify=True)
+    assert result["telegram_message_id"] == 29
+    assert result["telegram_url"] == "https://t.me/nashi_coffee_community/29"
+    h.bot.send_poll.assert_awaited_once()
+    h.bot.send_photo.assert_not_awaited()
+    h.bot.send_message.assert_awaited_once()
+    dm = h.bot.send_message.await_args.kwargs
+    assert dm["chat_id"] == 1003
+    assert dm["reply_markup"].inline_keyboard[0][0].url == result["telegram_url"]
+    h.pushes.assert_awaited_once()
+    assert h.pushes.await_args.kwargs["data"] == {"community_post_id": post["id"]}
+    # A Telegram-native poll does not change authenticated app voting rules.
+    public = h.client.get(f"/me/community/posts/{post['id']}", headers=bearer(h.token)).json()
+    assert public["question"] == "Що обираєш зранку?" and public["total_votes"] == 0
+    vote = h.client.post(f"/me/community/posts/{post['id']}/vote", headers=bearer(h.token), json={"option_id": 2})
+    assert vote.status_code == 200 and vote.json()["vote_option_id"] == 2
+    assert vote.json()["total_votes"] == 1
+    again = h.client.post(f"/me/community/posts/{post['id']}/vote", headers=bearer(h.token), json={"option_id": 1})
+    assert again.status_code == 409
+    publish(h, post, notify=True)
+    assert retry(h, post).status_code == 409
+    h.bot.send_poll.assert_awaited_once()
+    h.bot.send_message.assert_awaited_once()
+    h.pushes.assert_awaited_once()
+
+
+def test_poll_with_photo_sends_native_poll_only_and_preserves_app_image(telegram_api):
+    h = telegram_api
+    post = _poll_draft(h)
+    image = BytesIO()
+    Image.new("RGB", (12, 12)).save(image, format="PNG")
+    response = h.client.post(f"/community/admin/posts/{post['id']}/image", headers=bearer(h.token),
+                            files={"photo": ("coffee.png", image.getvalue(), "image/png")})
+    assert response.status_code == 200
+    image_url = response.json()["image_url"]
+    h.storage.read = Mock(side_effect=PermissionError("must not read photo for native poll"))
+    result = publish(h, post)
+    assert result["telegram_status"] == "published" and result["telegram_message_id"] == 29
+    h.bot.send_poll.assert_awaited_once()
+    h.bot.send_photo.assert_not_awaited()
+    h.bot.send_message.assert_not_awaited()
+    h.storage.read.assert_not_called()
+    public = h.client.get(f"/me/community/posts/{post['id']}", headers=bearer(h.token)).json()
+    assert public["image_url"] == image_url
+    assert [option["text"] for option in public["options"]] == ["Капучино", "Фільтр", "Еспресо"]
+
+
+@pytest.mark.parametrize("error", [TimeoutError(), _poll_error(TelegramNetworkError), _poll_error(TelegramServerError)])
+def test_native_poll_ambiguous_send_is_not_repeated_and_app_push_remains_once(telegram_api, error):
+    h = telegram_api
+    add_devices(h)
+    h.db.query("INSERT INTO app_push_devices(user_id,device_token) VALUES(1,'enabled')")
+    h.bot.send_poll.side_effect = error
+    post = _poll_draft(h)
+    result = publish(h, post, notify=True)
+    assert result["is_published"] and result["telegram_status"] == "unknown"
+    assert result["telegram_retry_allowed"] is False and result["telegram_message_id"] is None
+    assert retry(h, post).status_code == 409
+    publish(h, post, notify=True)
+    h.bot.send_poll.assert_awaited_once()
+    h.bot.send_message.assert_not_awaited()
+    h.pushes.assert_awaited_once()
+    assert h.db.query("SELECT status FROM community_telegram_deliveries") == [{"status": "pending"}]
+
+
+def test_native_poll_explicit_failure_retries_without_push_or_dm_duplicates(telegram_api):
+    h = telegram_api
+    add_devices(h)
+    h.db.query("INSERT INTO app_push_devices(user_id,device_token) VALUES(1,'enabled')")
+    h.bot.send_poll.side_effect = [_poll_error(), SimpleNamespace(message_id=81)]
+    post = _poll_draft(h)
+    failed = publish(h, post, notify=True)
+    assert failed["is_published"] and failed["telegram_status"] == "failed" and failed["telegram_retry_allowed"]
+    h.bot.send_message.assert_not_awaited()
+    publish(h, post, notify=True)
+    h.bot.send_poll.assert_awaited_once()
+    result = retry(h, post)
+    assert result.status_code == 200 and result.json()["telegram_status"] == "published"
+    assert result.json()["telegram_message_id"] == 81
+    h.bot.send_message.assert_awaited_once()
+    assert h.bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url == "https://t.me/nashi_coffee_community/81"
+    assert retry(h, post).status_code == 409
+    assert h.bot.send_poll.await_count == 2
+    h.pushes.assert_awaited_once()
+
+
+def test_native_poll_telegram_label_limits_do_not_modify_app_options(telegram_api):
+    h = telegram_api
+    labels = ["а" * 110 + "X", "а" * 110 + "Y", "а" * 99 + "…", "☕" * 160]
+    question = "☕" * 300
+    post = _poll_draft(h, question=question, options=labels)
+    result = publish(h, post)
+    assert result["telegram_status"] == "published"
+    call = h.bot.send_poll.await_args.kwargs
+    assert call["question"] == question
+    actual = [option.text for option in call["options"]]
+    assert len(actual) == len(labels) and len(set(actual)) == len(labels)
+    assert all(1 <= len(option) <= 100 for option in actual)
+    public = h.client.get(f"/me/community/posts/{post['id']}", headers=bearer(h.token)).json()
+    assert [option["text"] for option in public["options"]] == labels
+    assert public["question"] == question
+
+
+def test_native_poll_legacy_empty_question_uses_title_without_changing_post(telegram_api):
+    h = telegram_api
+    post = _poll_draft(h)
+    h.db.query("UPDATE community_posts SET question='' WHERE id=%s", (post["id"],))
+    result = publish(h, post)
+    assert result["telegram_status"] == "published"
+    assert h.bot.send_poll.await_args.kwargs["question"] == post["title"]
+    assert h.db.query("SELECT question FROM community_posts WHERE id=%s", (post["id"],)) == [{"question": ""}]
+
+
+def test_native_poll_dm_retry_reuses_successful_poll_receipt(telegram_api):
+    h = telegram_api
+    h.db.query("INSERT INTO users(id,telegram_user_id,personal_qr_token) VALUES(10,4010,'u10')")
+    h.bot.send_message.side_effect = [SimpleNamespace(message_id=31), bot_error(), SimpleNamespace(message_id=32)]
+    post = _poll_draft(h)
+    result = publish(h, post, notify=True)
+    assert result["telegram_status"] == "published" and result["telegram_dm_failed_count"] == 1
+    assert result["telegram_retry_allowed"] is True
+    fixed = retry(h, post)
+    assert fixed.status_code == 200 and fixed.json()["telegram_dm_failed_count"] == 0
+    h.bot.send_poll.assert_awaited_once()
+    assert [call.kwargs["chat_id"] for call in h.bot.send_message.await_args_list] == [1003, 4010, 4010]
+    for call in h.bot.send_message.await_args_list:
+        assert call.kwargs["reply_markup"].inline_keyboard[0][0].url == "https://t.me/nashi_coffee_community/29"
+    assert retry(h, post).status_code == 409
+
+
+def test_native_poll_invalid_local_options_fail_before_telegram_and_allow_safe_repair(telegram_api):
+    h = telegram_api
+    post = _poll_draft(h)
+    h.db.query("UPDATE community_posts SET options='[\"\",\"Лате\"]'::jsonb WHERE id=%s", (post["id"],))
+    result = publish(h, post)
+    assert result["is_published"] and result["telegram_status"] == "failed"
+    assert result["telegram_retry_allowed"] is True
+    h.bot.send_poll.assert_not_awaited()
+    h.bot.send_message.assert_not_awaited()
+    h.db.query("UPDATE community_posts SET options='[\"Фільтр\",\"Лате\"]'::jsonb WHERE id=%s", (post["id"],))
+    assert retry(h, post).json()["telegram_status"] == "published"
+    h.bot.send_poll.assert_awaited_once()
