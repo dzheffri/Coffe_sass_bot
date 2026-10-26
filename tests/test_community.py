@@ -20,6 +20,7 @@ MIGRATION = PROJECT / "migrations/20261015_community_posts.sql"
 SOFT_DELETE_MIGRATION = PROJECT / "migrations/20261015_community_soft_delete.sql"
 ACTIVE_SERIES_MIGRATION = PROJECT / "migrations/20261019_community_series_active_uniqueness.sql"
 TELEGRAM_MIGRATION = PROJECT / "migrations/20261025_community_telegram.sql"
+DESTINATIONS_MIGRATION = PROJECT / "migrations/20261026_community_destinations.sql"
 
 
 def _photo_bytes(kind="PNG"):
@@ -34,6 +35,7 @@ def community_api(database, tmp_path):
     database.query(SOFT_DELETE_MIGRATION.read_text(encoding="utf-8"))
     database.query(ACTIVE_SERIES_MIGRATION.read_text(encoding="utf-8"))
     database.query(TELEGRAM_MIGRATION.read_text(encoding="utf-8"))
+    database.query(DESTINATIONS_MIGRATION.read_text(encoding="utf-8"))
     module = importlib.import_module("app.api.community")
 
     def auth(authorization: str | None = Header(default=None)):

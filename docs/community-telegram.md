@@ -1,7 +1,7 @@
 # Community publication to Telegram
 
 Community remains independent of coffee-shop broadcasts. Publishing a draft
-commits the app post first, then mirrors it to `@nashi_coffee_community` using the
+commits the publication and its destinations first, then mirrors it to `@nashi_coffee_community` using the
 existing `BOT_TOKEN`. The channel send uses `disable_notification=True`.
 
 The existing **Надіслати сповіщення** option controls personal notifications:
@@ -14,14 +14,21 @@ The existing **Надіслати сповіщення** option controls persona
 - Telegram is optional for app users; a linked Telegram identity never enables
   an additional personal notification for an app account.
 
-The channel is mirrored regardless of that checkbox. Drafts, deleted posts,
+The channel is mirrored regardless of that checkbox when **У Telegram** is selected.
+The independent **У застосунку «Наші»** and **У Telegram** flags default to true.
+App-only posts send no Telegram content or personal Telegram notification.
+Telegram-only posts stay hidden from consumer feed/detail/reactions/votes and
+never send app push. Both destinations disabled cannot be published.
+Drafts, deleted posts,
 and previously published legacy posts are not automatically delivered.
 
 ## Receipts and retries
 
 Apply `migrations/20261025_community_telegram.sql` before deploying the integration.
 It adds nullable Telegram fields to `community_posts` and creates the personal
-delivery ledger. It sends nothing and does not backfill old publications.
+delivery ledger. The additive `20261026_community_destinations.sql` migration
+adds destination flags with true defaults and ordered content-message receipts.
+Neither migration sends anything or backfills publication delivery.
 
 Admin responses expose the channel status, message ID, canonical channel-post
 URL, and safe retry eligibility.
@@ -43,25 +50,29 @@ Such an outcome requires checking the channel before any manual reconciliation.
 
 ## Content
 
-All six existing Community types are supported. Series retain their title and
-part number. A poll is mirrored as one native anonymous, single-choice, regular
-Telegram poll using its existing question and answers. Its stored Telegram
-message ID and all links refer to that poll. App and Telegram votes are separate:
-no Telegram vote is written to the app voting tables or API.
+All six Community types retain their readable category, title and full text.
+The tip category is **☕️ Порада бариста**. Series retain their title and part.
+Photos are read only from validated local Community storage.
 
-Telegram poll questions are limited to 300 characters and answer text to 100.
-Long answers are shortened, preserving distinct labels if truncation creates a
-collision. The existing app content and options remain unchanged. Additional
-text and photos stay in the app; no extra channel message is created for a poll.
-This keeps the same single-message delivery claim and retry protection.
+A photo is the first channel message, with up to 1024 UTF-16 units of caption.
+All remaining content follows in messages of up to 4096 UTF-16 units. Without a
+photo, the complete content uses those text messages directly. Splitting never
+truncates text or adds a placeholder directing Telegram-only readers to the app.
 
-Other posts retain their existing text/photo rendering. Photos are read from
-the existing validated Community storage, never fetched from arbitrary URLs.
+Polls first send the same full editorial content/photo and then immediately
+send the native anonymous, single-choice regular poll. The canonical
+`telegram_message_id` points to the native poll; for other types it points to
+the first content message. App and Telegram votes remain independent.
+Telegram poll questions are limited to 300 characters and answer labels to 100;
+only the Telegram poll labels may be shortened/disambiguated, never app content.
 
-Telegram limits a message to 4096 UTF-16 units and a photo caption to 1024.
-Long channel content is shortened with a note to read the full text in the app;
-the app post is unchanged. Personal messages contain a short announcement and
-a URL button linking to the exact channel message.
+Each acknowledged photo/text chunk is committed into
+`telegram_content_message_ids` before attempting the next chunk or poll. A
+confirmed rejection retries only the unfinished stage. A poll rejection never
+resends already-recorded full content. Timeout/5xx/crash keeps the outcome
+unknown/in flight and blocks blind resend, including partial publications.
+Existing published posts without content receipts are never recreated.
+Personal messages still contain only a short announcement and an exact post URL.
 
 ## Bot menu and rollout
 

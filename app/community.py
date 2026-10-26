@@ -34,7 +34,7 @@ class CommunityRepository:
     def _post_row(self, post_id: int, *, published_only: bool = False, lock: bool = False):
         query = "SELECT * FROM community_posts WHERE id=%s AND deleted_at IS NULL"
         if published_only:
-            query += " AND published_at IS NOT NULL"
+            query += " AND published_at IS NOT NULL AND publish_to_app=TRUE"
         if lock:
             query += " FOR UPDATE"
         row = self.connection.execute(query, (post_id,)).fetchone()
@@ -79,7 +79,7 @@ class CommunityRepository:
                 """SELECT id,title,series_part,series_total
                    FROM community_posts
                    WHERE type='series' AND LOWER(series_title)=LOWER(%s) AND published_at IS NOT NULL
-                     AND deleted_at IS NULL
+                     AND deleted_at IS NULL AND publish_to_app=TRUE
                    ORDER BY series_part ASC, id ASC""", (row["series_title"],),
             ).fetchall()
             series_posts = [_series_summary(item) for item in siblings]
@@ -92,6 +92,8 @@ class CommunityRepository:
             "created_at": row["created_at"],
             "published_at": row["published_at"],
             "is_published": row["published_at"] is not None,
+            **({"publish_to_app": bool(row["publish_to_app"]),
+                "publish_to_telegram": bool(row["publish_to_telegram"])} if admin else {}),
             "series_title": row["series_title"],
             "series_part": row["series_part"],
             "series_total": row["series_total"],
@@ -111,7 +113,7 @@ class CommunityRepository:
                    published_only: bool, admin: bool = False) -> dict:
         where = " WHERE deleted_at IS NULL"
         if published_only:
-            where += " AND published_at IS NOT NULL"
+            where += " AND published_at IS NOT NULL AND publish_to_app=TRUE"
         total = self.connection.execute(
             "SELECT COUNT(*) AS total FROM community_posts" + where
         ).fetchone()["total"]
@@ -134,11 +136,13 @@ class CommunityRepository:
         try:
             row = self.connection.execute(
                 """INSERT INTO community_posts
-                   (type,title,text,question,options,series_title,series_part,series_total,created_by_user_id)
-                   VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s) RETURNING *""",
+                   (type,title,text,question,options,series_title,series_part,series_total,created_by_user_id,
+                    publish_to_app,publish_to_telegram)
+                   VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s) RETURNING *""",
                 (data["type"], data["title"], data["text"], data.get("question"),
                  json.dumps(data.get("options", []), ensure_ascii=False), data.get("series_title"),
-                 data.get("series_part"), data.get("series_total"), actor_user_id),
+                 data.get("series_part"), data.get("series_total"), actor_user_id,
+                 data.get("publish_to_app", True), data.get("publish_to_telegram", True)),
             ).fetchone()
         except UniqueViolation as exc:
             raise CommunityError(409, "SERIES_PART_ALREADY_EXISTS") from exc
@@ -152,11 +156,14 @@ class CommunityRepository:
             row = self.connection.execute(
                 """UPDATE community_posts
                    SET type=%s,title=%s,text=%s,question=%s,options=%s::jsonb,
-                       series_title=%s,series_part=%s,series_total=%s
+                       series_title=%s,series_part=%s,series_total=%s,
+                       publish_to_app=%s,publish_to_telegram=%s
                    WHERE id=%s RETURNING *""",
                 (data["type"], data["title"], data["text"], data.get("question"),
                  json.dumps(data.get("options", []), ensure_ascii=False), data.get("series_title"),
-                 data.get("series_part"), data.get("series_total"), post_id),
+                 data.get("series_part"), data.get("series_total"),
+                 data.get("publish_to_app", row["publish_to_app"]),
+                 data.get("publish_to_telegram", row["publish_to_telegram"]), post_id),
             ).fetchone()
         except UniqueViolation as exc:
             raise CommunityError(409, "SERIES_PART_ALREADY_EXISTS") from exc
@@ -174,14 +181,18 @@ class CommunityRepository:
 
     def claim_publication(self, post_id: int, actor_user_id: int, notify: bool) -> tuple[dict, bool]:
         row = self._post_row(post_id, lock=True)
-        should_notify = row["published_at"] is None and bool(notify)
+        if not row["publish_to_app"] and not row["publish_to_telegram"]:
+            raise CommunityError(422, "COMMUNITY_DESTINATION_REQUIRED",
+                                 "Оберіть хоча б одне місце публікації.")
+        should_notify = row["published_at"] is None and bool(notify) and row["publish_to_app"]
         if row["published_at"] is None:
             row = self.connection.execute(
                 """UPDATE community_posts
-                   SET published_at=NOW(), notification_attempted=%s,telegram_status='pending'
-                   WHERE id=%s RETURNING *""", (bool(notify), post_id),
+                   SET published_at=NOW(), notification_attempted=%s,telegram_status=%s
+                   WHERE id=%s RETURNING *""",
+                (should_notify, "pending" if row["publish_to_telegram"] else None, post_id),
             ).fetchone()
-            if should_notify:
+            if bool(notify) and row["publish_to_telegram"]:
                 from app.community_telegram import queue_telegram_only_recipients
                 queue_telegram_only_recipients(self.connection, post_id)
         return self._serialized(row, actor_user_id, admin=True), should_notify

@@ -42,6 +42,8 @@ class CommunityPostInput(BaseModel):
     series_title: str | None = Field(default=None, max_length=180)
     series_part: int | None = Field(default=None, gt=0, le=365)
     series_total: int | None = Field(default=None, gt=0, le=365)
+    publish_to_app: bool = Field(default=True, strict=True)
+    publish_to_telegram: bool = Field(default=True, strict=True)
 
     class Config:
         extra = "forbid"
@@ -60,6 +62,11 @@ def _invalid(message: str = "INVALID_COMMUNITY_POST") -> CommunityError:
 
 def _normalise_post(data: CommunityPostInput) -> dict:
     values = data.model_dump(mode="python")
+    # Older admin clients omit destinations. New posts default to both; an
+    # existing draft keeps its saved choices when those fields are omitted.
+    for key in ("publish_to_app", "publish_to_telegram"):
+        if key not in data.model_fields_set:
+            values.pop(key)
     values["title"] = values["title"].strip()
     values["text"] = values["text"].strip()
     if not values["title"] or (values["type"] != "poll" and not values["text"]):
