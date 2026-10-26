@@ -39,6 +39,10 @@ def owner_database(operations_database, tmp_path, monkeypatch):
     database.query((Path(__file__).parents[1] / "migrations/20261004_admin_broadcast.sql").read_text())
     database.query((Path(__file__).parents[1] / "migrations/20261013_broadcast_recipients.sql").read_text())
     database.query((Path(__file__).parents[1] / "migrations/20261014_broadcast_recipient_delete.sql").read_text())
+    database.query((Path(__file__).parents[1] / "migrations/20261026_broadcast_delivery_jobs.sql").read_text())
+    # Patch before api/TestClient startup; no real polling sender may run.
+    owner_module = importlib.import_module("app.api.barista_owner")
+    monkeypatch.setattr(owner_module, "broadcast_job_loop", AsyncMock())
     from app import broadcast_publication
     from app.broadcast_media_storage import BroadcastMediaStorage
     database.broadcast_storage = BroadcastMediaStorage(tmp_path / "broadcast_media")
@@ -47,7 +51,8 @@ def owner_database(operations_database, tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def owner_api(owner_database, api, monkeypatch):
+def owner_api(owner_database, monkeypatch, request):
+    api = request.getfixturevalue("api")
     module = importlib.import_module("app.api.barista_owner")
 
     async def deliver(broadcast):
@@ -61,6 +66,27 @@ def owner_api(owner_database, api, monkeypatch):
     delivery = AsyncMock(side_effect=deliver)
     delivery.original = module.deliver_owner_broadcast
     monkeypatch.setattr(module, "deliver_owner_broadcast", delivery)
+    counter = iter(range(1, 1000))
+
+    async def telegram_send(**kwargs):
+        return SimpleNamespace(message_id=next(counter))
+
+    async def no_app_device(broadcast, recipient, *, audit):
+        audit.update(attempted=0, sent=0, failed=0)
+        return None
+
+    delivery.worker_bot = SimpleNamespace(send_message=AsyncMock(side_effect=telegram_send),
+        send_photo=AsyncMock(side_effect=telegram_send), send_video=AsyncMock(side_effect=telegram_send),
+        session=SimpleNamespace(close=AsyncMock()))
+    delivery.worker_push = AsyncMock(side_effect=no_app_device)
+
+    def drain():
+        from app.broadcast_jobs import process_broadcast_jobs_once
+        asyncio.run(process_broadcast_jobs_once(connection_factory=owner_database.db.get_connection,
+            push_sender=delivery.worker_push, bot_factory=lambda: delivery.worker_bot,
+            media_storage=owner_database.broadcast_storage))
+
+    delivery.drain = drain
     return api[0], delivery
 
 
@@ -329,10 +355,14 @@ def test_broadcast_preview_and_send_snapshots_all_own_shop_clients(owner_api, ow
     assert stored["token_hash"] != body["confirmation_token"]
     assert stored["used_at"] is None
     response = send(client, token, body["confirmation_token"])
-    assert response.status_code == 200
-    assert response.json()["sent"] == 2
-    assert delivery.await_args.args[0]["shop_name"] == "Наші"
-    assert delivery.await_args.args[0]["recipients"] == [
+    assert response.status_code == 202
+    assert response.json()["sent"] == 0 and response.json()["status"] == "queued"
+    assert database.query("SELECT * FROM touch_logs") == []
+    delivery.assert_not_awaited()
+    delivery.drain()
+    assert delivery.worker_push.await_args.args[0]["shop_name"] == "Наші"
+    assert [{key:call.args[1][key] for key in ("telegram_user_id", "user_id")}
+            for call in delivery.worker_push.await_args_list] == [
         {"telegram_user_id":1004,"user_id":4},
         {"telegram_user_id":1006,"user_id":6},
     ]
@@ -342,8 +372,10 @@ def test_broadcast_preview_and_send_snapshots_all_own_shop_clients(owner_api, ow
     ]
     assert database.query("SELECT sender_user_id,shop_id,recipients_count FROM broadcasts") == [
         {"sender_user_id":1,"shop_id":1,"recipients_count":2}]
-    assert send(client, token, body["confirmation_token"]).status_code == 409
-    assert delivery.await_count == 1
+    repeated = send(client, token, body["confirmation_token"])
+    assert repeated.status_code == 202 and repeated.json()["broadcast_id"] == response.json()["broadcast_id"]
+    delivery.drain()
+    assert delivery.worker_bot.send_message.await_count == 2
 
 
 def test_other_shop_other_session_changed_audience_or_expired_preview_never_send(owner_api, owner_database):
@@ -385,8 +417,11 @@ def test_two_concurrent_confirmations_attempt_delivery_only_once(owner_api, owne
     confirmation = preview(client, token).json()["confirmation_token"]
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: send(client, token, confirmation), range(2)))
-    assert sorted(result.status_code for result in results) == [200,409]
-    assert delivery.await_count == 1
+    assert sorted(result.status_code for result in results) == [202,202]
+    assert results[0].json()["broadcast_id"] == results[1].json()["broadcast_id"]
+    delivery.assert_not_awaited()
+    delivery.drain()
+    assert delivery.worker_bot.send_message.await_count == 2
     assert len(owner_database.query("SELECT * FROM broadcasts")) == 1
 
 
@@ -479,13 +514,14 @@ def test_plain_text_delivery_uses_only_saved_recipient_ids_and_closes_bot_sessio
     monkeypatch.setattr(module, "Bot", lambda token:bot)
     touched, failed = asyncio.run(owner_api[1].original({
         "shop_id": 1,
+        "shop_name": "Наші",
         "text":"<b>Ordinary text</b>",
         "recipients":[{"user_id":4,"telegram_user_id":1004},{"user_id":6,"telegram_user_id":1006}],
     }))
     assert touched == [4] and failed == 1
     assert [call.kwargs for call in bot.send_message.await_args_list] == [
-        {"chat_id":1004,"text":"<b>Ordinary text</b>"},
-        {"chat_id":1006,"text":"<b>Ordinary text</b>"},
+        {"chat_id":1004,"text":"☕️ Наші\n\n<b>Ordinary text</b>","parse_mode":None},
+        {"chat_id":1006,"text":"☕️ Наші\n\n<b>Ordinary text</b>","parse_mode":None},
     ]
     bot.session.close.assert_awaited_once()
     assert app_push.await_count == 2

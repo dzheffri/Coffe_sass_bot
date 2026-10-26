@@ -45,7 +45,10 @@ def test_native_text_confirmation_snapshots_all_shop_clients_without_changing_te
     # without Telegram. The selected shop still excludes user 5 from shop 2.
     assert body["recipients_count"] == 4
     assert db.query("SELECT * FROM broadcasts") == []
-    assert send(client, token, body["confirmation_token"]).status_code == 200
+    accepted = send(client, token, body["confirmation_token"])
+    assert accepted.status_code == 202 and accepted.json()["status"] == "queued"
+    assert db.query("SELECT * FROM touch_logs") == []
+    delivery.drain()
     row = db.query("SELECT * FROM broadcasts")[0]
     assert row["text"] == "Уся наша аудиторія" and row["shop_id"] == 1 and row["sender_user_id"] == 1
     assert row["media_type"] is None and row["media_key"] is None
@@ -55,13 +58,15 @@ def test_native_text_confirmation_snapshots_all_shop_clients_without_changing_te
     # Publication delivery receives the complete inbox snapshot, including
     # users without Telegram.  The APNs-first adapter decides per recipient
     # whether Telegram fallback is needed after the claim.
-    assert {user["user_id"] for user in delivery.await_args.args[0]["recipients"]} == {2, 4, 6, 7}
-    assert delivery.await_args.args[0]["shop_name"] == "Наші"
+    assert {call.args[1]["user_id"] for call in delivery.worker_push.await_args_list} == {2, 4, 6, 7}
+    assert delivery.worker_push.await_args.args[0]["shop_name"] == "Наші"
     assert row["recipients_count"] == 3
     assert {row["user_id"] for row in db.query("SELECT user_id FROM touch_logs")} == {4, 6, 7}
-    assert send(client, token, body["confirmation_token"]).status_code == 409
+    repeated = send(client, token, body["confirmation_token"])
+    assert repeated.status_code == 202 and repeated.json()["broadcast_id"] == accepted.json()["broadcast_id"]
     assert len(db.query("SELECT * FROM broadcasts")) == 1 and len(snapshot(db)) == 4
-    assert delivery.await_count == 1
+    delivery.drain()
+    assert delivery.worker_bot.send_message.await_count == 3
 
 
 @pytest.mark.parametrize("kind,data,filename,text", [
@@ -78,17 +83,18 @@ def test_native_media_persists_original_content_and_private_key(audience, owner_
     token = db.staff_token()
     body = media_preview(client, token, kind=kind, data=data, filename=filename, text=text).json()
     assert not db.broadcast_storage.root.exists()
-    assert send(client, token, body["confirmation_token"]).status_code == 200
+    assert send(client, token, body["confirmation_token"]).status_code == 202
+    delivery.drain()
     row = db.query("SELECT * FROM broadcasts")[0]
     assert row["media_type"] == kind and row["media_key"]
     assert row["text"] == text
     assert db.broadcast_storage.get(row["media_key"])["bytes"] == data
     assert [path.name for path in db.broadcast_storage.root.iterdir()] == [row["media_key"]]
     assert len(snapshot(db)) == 4
-    payload = delivery.await_args.args[0]
-    assert payload["media"]["bytes"] == data and payload["text"] == text
+    payload = delivery.worker_push.await_args.args[0]
+    assert db.broadcast_storage.get(payload["media_key"])["bytes"] == data and payload["text"] == text
     assert payload["shop_name"] == "Наші"
-    assert {user["user_id"] for user in payload["recipients"]} == {2, 4, 6, 7}
+    assert {call.args[1]["user_id"] for call in delivery.worker_push.await_args_list} == {2, 4, 6, 7}
     stored = db.query("SELECT media_bytes,used_at FROM admin_broadcast_previews")[0]
     assert stored["media_bytes"] is None and stored["used_at"] is not None
 
@@ -103,12 +109,15 @@ def test_native_storage_failure_does_not_break_original_delivery_or_create_broke
     token = db.staff_token()
     data = photo_data()
     body = media_preview(client, token, data=data, text=text).json()
-    assert send(client, token, body["confirmation_token"]).status_code == 200
+    assert send(client, token, body["confirmation_token"]).status_code == 202
+    fallback = db.query("SELECT fallback_media_bytes FROM broadcast_delivery_jobs")[0]
+    assert bytes(fallback["fallback_media_bytes"]) == data
+    delivery.drain()
     row = db.query("SELECT * FROM broadcasts")[0]
     assert row["text"] == text and row["media_type"] is None and row["media_key"] is None
     assert len(snapshot(db)) == 4
-    assert delivery.await_args.args[0]["media"]["bytes"] == data
-    assert delivery.await_count == 1
+    assert delivery.worker_bot.send_photo.await_args.kwargs["photo"].data == data
+    assert delivery.worker_bot.send_photo.await_count == 3
     assert "Broadcast media persistence failed (OSError)" in caplog.text
     assert "private failure" not in caplog.text
 
@@ -122,9 +131,12 @@ def test_app_only_audience_can_publish_without_telegram_devices(owner_database, 
     body = preview(client, token).json()
     assert body["recipients_count"] == 1
     result = send(client, token, body["confirmation_token"])
-    assert result.status_code == 200 and result.json()["sent"] == 0
+    assert result.status_code == 202 and result.json()["sent"] == 0
+    delivery.drain()
     assert [row["user_id"] for row in snapshot(db)] == [2]
-    assert delivery.await_args.args[0]["recipients"] == [{"telegram_user_id": None, "user_id": 2}]
+    recipient = delivery.worker_push.await_args.args[1]
+    assert recipient["telegram_user_id"] is None and recipient["user_id"] == 2
+    delivery.worker_bot.send_message.assert_not_awaited()
 
 
 def test_native_snapshot_includes_null_activity_client_and_excludes_other_shop(owner_database, owner_api):
@@ -141,11 +153,12 @@ def test_native_snapshot_includes_null_activity_client_and_excludes_other_shop(o
     body = preview(client, token, "Для всіх клієнтів").json()
 
     assert body["recipients_count"] == 3
-    assert send(client, token, body["confirmation_token"]).status_code == 200
-    payload = delivery.await_args.args[0]
-    assert {row["user_id"] for row in payload["recipients"]} == {4, 6, 8}
+    assert send(client, token, body["confirmation_token"]).status_code == 202
+    delivery.drain()
+    recipients = [call.args[1] for call in delivery.worker_push.await_args_list]
+    assert {row["user_id"] for row in recipients} == {4, 6, 8}
     assert {row["user_id"] for row in snapshot(db)} == {4, 6, 8}
-    assert 5 not in {row["user_id"] for row in payload["recipients"]}
+    assert 5 not in {row["user_id"] for row in recipients}
 
 
 def test_native_preview_becomes_stale_when_old_client_is_added(owner_database, owner_api):
@@ -176,8 +189,9 @@ def test_native_preview_is_stable_when_only_client_activity_changes(owner_databa
     db.query("UPDATE shop_clients SET last_activity_at=NOW() WHERE shop_id=1 AND user_id=6")
 
     response = send(client, token, body["confirmation_token"])
-    assert response.status_code == 200
-    assert delivery.await_count == 1
+    assert response.status_code == 202
+    delivery.drain()
+    assert delivery.worker_bot.send_message.await_count == 2
 
 
 def test_new_app_only_audience_member_invalidates_native_preview(owner_database, owner_api):
@@ -199,10 +213,12 @@ def test_native_concurrent_confirmation_creates_one_broadcast_snapshot_and_file(
     body = media_preview(client, token).json()
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: send(client, token, body["confirmation_token"]), range(2)))
-    assert sorted(response.status_code for response in results) == [200, 409]
+    assert sorted(response.status_code for response in results) == [202, 202]
+    assert results[0].json()["broadcast_id"] == results[1].json()["broadcast_id"]
     assert len(db.query("SELECT * FROM broadcasts")) == 1 and len(snapshot(db)) == 4
     assert len(list(db.broadcast_storage.root.iterdir())) == 1
-    assert delivery.await_count == 1
+    delivery.drain()
+    assert delivery.worker_bot.send_photo.await_count == 3
 
 
 def test_recipient_insert_failure_rolls_back_broadcast_preview_and_private_file(audience, owner_api):
@@ -355,10 +371,18 @@ def test_bot_confirmation_downloads_publishes_and_delivers_through_real_shared_s
         else:
             assert row["media_type"] is None and row["media_key"] is None
             callback.bot.get_file.assert_not_awaited()
-        assert [call.kwargs for call in callback.bot.copy_message.await_args_list] == [
-            {"chat_id": user, "from_chat_id": 888, "message_id": 55} for user in (1004, 1007)]
+        if kind:
+            sender = callback.bot.copy_message
+            assert [call.kwargs for call in sender.await_args_list] == [
+                {"chat_id": user, "from_chat_id": 888, "message_id": 55,
+                 "caption": "☕️ Наші\n\nOriginal caption", "parse_mode": None} for user in (1004, 1007)]
+        else:
+            sender = callback.bot.send_message
+            assert [call.kwargs for call in sender.await_args_list] == [
+                {"chat_id": user, "text": "☕️ Наші\n\nOriginal caption", "parse_mode": None} for user in (1004, 1007)]
+            callback.bot.copy_message.assert_not_awaited()
         await owner.broadcast_confirm_callback(callback, state)
         assert len(db.query("SELECT * FROM broadcasts")) == 1
-        assert len(snapshot(db)) == 3 and callback.bot.copy_message.await_count == 2
+        assert len(snapshot(db)) == 3 and sender.await_count == 2
 
     asyncio.run(scenario())

@@ -114,9 +114,9 @@ def test_already_claimed_broadcast_stops_pending_delivery_on_shop_closure(owner_
     monkeypatch.setitem(sys.modules, "app.config", SimpleNamespace(BOT_TOKEN="offline-token"))
     monkeypatch.setattr(module, "Bot", lambda token: bot)
     touched, failed = asyncio.run(owner_api[1].original({
-        "shop_id":1, "text":"Shop-only message",
+        "shop_id":1, "shop_name":"Наші", "text":"Shop-only message",
         "recipients":[{"user_id":4,"telegram_user_id":1004}, {"user_id":6,"telegram_user_id":1006}],
     }))
     assert touched == [4] and failed == 1
-    bot.send_message.assert_awaited_once_with(chat_id=1004, text="Shop-only message")
+    bot.send_message.assert_awaited_once_with(chat_id=1004, text="☕️ Наші\n\nShop-only message",parse_mode=None)
     bot.session.close.assert_awaited_once()

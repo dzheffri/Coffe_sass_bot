@@ -389,6 +389,7 @@ async def broadcast_preview_handler(message: types.Message, state: FSMContext):
                     broadcast_shop_id=admin_shop["id"],
                     broadcast_preview_token=token,
                     broadcast_media_reference=_broadcast_media_reference(message),
+                    broadcast_has_attachment=message.text is None,
                 )
     if error:
         await message.answer(error)
@@ -508,11 +509,18 @@ async def broadcast_confirm_callback(callback: types.CallbackQuery, state: FSMCo
             if push_sent is None and row.get("telegram_user_id") is None:
                 continue
             if push_sent is None:
-                await callback.bot.copy_message(
-                    chat_id=row["telegram_user_id"],
-                    from_chat_id=data["broadcast_from_chat_id"],
-                    message_id=data["broadcast_message_id"],
-                )
+                from app.broadcast_jobs import telegram_plan
+                # Keep original media even when its private download failed.
+                # Only Telegram rendering gains the sender; inbox text stays exact.
+                has_attachment = data.get('broadcast_has_attachment', bool(data.get('broadcast_media_reference')))
+                for stage in telegram_plan(publication['shop_name'], publication['text'],
+                                           'photo' if has_attachment else None):
+                    if stage['kind'] == 'text':
+                        await callback.bot.send_message(chat_id=row['telegram_user_id'],text=stage['text'],parse_mode=None)
+                    else:
+                        await callback.bot.copy_message(chat_id=row['telegram_user_id'],
+                            from_chat_id=data['broadcast_from_chat_id'],message_id=data['broadcast_message_id'],
+                            caption=stage['text'],parse_mode=None)
             sent += 1
             touched_user_ids.append(row["user_id"])
         except Exception as exc:

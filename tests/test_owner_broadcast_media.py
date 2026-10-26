@@ -54,19 +54,26 @@ def test_valid_native_media_is_pinned_to_shop_preview_and_cleared_before_deliver
     stored = owner_database.query("SELECT * FROM admin_broadcast_previews")[0]
     assert bytes(stored["media_bytes"]) == data
     result = send(client,token,body["confirmation_token"])
-    assert result.status_code == 200
-    captured = delivery.await_args.args[0]
-    assert captured["media"]["bytes"] == data and captured["media"]["kind"] == kind
-    assert captured["shop_name"] == "Наші"
-    assert captured["recipients"] == [
+    assert result.status_code == 202 and result.json()["status"] == "queued"
+    delivery.assert_not_awaited()
+    delivery.drain()
+    captured = delivery.worker_push.await_args.args[0]
+    assert owner_database.broadcast_storage.get(captured["media_key"])["bytes"] == data
+    assert captured["media_type"] == kind and captured["shop_name"] == "Наші"
+    assert [{key:call.args[1][key] for key in ("user_id", "telegram_user_id")}
+            for call in delivery.worker_push.await_args_list] == [
         {"user_id":4,"telegram_user_id":1004},
         {"user_id":6,"telegram_user_id":1006},
     ]
     assert captured["text"] == "Запрошуємо на каву"
     stored = owner_database.query("SELECT * FROM admin_broadcast_previews")[0]
     assert stored["media_bytes"] is None and stored["used_at"] is not None
-    assert send(client,token,body["confirmation_token"]).status_code == 409
-    assert delivery.await_count == 1
+    repeated = send(client,token,body["confirmation_token"])
+    assert repeated.status_code == 202 and repeated.json()["broadcast_id"] == result.json()["broadcast_id"]
+    delivery.drain()
+    sender = delivery.worker_bot.send_photo if kind == "photo" else delivery.worker_bot.send_video
+    assert sender.await_count == 2
+    assert all(call.kwargs[kind].data == data for call in sender.await_args_list)
 
 
 def test_media_only_and_json_text_backwards_compatibility(owner_api,owner_database):
@@ -74,7 +81,7 @@ def test_media_only_and_json_text_backwards_compatibility(owner_api,owner_databa
     token = owner_database.staff_token()
     media = media_preview(client,token,text="")
     assert media.status_code == 200 and media.json()["text"] == ""
-    assert send(client,token,media.json()["confirmation_token"]).status_code == 200
+    assert send(client,token,media.json()["confirmation_token"]).status_code == 202
     text = preview(client,token)
     assert text.status_code == 200 and text.json()["media"] is None
 
@@ -262,12 +269,13 @@ def test_native_delivery_passes_buffered_media_and_caption_only_to_verified_reci
     data = photo_data() if kind == "photo" else video_data()
     touched,failed = asyncio.run(owner_api[1].original({
         "shop_id": 1,
+        "shop_name": "Наші",
         "text":"Caption", "recipients":[{"user_id":4,"telegram_user_id":1004}],
         "media":{"kind":kind,"filename":"attachment","bytes":data},
     }))
     assert touched == [4] and failed == 0
     call = getattr(bot,method).await_args.kwargs
-    assert call["chat_id"] == 1004 and call["caption"] == "Caption"
+    assert call["chat_id"] == 1004 and call["caption"] == "☕️ Наші\n\nCaption" and call["parse_mode"] is None
     assert call[kind].data == data
     bot.send_message.assert_not_awaited()
     bot.session.close.assert_awaited_once()
@@ -288,6 +296,7 @@ def test_native_delivery_reuses_only_telegram_returned_media_id(owner_api, monke
     data = photo_data() if kind == "photo" else video_data()
     touched, failed = asyncio.run(owner_api[1].original({
         "shop_id": 1,
+        "shop_name": "Наші",
         "text": "Caption", "recipients": [{"user_id": 4, "telegram_user_id": 1004},
                                           {"user_id": 5, "telegram_user_id": 1005}],
         "media": {"kind": kind, "filename": "attachment", "bytes": data},
@@ -297,7 +306,7 @@ def test_native_delivery_reuses_only_telegram_returned_media_id(owner_api, monke
     assert calls[0].kwargs[kind].data == data
     assert calls[1].kwargs[kind] == "bot-uploaded-" + kind
     assert [call.kwargs["chat_id"] for call in calls] == [1004, 1005]
-    assert all(call.kwargs["caption"] == "Caption" for call in calls)
+    assert all(call.kwargs["caption"] == "☕️ Наші\n\nCaption" and call.kwargs["parse_mode"] is None for call in calls)
     bot.send_message.assert_not_awaited()
     bot.session.close.assert_awaited_once()
 

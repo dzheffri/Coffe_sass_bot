@@ -95,6 +95,25 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 app = FastAPI(title="Coffee Club API")
 
+
+@app.on_event("startup")
+async def start_shop_novelty_worker():
+    import asyncio
+    from app.shop_novelty_notifications import worker
+    app.state.shop_novelty_worker = asyncio.create_task(worker())
+
+
+@app.on_event("shutdown")
+async def stop_shop_novelty_worker():
+    import asyncio
+    task = getattr(app.state, "shop_novelty_worker", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2447,172 +2466,13 @@ async def owner_update_shop(
 ):
     if get_owner_shop_id(owner_telegram_id) is None:
         raise HTTPException(403, detail="Кав’ярню закрито або доступ відсутній")
-    # До сохранения запоминаем текущие карточки "Новинки".
-    # Сравниваем не количество карточек, а их содержимое.
-    # Поэтому сценарий:
-    #   удалили старую -> добавили новую -> сохранили
-    # тоже даст push, даже если общее количество осталось тем же.
-    old_profile = get_shop_profile(owner_telegram_id)
-
-    old_news = []
-    if old_profile and old_profile.get("ok"):
-        old_news = (
-            old_profile.get("shop", {}).get("news", [])
-            or []
-        )
-
-    def news_fields(item):
-        if isinstance(item, dict):
-            title = str(item.get("title") or "").strip()
-            price = str(item.get("price") or "").strip()
-            image_url = str(item.get("image_url") or "").strip()
-        else:
-            title = str(getattr(item, "title", "") or "").strip()
-            price = str(getattr(item, "price", "") or "").strip()
-            image_url = str(getattr(item, "image_url", "") or "").strip()
-
-        return title, price, image_url
-
-    def is_meaningful_news(item):
-        title, price, image_url = news_fields(item)
-        return bool(title or price or image_url)
-
-    def news_identity(item):
-        """
-        Идентичность новинки для определения именно новой карточки.
-
-        Цена специально не участвует:
-        изменение только цены не должно слать новый push.
-        """
-        title, _, image_url = news_fields(item)
-
-        return (
-            title.casefold(),
-            image_url,
-        )
-
-    old_identities = {
-        news_identity(item)
-        for item in old_news
-        if is_meaningful_news(item)
-    }
-
-    new_news_payload = [
-        item.dict()
-        for item in data.news
-    ]
-
-    new_meaningful = [
-        item
-        for item in new_news_payload
-        if is_meaningful_news(item)
-    ]
-
-    newly_added_news = [
-        item
-        for item in new_meaningful
-        if news_identity(item) not in old_identities
-    ]
-
-    result = update_shop_profile(
-        owner_telegram_id=owner_telegram_id,
-        name=data.name,
-        subtitle=data.subtitle,
-        address=data.address,
-        work_from=data.work_from,
-        work_to=data.work_to,
-        instagram=data.instagram,
-        description=data.description,
-        logo_url=data.logo_url,
-        cover_url=data.cover_url,
-        news=new_news_payload,
+    # Notifications are emitted only by the atomic Super Admin approval flow.
+    return update_shop_profile(
+        owner_telegram_id=owner_telegram_id, name=data.name, subtitle=data.subtitle,
+        address=data.address, work_from=data.work_from, work_to=data.work_to,
+        instagram=data.instagram, description=data.description, logo_url=data.logo_url,
+        cover_url=data.cover_url, news=[item.dict() for item in data.news],
     )
-
-    # Push отправляем только если появилась реально новая
-    # карточка. Удаление само по себе push не вызывает.
-    if (
-        result
-        and result.get("ok")
-        and newly_added_news
-    ):
-        try:
-            shop_id = get_owner_shop_id(
-                owner_telegram_id
-            )
-
-            if shop_id:
-                settings = get_shop_reminder_settings(
-                    shop_id
-                )
-
-                shop_news_enabled = bool(
-                    settings
-                    and settings.get(
-                        "shop_news_enabled",
-                        True,
-                    )
-                )
-
-                if shop_news_enabled:
-                    devices = (
-                        get_app_push_devices_for_shop(
-                            shop_id
-                        )
-                    )
-
-                    newest_item = newly_added_news[-1]
-                    news_title = (
-                        str(
-                            newest_item.get("title")
-                            or ""
-                        ).strip()
-                    )
-
-                    shop_name = (
-                        (data.name or "").strip()
-                        or "Кавʼярня"
-                    )
-
-                    if news_title:
-                        body = (
-                            f"{news_title}. "
-                            f"Зазирни в «Наші» 👀"
-                        )
-                    else:
-                        body = (
-                            "Кавʼярня додала новинку — "
-                            "зазирни в «Наші» 👀"
-                        )
-
-                    push_result = await send_app_pushes(
-                        devices=devices,
-                        title=(
-                            f"📰 {shop_name} має новинку"
-                        ),
-                        body=body,
-                        data={
-                            "type": "shop_news",
-                            "shop_id": shop_id,
-                        },
-                    )
-
-                    print(
-                        "🔔 SHOP NEWS PUSH:",
-                        f"shop_id={shop_id}",
-                        f"devices={len(devices)}",
-                        f"sent={push_result.get('sent', 0)}",
-                        f"failed={push_result.get('failed', 0)}",
-                    )
-
-        except Exception as exc:
-            # Ошибка push никогда не должна мешать
-            # сохранению профиля кофейни.
-            print(
-                "SHOP NEWS PUSH ERROR:",
-                repr(exc),
-            )
-
-    return result
 
 
 @app.get("/owner/shops/{owner_telegram_id}")
@@ -2739,110 +2599,10 @@ async def superadmin_approve_request(
     request_id: int,
     current_user=Depends(require_superadmin),
 ):
-    reviewer_telegram_id = int(
-        current_user["telegram_user_id"]
-    )
+    from app.shop_novelty_notifications import approve_shop_change
+    from starlette.concurrency import run_in_threadpool
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    scr.id,
-                    scr.shop_id,
-                    scr.status,
-                    scr.payload,
-                    owner.telegram_user_id AS owner_telegram_id,
-                    sa.user_id AS owner_user_id
-                FROM shop_change_requests scr
-
-                LEFT JOIN shop_admins sa
-                    ON sa.shop_id = scr.shop_id
-                   AND sa.role = 'owner'
-
-                LEFT JOIN users owner
-                    ON owner.id = sa.user_id
-
-                WHERE scr.id = %s
-                LIMIT 1
-                """,
-                (request_id,),
-            )
-
-            request_row = cur.fetchone()
-
-    if not request_row:
-        raise HTTPException(
-            status_code=404,
-            detail="Заявку не знайдено",
-        )
-
-    if request_row["status"] != "pending":
-        raise HTTPException(
-            status_code=400,
-            detail="Заявка вже оброблена",
-        )
-
-    owner_telegram_id = request_row[
-        "owner_telegram_id"
-    ]
-
-    if not owner_telegram_id and not request_row.get("owner_user_id"):
-        raise HTTPException(
-            status_code=400,
-            detail="Власника кавʼярні не знайдено",
-        )
-
-    payload = request_row["payload"] or {}
-
-    news_payload = payload.get("news") or []
-
-    result = update_shop_profile(
-        owner_telegram_id=owner_telegram_id,
-        authorized_shop_id=request_row["shop_id"],
-        name=payload.get("name", ""),
-        subtitle=payload.get("subtitle", ""),
-        address=payload.get("address", ""),
-        work_from=payload.get("work_from", ""),
-        work_to=payload.get("work_to", ""),
-        instagram=payload.get("instagram", ""),
-        description=payload.get("description", ""),
-        logo_url=payload.get("logo_url", ""),
-        cover_url=payload.get("cover_url", ""),
-        news=news_payload,
-    )
-
-    if not result or not result.get("ok"):
-        raise HTTPException(
-            status_code=500,
-            detail="Не вдалося застосувати зміни",
-        )
-
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE shop_change_requests
-                SET
-                    status = 'approved',
-                    reviewed_at = NOW(),
-                    reviewed_by_telegram_id = %s,
-                    reject_reason = NULL
-                WHERE id = %s
-                  AND status = 'pending'
-                """,
-                (
-                    reviewer_telegram_id,
-                    request_id,
-                ),
-            )
-
-    return {
-        "ok": True,
-        "status": "approved",
-        "request_id": request_id,
-        "shop_id": request_row["shop_id"],
-    }
+    return await run_in_threadpool(approve_shop_change, request_id, int(current_user["telegram_user_id"]))
 
 
 @app.post(

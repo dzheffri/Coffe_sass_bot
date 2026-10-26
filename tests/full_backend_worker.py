@@ -149,6 +149,13 @@ def worker(source, phase, schema, audit_root):
         state["before"] = query("SELECT * FROM app_sessions ORDER BY id")
         report["legacy_real_startup_schema"] = True
     else:
+        if phase == 'current_security':
+            # The harness explicitly drains new receipts below with fake
+            # transports. Real startup delivery must never race those checks.
+            from app.api import barista_owner
+            from app import shop_novelty_notifications
+            barista_owner.broadcast_job_loop = AsyncMock()
+            shop_novelty_notifications.worker = AsyncMock()
         with TestClient(main.app) as client:
             for path in ("/me", "/me/qr", "/me/shops", "/me/stats"):
                 response = client.get(path, headers=auth("legacy-active"))
@@ -607,21 +614,30 @@ def _real_native_admin_tools(db, client, query, auth, jwt, report):
     assert client.post("/barista/owner/broadcast", headers=auth(other_owner),
                        json={"confirmation_token": confirmation}).status_code == 403
 
-    async def offline_delivery(broadcast):
-        # The publication snapshot contains the app-only customer too; the
-        # mocked legacy delivery reports only the Telegram recipient as sent.
-        assert broadcast["recipients"] == [
-            {"telegram_user_id": 71001, "user_id": 1},
-            {"telegram_user_id": None, "user_id": 32650},
-        ]
-        return [1], 0
+    async def offline_push(broadcast, recipient, *, audit):
+        audit.update(attempted=0,sent=0,failed=0)
+        return None
 
-    with patch.object(barista_owner, "deliver_owner_broadcast", AsyncMock(side_effect=offline_delivery)) as delivery:
-        sent = client.post("/barista/owner/broadcast", headers=auth(owner), json={"confirmation_token": confirmation})
-        assert sent.status_code == 200 and sent.json()["sent"] == 1, sent.text
-        assert client.post("/barista/owner/broadcast", headers=auth(owner),
-                           json={"confirmation_token": confirmation}).status_code == 409
-        delivery.assert_awaited_once()
+    from app.broadcast_jobs import process_broadcast_jobs_once
+    push = AsyncMock(side_effect=offline_push)
+    bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=101)),
+                          session=SimpleNamespace(close=AsyncMock()))
+    sent = client.post('/barista/owner/broadcast',headers=auth(owner),json={'confirmation_token':confirmation})
+    assert sent.status_code == 202 and sent.json()['status'] == 'queued',sent.text
+    bid = sent.json()['broadcast_id']
+    assert sent.json()['target_users'] == sent.json()['app_notifications_created'] == 2
+    assert sent.json()['apns_attempted'] == sent.json()['telegram_attempted'] == 0
+    asyncio.run(process_broadcast_jobs_once(connection_factory=db.get_connection,push_sender=push,bot_factory=lambda:bot))
+    assert {call.args[1]['user_id'] for call in push.await_args_list} == {1,32650}
+    bot.send_message.assert_awaited_once_with(chat_id=71001,text='☕️ Local cafe\n\nOffline only',
+                                            parse_mode=None,request_timeout=15)
+    result = client.get(f'/barista/owner/broadcasts/{bid}',headers=auth(owner))
+    assert result.status_code == 200 and result.json()['status'] == 'completed'
+    assert result.json()['sent'] == result.json()['telegram_success'] == 1
+    again = client.post('/barista/owner/broadcast',headers=auth(owner),json={'confirmation_token':confirmation})
+    assert again.status_code == 202 and again.json()['broadcast_id'] == bid
+    asyncio.run(process_broadcast_jobs_once(connection_factory=db.get_connection,push_sender=push,bot_factory=lambda:bot))
+    assert push.await_count == 2 and bot.send_message.await_count == 1
     assert query("""SELECT user_id,read_at,delivery_status FROM broadcast_recipients
         ORDER BY user_id""") == [
         {"user_id": user_id, "read_at": None, "delivery_status": None}

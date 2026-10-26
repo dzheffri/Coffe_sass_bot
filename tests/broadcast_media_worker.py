@@ -47,7 +47,7 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         ).start()
         self.publication = patch.object(
             self.owner, "publish_bot_broadcast",
-            return_value={"broadcast_id": 101, "shop_id": 73, "text": "Original caption",
+            return_value={"broadcast_id": 101, "shop_id": 73, "shop_name": "Offline shop", "text": "Original caption",
                           "recipients": [{"telegram_user_id": 201, "user_id": 11}]},
         ).start()
         self.active_shop = patch.object(self.owner, "get_shop", return_value={"id": 73, "is_active": True}).start()
@@ -112,7 +112,7 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             data=f"broadcast_confirm:{PREVIEW_TOKEN}",
             from_user=SimpleNamespace(id=9002), answer=AsyncMock(),
-            message=self.message(), bot=SimpleNamespace(copy_message=AsyncMock()),
+            message=self.message(), bot=SimpleNamespace(copy_message=AsyncMock(),send_message=AsyncMock()),
         )
 
     async def test_ordinary_owner_cannot_start_or_send_global_broadcast(self):
@@ -159,6 +159,7 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
                         broadcast_from_chat_id=777, broadcast_message_id=44,
                         broadcast_shop_id=73, broadcast_preview_token=payload["broadcast_preview_token"],
                         broadcast_media_reference=reference,
+                        broadcast_has_attachment=kind != 'text',
                     )
                     self.assertEqual(len(payload["broadcast_preview_token"]), 32)
                     copied = message.bot.copy_message.await_args.kwargs
@@ -184,9 +185,9 @@ class BroadcastMediaTests(unittest.IsolatedAsyncioTestCase):
         self.shop.assert_called_once_with(9002)
         self.publication.assert_called_once_with(73, 9002, "Original caption", None, quota_exempt=False)
         self.all_users.assert_not_called()
-        callback.bot.copy_message.assert_awaited_once_with(
-            chat_id=201, from_chat_id=888, message_id=55,
-        )
+        callback.bot.copy_message.assert_not_awaited()
+        callback.bot.send_message.assert_awaited_once_with(
+            chat_id=201,text='☕️ Offline shop\n\nOriginal caption',parse_mode=None)
         self.record.assert_called_once_with(73, 101, [11])
         state.clear.assert_awaited_once()
 

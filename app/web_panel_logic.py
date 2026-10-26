@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 from app.db import get_connection, get_admin_shop_and_role, get_shop_marketing_efficiency
 
 
@@ -110,7 +112,7 @@ def update_shop_profile(
     logo_url: str,
     cover_url: str,
     news: list[dict],
-    *, authorized_shop_id: int | None = None,
+    *, authorized_shop_id: int | None = None, connection=None,
 ):
     # Only authenticated server callers may supply a pre-authorized shop.
     # Legacy bot/Web callers retain the original Telegram owner lookup.
@@ -125,7 +127,7 @@ def update_shop_profile(
 
     shop_id = shop["id"]
 
-    with get_connection() as conn:
+    with (get_connection() if connection is None else nullcontext(connection)) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -183,7 +185,8 @@ def update_shop_profile(
                     )
                 )
 
-        conn.commit()
+        if connection is None:
+            conn.commit()
 
     return {
         "ok": True,

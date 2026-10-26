@@ -97,6 +97,7 @@ def _saved_preview(**overrides):
         "broadcast_shop_id": SHOP_ID,
         "broadcast_preview_token": PREVIEW_TOKEN,
         "broadcast_media_reference": None,
+        "broadcast_has_attachment": bool(overrides.get('broadcast_media_reference')),
         **overrides,
     }
 
@@ -156,7 +157,7 @@ def owner():
         "log_broadcast_touches": Mock(side_effect=AssertionError("Legacy touch helper must not be called")),
         "download_telegram_broadcast_media": AsyncMock(return_value=None),
         "publish_bot_broadcast": Mock(return_value={
-            "broadcast_id": BROADCAST_ID, "shop_id": SHOP_ID,
+            "broadcast_id": BROADCAST_ID, "shop_id": SHOP_ID, "shop_name": "Offline shop",
             "text": "Original caption", "recipients": [
                 {"user_id": 11, "telegram_user_id": 201},
                 {"user_id": 12, "telegram_user_id": None},
@@ -235,16 +236,22 @@ def test_confirmation_publishes_then_copies_original_only_to_telegram_audience(o
         owner.download_telegram_broadcast_media.return_value = media
         state, callback = _state(), _callback()
         audience = copy.deepcopy(owner.publish_bot_broadcast.return_value["recipients"])
-        await _seed_state(state, _saved_preview(broadcast_media_reference=reference))
+        await _seed_state(state, _saved_preview(broadcast_media_reference=reference,
+                                               broadcast_has_attachment=kind != 'text'))
         await owner.broadcast_confirm_callback(callback, state)
         owner.publish_bot_broadcast.assert_called_once_with(
             SHOP_ID, ACTOR, "Original caption", media, quota_exempt=False,
         )
         owner.download_telegram_broadcast_media.assert_awaited_once_with(callback.bot, reference)
-        callback.bot.copy_message.assert_awaited_once_with(
-            chat_id=201, from_chat_id=888, message_id=55,
-        )
-        callback.bot.send_message.assert_not_awaited()
+        if kind == 'text':
+            callback.bot.send_message.assert_awaited_once_with(
+                chat_id=201,text='☕️ Offline shop\n\nOriginal caption',parse_mode=None)
+            callback.bot.copy_message.assert_not_awaited()
+        else:
+            callback.bot.copy_message.assert_awaited_once_with(
+                chat_id=201,from_chat_id=888,message_id=55,
+                caption='☕️ Offline shop\n\nOriginal caption',parse_mode=None)
+            callback.bot.send_message.assert_not_awaited()
         owner.record_broadcast_delivery.assert_called_once_with(SHOP_ID, BROADCAST_ID, [11])
         assert owner.publish_bot_broadcast.return_value["recipients"] == audience
         assert await state.get_data() == {} and await state.get_state() is None
@@ -331,13 +338,14 @@ def test_photo_without_caption_publishes_empty_text_and_copies_original(owner):
         assert data["broadcast_text"] == ""
         media = {"kind": "photo", "filename": "photo.jpg", "bytes": b"validated"}
         owner.download_telegram_broadcast_media.return_value = media
+        owner.publish_bot_broadcast.return_value['text'] = ''
         callback = _callback(token=data["broadcast_preview_token"])
         await owner.broadcast_confirm_callback(callback, state)
         owner.publish_bot_broadcast.assert_called_once_with(
             SHOP_ID, ACTOR, "", media, quota_exempt=False,
         )
         callback.bot.copy_message.assert_awaited_once_with(
-            chat_id=201, from_chat_id=777, message_id=44,
+            chat_id=201, from_chat_id=777, message_id=44,caption='☕️ Offline shop',parse_mode=None,
         )
 
     asyncio.run(scenario())
@@ -352,8 +360,9 @@ def test_repeated_confirmation_publishes_and_delivers_once(owner):
         await owner.broadcast_confirm_callback(second, state)
         owner.publish_bot_broadcast.assert_called_once()
         owner.record_broadcast_delivery.assert_called_once()
-        first.bot.copy_message.assert_awaited_once()
-        second.bot.copy_message.assert_not_awaited()
+        first.bot.send_message.assert_awaited_once()
+        second.bot.send_message.assert_not_awaited()
+        first.bot.copy_message.assert_not_awaited()
 
     asyncio.run(scenario())
 
@@ -389,8 +398,9 @@ def test_concurrent_confirmation_claims_shared_fsm_before_download_or_delivery(o
         owner.download_telegram_broadcast_media.assert_awaited_once()
         owner.publish_bot_broadcast.assert_called_once()
         owner.record_broadcast_delivery.assert_called_once()
-        first.bot.copy_message.assert_awaited_once()
-        second.bot.copy_message.assert_not_awaited()
+        first.bot.send_message.assert_awaited_once()
+        second.bot.send_message.assert_not_awaited()
+        first.bot.copy_message.assert_not_awaited()
 
     asyncio.run(scenario())
 
@@ -463,6 +473,7 @@ def test_download_failure_publishes_without_media_and_still_copies_original(owne
         )
         callback.bot.copy_message.assert_awaited_once_with(
             chat_id=201, from_chat_id=888, message_id=55,
+            caption='☕️ Offline shop\n\nOriginal caption',parse_mode=None,
         )
         output = caplog.text + capsys.readouterr().out
         assert "private-path-and-token" not in output
@@ -480,12 +491,29 @@ def test_delivery_records_only_successful_user_ids_from_published_audience(owner
             {"user_id": 13, "telegram_user_id": 203},
         ]
         callback, state = _callback(), _state()
-        callback.bot.copy_message.side_effect = [None, RuntimeError("offline Telegram failure")]
+        callback.bot.send_message.side_effect = [None, RuntimeError("offline Telegram failure")]
         await _seed_state(state, _saved_preview())
         await owner.broadcast_confirm_callback(callback, state)
-        assert [call.kwargs["chat_id"] for call in callback.bot.copy_message.await_args_list] == [201, 203]
+        assert [call.kwargs["chat_id"] for call in callback.bot.send_message.await_args_list] == [201, 203]
         owner.record_broadcast_delivery.assert_called_once_with(SHOP_ID, BROADCAST_ID, [11])
 
+    asyncio.run(scenario())
+
+
+def test_photo_sender_name_and_long_unicode_caption_preserve_all_owner_text(owner):
+    async def scenario():
+        text = '🥐' * 800
+        reference = {'kind':'photo','file_id':'local-test-photo','filename':'coffee.jpg'}
+        owner.publish_bot_broadcast.return_value.update(text=text,shop_name='Інша кав’ярня')
+        state,callback = _state(),_callback()
+        await _seed_state(state,_saved_preview(broadcast_text=text,broadcast_media_reference=reference))
+        await owner.broadcast_confirm_callback(callback,state)
+        photo = callback.bot.copy_message.await_args.kwargs
+        assert photo['parse_mode'] is None
+        assert len(photo['caption'].encode('utf-16-le')) // 2 <= 1024
+        sent = photo['caption'] + ''.join(call.kwargs['text'] for call in callback.bot.send_message.await_args_list)
+        assert sent == '☕️ Інша кав’ярня\n\n' + text
+        assert owner.publish_bot_broadcast.call_args.args[2] == text
     asyncio.run(scenario())
 
 
@@ -529,9 +557,8 @@ def test_finishing_an_old_delivery_keeps_a_newly_created_preview(owner):
         assert await state.get_data() == newer
         assert await state.get_state() == WAITING_STATE.state
         owner.publish_bot_broadcast.assert_called_once()
-        callback.bot.copy_message.assert_awaited_once_with(
-            chat_id=201, from_chat_id=888, message_id=55,
-        )
+        callback.bot.send_message.assert_awaited_once_with(
+            chat_id=201,text='☕️ Offline shop\n\nOriginal caption',parse_mode=None)
 
     asyncio.run(scenario())
 

@@ -1350,6 +1350,16 @@ def merge_users(source_user_id: int, target_user_id: int):
             # rolled out separately, so pre-migration merges must still work.
             cur.execute("SELECT to_regclass('broadcast_recipients') AS recipients_table")
             if cur.fetchone()["recipients_table"] is not None:
+                cur.execute("SELECT to_regclass('broadcast_recipient_deliveries') AS deliveries_table")
+                if cur.fetchone()["deliveries_table"] is not None:
+                    from app.broadcast_jobs import merge_job_recipient_receipts
+                    merge_job_recipient_receipts(cur, source_user_id, target_user_id)
+                    cur.execute("UPDATE broadcast_delivery_jobs SET requested_by_user_id=%s WHERE requested_by_user_id=%s",
+                                (target_user_id, source_user_id))
+                cur.execute("SELECT to_regclass('shop_novelty_deliveries') AS novelty_table")
+                if cur.fetchone()["novelty_table"] is not None:
+                    from app.shop_novelty_notifications import merge_novelty_receipts
+                    merge_novelty_receipts(cur, source_user_id, target_user_id)
                 cur.execute("""
                     SELECT EXISTS (
                         SELECT 1
@@ -2718,8 +2728,9 @@ def can_send_broadcast(shop_id: int, *, connection=None):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT cs.is_active AND (
-                    SELECT COUNT(*) FROM broadcasts
+                    SELECT COUNT(*) FROM broadcasts b
                     WHERE shop_id=cs.id AND created_at >= NOW() - INTERVAL '7 days'
+                      AND COALESCE(to_jsonb(b)->>'origin','manual')='manual'
                 ) < 8 AS allowed
                 FROM coffee_shops cs WHERE cs.id=%s
             """, (shop_id,))
@@ -2760,8 +2771,9 @@ def can_send_network_broadcast(network_id: int, *, connection=None):
         with conn.cursor() as cur:
             row = cur.execute("""SELECT EXISTS(SELECT 1 FROM coffee_shops
                     WHERE network_id=%s AND is_active IS TRUE) AND
-                (SELECT COUNT(*) FROM broadcasts WHERE network_id=%s
-                    AND created_at>=NOW()-INTERVAL '7 days')<8 AS allowed""",
+                (SELECT COUNT(*) FROM broadcasts b WHERE network_id=%s
+                    AND created_at>=NOW()-INTERVAL '7 days'
+                    AND COALESCE(to_jsonb(b)->>'origin','manual')='manual')<8 AS allowed""",
                 (network_id, network_id)).fetchone()
             return bool(row and row["allowed"])
 

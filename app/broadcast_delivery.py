@@ -13,7 +13,7 @@ _PERMANENT_PUSH_ERRORS = {
 }
 
 
-async def send_broadcast_app_push(broadcast, recipient) -> bool | None:
+async def send_broadcast_app_push(broadcast, recipient, *, audit=None) -> bool | None:
     """True: sent; None: Telegram fallback; False: defer without duplication.
 
     The existing sender deletes permanently invalid tokens. Publication and
@@ -34,6 +34,8 @@ async def send_broadcast_app_push(broadcast, recipient) -> bool | None:
             if token and token not in seen:
                 seen.add(token)
                 unique_devices.append(dict(device, device_token=token))
+        if audit is not None:
+            audit.update(attempted=0,sent=0,failed=0)
         if not unique_devices:
             return None
 
@@ -45,6 +47,8 @@ async def send_broadcast_app_push(broadcast, recipient) -> bool | None:
         )
         sent = result.get("sent", 0)
         failed = result.get("failed", 0)
+        if audit is not None:
+            audit.update(attempted=len(unique_devices),sent=int(sent),failed=int(failed))
         errors = result.get("errors", [])
         invalid = sum((error.get("status"), error.get("reason")) in _PERMANENT_PUSH_ERRORS
                       for error in errors)
@@ -60,6 +64,8 @@ async def send_broadcast_app_push(broadcast, recipient) -> bool | None:
                     broadcast["broadcast_id"], user_id, len(unique_devices), sent, failed, invalid, outcome)
         return delivered
     except Exception as exc:
+        if audit is not None:
+            audit['error_class'] = type(exc).__name__
         logger.warning("[broadcast][APP PUSH] broadcast_id=%s user_id=%s error=%s",
                        broadcast.get("broadcast_id"), user_id, type(exc).__name__)
         return False

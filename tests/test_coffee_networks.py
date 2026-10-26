@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import psycopg
 import pytest
@@ -16,8 +17,11 @@ pytest_plugins = ("test_owner_onboarding",)
 
 
 @pytest.fixture
-def network_api(onboarding_api, database, monkeypatch):
-    client, _ = onboarding_api
+def network_api(database, monkeypatch, request):
+    owner_module = importlib.import_module("app.api.barista_owner")
+    monkeypatch.setattr(owner_module, "broadcast_job_loop", AsyncMock())
+    # Construct TestClient only after disabling the real background worker.
+    client, _ = request.getfixturevalue("onboarding_api")
     monkeypatch.setenv("BARISTA_INVITE_PEPPER", "local-network-invite-pepper-for-tests-only-32-bytes")
     database.query("""
         CREATE TABLE shop_clients (
@@ -63,6 +67,7 @@ def network_api(onboarding_api, database, monkeypatch):
     database.query((PROJECT / "migrations/20261017_owner_onboarding.sql").read_text())
     database.query((PROJECT / "migrations/20261017_admin_web_login.sql").read_text())
     database.query((PROJECT / "migrations/20261013_broadcast_recipients.sql").read_text())
+    database.query((PROJECT / "migrations/20261026_broadcast_delivery_jobs.sql").read_text())
     migration = (PROJECT / "migrations/20261018_coffee_networks.sql").read_text()
     database.query(migration)
     network_router = importlib.import_module("app.api.networks")

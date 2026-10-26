@@ -14,13 +14,15 @@ from starlette.concurrency import run_in_threadpool
 
 from app.admin_tools import (claim_broadcast, cleanup_broadcast_previews, list_members, make_broadcast_preview,
                              claim_network_broadcast, make_network_broadcast_preview,
-                             preview_limits,
+                             preview_limits, _lock_active_shop,
                              read_statistics, remove_member, require_owner,
                              selected_shop, shop_response)
 from app.db import get_connection, log_broadcast_touches
 from app.broadcast_media import JSON_LIMIT, bounded_body, multipart_media, validate_text_length
 from app.broadcast_publication import BroadcastPublication
 from app.broadcast_delivery import send_broadcast_app_push
+from app.broadcast_jobs import (broadcast_job_loop, delivery_status, enqueue_broadcast,
+                                existing_confirmation, owner_history, telegram_plan)
 
 logger = logging.getLogger(__name__)
 
@@ -90,20 +92,21 @@ async def deliver_owner_broadcast(broadcast):
                     from app.config import BOT_TOKEN
                     bot = Bot(BOT_TOKEN)
                 media = broadcast.get("media")
-                if media is None:
-                    await bot.send_message(chat_id=row["telegram_user_id"], text=broadcast["text"])
-                else:
+                for stage in telegram_plan(broadcast['shop_name'], broadcast['text'], media['kind'] if media else None):
+                    if stage['kind'] == 'text':
+                        await bot.send_message(chat_id=row['telegram_user_id'], text=stage['text'],parse_mode=None)
+                        continue
                     # Reuse only a file ID returned by our own successful Bot
                     # upload. App-supplied IDs/URLs are never accepted.
                     file = telegram_media_id or BufferedInputFile(media["bytes"], filename=media["filename"])
                     if media["kind"] == "photo":
                         message = await bot.send_photo(chat_id=row["telegram_user_id"], photo=file,
-                                                       caption=broadcast["text"] or None)
+                                                       caption=stage['text'],parse_mode=None)
                         sizes = getattr(message, "photo", None)
                         candidate = getattr(sizes[-1], "file_id", None) if isinstance(sizes, list) and sizes else None
                     else:
                         message = await bot.send_video(chat_id=row["telegram_user_id"], video=file,
-                                                       caption=broadcast["text"] or None)
+                                                       caption=stage['text'],parse_mode=None)
                         candidate = getattr(getattr(message, "video", None), "file_id", None)
                     if isinstance(candidate, str) and candidate:
                         telegram_media_id = candidate
@@ -120,6 +123,7 @@ async def deliver_owner_broadcast(broadcast):
 def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
     router = APIRouter(tags=["barista-owner"])
     cleanup_task = None
+    delivery_task = None
 
     def cleanup_media():
         try:
@@ -140,11 +144,16 @@ def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
 
     @router.on_event("startup")
     async def start_media_cleanup():
-        nonlocal cleanup_task
+        nonlocal cleanup_task, delivery_task
         cleanup_task = asyncio.create_task(cleanup_loop())
+        delivery_task = asyncio.create_task(broadcast_job_loop())
 
     @router.on_event("shutdown")
     async def stop_media_cleanup():
+        if delivery_task is not None:
+            delivery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await delivery_task
         if cleanup_task is not None:
             cleanup_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -240,32 +249,64 @@ def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
                 with connection.transaction():
                     session = authorize(token, connection=connection)
                     shop = require_owner(session)
+                    # Serialize the lookup with preview claiming. A concurrent
+                    # retry must observe the first committed job, not used_at.
+                    _lock_active_shop(shop['shop_id'], connection)
+                    # Current owner/tenant checked before looking up an old
+                    # action. The result survives preview cleanup/session refresh.
+                    existing = existing_confirmation(connection, confirmation_token, session["user_id"],
+                                                     shop_id=shop["shop_id"])
+                    if existing is not None:
+                        return delivery_status(connection, existing)
                     broadcast = claim_broadcast(session, shop, confirmation_token, connection, publication)
-            return shop, broadcast
+                    enqueue_broadcast(connection, broadcast, confirmation_token, session["user_id"])
+                    return delivery_status(connection, broadcast["broadcast_id"])
 
-    def save_delivery(shop_id, broadcast_id, touched):
-        with get_connection() as connection:
-            with connection.transaction():
-                connection.execute("UPDATE broadcasts SET recipients_count=%s WHERE id=%s AND shop_id=%s",
-                                   (len(touched), broadcast_id, shop_id))
-                log_broadcast_touches(shop_id, touched, connection=connection)
-
-    @router.post("/owner/broadcast")
+    @router.post("/owner/broadcast", status_code=202)
     async def send(body: BroadcastSendRequest, authorization: str | None = Header(default=None)):
-        token = parse_bearer(authorization)
         try:
-            shop, broadcast = await run_in_threadpool(prepare_send, token, body.confirmation_token)
+            return await run_in_threadpool(prepare_send, parse_bearer(authorization), body.confirmation_token)
         except (UndefinedTable, UndefinedColumn) as exc:
             raise HTTPException(503, detail={"code": "BROADCAST_NOT_CONFIGURED"}) from exc
-        touched, failed = await deliver_owner_broadcast(broadcast)
-        try:
-            await run_in_threadpool(save_delivery, shop["shop_id"], broadcast["broadcast_id"], touched)
-        except Exception as exc:
-            # The messages have already been attempted. An audit failure must
-            # not look like permission to resend the same confirmed broadcast.
-            logger.warning("Owner broadcast audit update failed (%s)", type(exc).__name__)
-        return {"ok": True, "shop": shop_response(shop), "sent": len(touched), "failed": failed,
-                "status": "completed" if failed == 0 else "partial"}
+
+    def owner_job_context(connection, token, broadcast_id=None):
+        session = authorize(token, connection=connection, touch=False)
+        shop = require_owner(session)
+        if broadcast_id is not None and connection.execute(
+                """SELECT 1 FROM broadcasts b WHERE b.id=%s AND b.shop_id=%s
+                AND COALESCE(to_jsonb(b)->>'scope','SHOP')='SHOP'
+                AND COALESCE(to_jsonb(b)->>'origin','manual')='manual'""",
+                (broadcast_id, shop["shop_id"])).fetchone() is None:
+            raise HTTPException(404, detail={"code":"BROADCAST_NOT_FOUND"})
+        return session, shop
+
+    @router.get("/owner/broadcasts")
+    def history(limit: int = Query(default=20,ge=1,le=100), offset: int = Query(default=0,ge=0,le=1000000),
+                authorization: str | None = Header(default=None)):
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                _, shop = owner_job_context(connection, parse_bearer(authorization))
+                return owner_history(connection, shop_id=shop["shop_id"], limit=limit, offset=offset)
+
+    @router.get("/owner/broadcasts/{broadcast_id}")
+    def status(broadcast_id: int, authorization: str | None = Header(default=None)):
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                owner_job_context(connection, parse_bearer(authorization), broadcast_id)
+                return delivery_status(connection, broadcast_id)
+
+    @router.post("/owner/broadcast/status")
+    def reconcile(body: BroadcastSendRequest, authorization: str | None = Header(default=None)):
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                session,shop = owner_job_context(connection, parse_bearer(authorization))
+                found = existing_confirmation(connection,body.confirmation_token,session["user_id"],shop_id=shop["shop_id"])
+                if found is None:
+                    raise HTTPException(404, detail={"code":"BROADCAST_NOT_FOUND"})
+                return delivery_status(connection,found)
 
     def authorize_network(token, network_id, *, connection=None, touch=False):
         session = authorize(token, connection=connection, touch=touch)
@@ -323,26 +364,58 @@ def build_owner_router(*, authorize: Callable, parse_bearer: Callable):
             with get_connection() as connection:
                 with connection.transaction():
                     session, network = authorize_network(token, network_id, connection=connection, touch=True)
+                    connection.execute('SELECT id FROM coffee_networks WHERE id=%s FOR NO KEY UPDATE',
+                                       (network_id,)).fetchone()
+                    existing = existing_confirmation(connection, confirmation_token, session["user_id"],network_id=network_id)
+                    if existing is not None:
+                        return delivery_status(connection, existing)
                     broadcast = claim_network_broadcast(session, network_id, confirmation_token,
                                                         connection, publication)
-            return network, broadcast
+                    enqueue_broadcast(connection,broadcast,confirmation_token,session["user_id"])
+                    return delivery_status(connection,broadcast["broadcast_id"])
 
-    @router.post("/owner/networks/{network_id}/broadcast")
+    @router.post("/owner/networks/{network_id}/broadcast",status_code=202)
     async def send_network(body: BroadcastSendRequest, network_id: int,
                            authorization: str | None = Header(default=None)):
-        token = parse_bearer(authorization)
         try:
-            network, broadcast = await run_in_threadpool(
-                prepare_network_send, token, network_id, body.confirmation_token)
+            return await run_in_threadpool(prepare_network_send, parse_bearer(authorization),network_id,body.confirmation_token)
         except (UndefinedTable, UndefinedColumn) as exc:
-            raise HTTPException(503, detail={"code": "BROADCAST_NOT_CONFIGURED"}) from exc
-        touched, failed = await deliver_owner_broadcast(broadcast)
-        try:
-            await run_in_threadpool(save_delivery, broadcast["shop_id"], broadcast["broadcast_id"], touched)
-        except Exception as exc:
-            logger.warning("Network broadcast audit update failed (%s)", type(exc).__name__)
-        return {"ok": True, "network": {"id": network["network_id"], "name": network["name"]},
-                "scope": "NETWORK", "sent": len(touched), "failed": failed,
-                "status": "completed" if failed == 0 else "partial"}
+            raise HTTPException(503, detail={"code":"BROADCAST_NOT_CONFIGURED"}) from exc
+
+    def network_job_context(connection, token, network_id, broadcast_id=None):
+        session,network = authorize_network(token,network_id,connection=connection,touch=False)
+        if broadcast_id is not None and connection.execute(
+                """SELECT 1 FROM broadcasts b WHERE b.id=%s AND b.network_id=%s AND b.scope='NETWORK'
+                AND COALESCE(to_jsonb(b)->>'origin','manual')='manual'""",(broadcast_id,network_id)).fetchone() is None:
+            raise HTTPException(404,detail={"code":"BROADCAST_NOT_FOUND"})
+        return session,network
+
+    @router.get("/owner/networks/{network_id}/broadcasts")
+    def network_history(network_id: int,limit: int=Query(default=20,ge=1,le=100),
+                        offset: int=Query(default=0,ge=0,le=1000000),authorization: str|None=Header(default=None)):
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                network_job_context(connection,parse_bearer(authorization),network_id)
+                return owner_history(connection,network_id=network_id,limit=limit,offset=offset)
+
+    @router.get("/owner/networks/{network_id}/broadcasts/{broadcast_id}")
+    def network_status(network_id: int,broadcast_id: int,authorization: str|None=Header(default=None)):
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                network_job_context(connection,parse_bearer(authorization),network_id,broadcast_id)
+                return delivery_status(connection,broadcast_id)
+
+    @router.post("/owner/networks/{network_id}/broadcast/status")
+    def network_reconcile(body:BroadcastSendRequest,network_id:int,authorization:str|None=Header(default=None)):
+        with get_connection() as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                session,_ = network_job_context(connection,parse_bearer(authorization),network_id)
+                found = existing_confirmation(connection,body.confirmation_token,session["user_id"],network_id=network_id)
+                if found is None:
+                    raise HTTPException(404,detail={"code":"BROADCAST_NOT_FOUND"})
+                return delivery_status(connection,found)
 
     return router
