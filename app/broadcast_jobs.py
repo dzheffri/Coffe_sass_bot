@@ -89,10 +89,35 @@ def confirmation_response(result):
     """Old App Store builds accept only completed/partial send receipts.
 
     This is a transport compatibility status, not a claim that sending finished.
-    New clients use delivery_status; read-only status/history keep actual status.
+    Pending legacy sent/failed describe acceptance, not external delivery.
+    New clients use delivery_status; read-only status/history keep actual counts.
     """
     actual = result['status']
-    return dict(result,delivery_status=actual,status='partial' if actual in ('queued','sending') else actual)
+    pending = actual in ('queued','sending')
+    response = dict(result,delivery_status=actual,status='partial' if pending else actual,
+                    accepted_recipients=result['target_users'],
+                    sent_semantics='accepted_recipients' if pending else 'delivered_users')
+    if pending:
+        response.update(sent=result['target_users'],failed=0)
+    return response
+
+
+def _delivery_accounting(result):
+    """Primary user outcomes; APNs is separate from a committed inbox delivery."""
+    fields = ('app_delivered','telegram_delivered','delivery_failed','no_route',
+              'delivery_pending','delivery_unknown','delivery_accounting_valid')
+    if any(result.get(key) is None for key in ('app_inbox_created','telegram_sent','no_delivery_channel')):
+        return dict.fromkeys(fields)
+    app,telegram,no_route = (result[key] for key in ('app_inbox_created','telegram_sent','no_delivery_channel'))
+    remaining = result['target_users']-app-telegram-no_route
+    counts = dict(app_delivered=app,telegram_delivered=telegram,no_route=no_route,
+                  delivery_unknown=result['telegram_unknown'])
+    if remaining < 0:
+        return dict(counts,delivery_failed=None,delivery_pending=None,delivery_accounting_valid=False)
+    pending = result['status'] in ('queued','sending')
+    failed = min(remaining,result['telegram_failed']+result['telegram_unknown']) if pending else remaining
+    return dict(counts,delivery_failed=failed,delivery_pending=remaining-failed,
+                delivery_accounting_valid=True)
 
 
 def delivery_status(connection, broadcast_id):
@@ -119,6 +144,7 @@ def delivery_status(connection, broadcast_id):
         result['sent'] = row['recipients_count']
         result.update({key:None for key in ('app_routed_users','app_inbox_created','telegram_routed_users',
             'no_delivery_channel','no_delivery_users','apns_users','apns_devices_sent','telegram_sent','telegram_error_classes')})
+        result.update(_delivery_accounting(result))
         return result
     counts = connection.execute('''SELECT COALESCE(SUM(apns_attempted),0) AS apns_attempted,
         COALESCE(SUM(apns_success),0) AS apns_success,COALESCE(SUM(apns_failed),0) AS apns_failed,
@@ -143,6 +169,7 @@ def delivery_status(connection, broadcast_id):
         # A crash may lose the APNs acknowledgement. Never invent exact totals.
         for key in ('apns_attempted','apns_success','apns_failed'):
             result[key] = None
+    result.update(_delivery_accounting(result))
     return result
 
 

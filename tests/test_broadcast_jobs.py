@@ -11,7 +11,8 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.methods import SendMessage
 
 from app.broadcast_jobs import (delivery_status, enqueue_broadcast, merge_job_recipient_receipts,
-                                owner_history, process_broadcast_jobs_once, telegram_plan,confirmation_response)
+                                owner_history, process_broadcast_jobs_once, telegram_plan,confirmation_response,
+                                _delivery_accounting)
 from app.broadcast_publication import BroadcastPublication
 from conftest import bearer
 from test_barista_operations import operations_database
@@ -73,6 +74,8 @@ def test_confirmation_queues_immediately_and_reconciles_same_action(jobs_databas
     result = response.json()
     assert result['status'] == 'partial' and result['delivery_status'] == 'queued' and result['broadcast_id'] > 0
     assert result['target_users'] == result['app_notifications_created'] == 2
+    assert result['sent'] == 2 and result['failed'] == 0
+    assert result['sent_semantics'] == 'accepted_recipients'
     assert result['apns_attempted'] == result['telegram_attempted'] == 0
     assert db.query('SELECT * FROM touch_logs') == []
     # Old preview data can expire/be cleaned and the actor can refresh session.
@@ -82,8 +85,11 @@ def test_confirmation_queues_immediately_and_reconciles_same_action(jobs_databas
     assert repeated.status_code == 202 and repeated.json() == result
     reconciled = client.post('/barista/owner/broadcast/status', headers=bearer(refreshed),
                              json={'confirmation_token':body['confirmation_token']})
-    actual = dict(result,status='queued')
-    assert reconciled.status_code == 200 and reconciled.json() == actual
+    assert reconciled.status_code == 200
+    actual = reconciled.json()
+    assert actual['status'] == actual['delivery_status'] == 'queued'
+    assert actual['sent'] == actual['app_inbox_created']+actual['telegram_sent']
+    assert 'sent_semantics' not in actual and 'accepted_recipients' not in actual
     assert len(db.query('SELECT id FROM broadcasts')) == 1
     assert len(db.query('SELECT * FROM broadcast_delivery_jobs')) == 1
     assert client.get('/barista/owner/broadcasts',headers=bearer(refreshed)).json()['items'] == [actual]
@@ -157,6 +163,8 @@ def test_temporary_app_error_never_falls_back_to_telegram(jobs_database):
     result = status(db,bid)
     assert result['status'] == 'partial' and result['apns_failed'] == 1
     assert result['telegram_attempted'] == 0 and result['failed'] == 1
+    assert result['app_delivered'] == 1 and result['delivery_failed'] == 0
+    assert result['delivery_pending'] == 0 and result['no_route'] == 0
     bot.send_message.assert_not_awaited()
 
 
@@ -342,6 +350,8 @@ def test_old_app_store_send_receipt_accepts_pending_and_new_status_stays_truthfu
     assert type(body['sent']) is int and type(body['failed']) is int
     assert body['status'] in ('completed','partial')
     assert body['delivery_status'] == 'queued' and body['broadcast_id'] > 0
+    assert body['sent'] == body['accepted_recipients'] == body['target_users'] == 2
+    assert body['failed'] == 0 and body['sent_semantics'] == 'accepted_recipients'
     assert send(client,token,action).json()['broadcast_id'] == body['broadcast_id']
     actual = client.get(f"/barista/owner/broadcasts/{body['broadcast_id']}",headers=bearer(token)).json()
     assert actual['status'] == actual['delivery_status'] == 'queued'
@@ -387,6 +397,8 @@ def test_route_snapshot_exact_counts_and_acknowledgements_survive_account_cleanu
     assert before['telegram_sent'] == before['telegram_routed_users'] == 1 and before['telegram_failed'] == 0
     assert before['app_notifications_created'] == 3 and before['sent'] == 2
     assert before['status'] == 'partial' and before['completed_at'] is not None
+    assert (before['app_delivered'],before['telegram_delivered'],before['delivery_failed'],before['no_route']) == (1,1,0,1)
+    assert before['delivery_accounting_valid'] and before['delivery_pending'] == 0
     with db.db.get_connection() as connection:
         with connection.transaction():
             merge_job_recipient_receipts(connection.cursor(),2,6)
@@ -414,3 +426,26 @@ def test_telegram_error_summary_and_new_app_identity_before_delivery_are_safe(jo
     drain(db,push,bot)
     assert bot.send_message.await_count == push.await_count == 1
     assert push.await_args.args[1]['user_id']==6 and status(db,bid)['status']=='partial'
+
+
+def test_accepted_initial_receipt_and_final_primary_accounting_are_separate():
+    # Production #42 shape, with no production I/O or delivery.
+    initial = dict(ok=True,status='queued',target_users=172,sent=19,failed=0,
+        app_inbox_created=19,telegram_sent=0,no_delivery_channel=0,telegram_failed=0,
+        telegram_unknown=0,apns_failed=0)
+    response = confirmation_response(initial)
+    assert (response['sent'],response['failed']) == (172,0)
+    assert response['sent_semantics'] == 'accepted_recipients' and response['delivery_status']=='queued'
+    assert initial['sent']==19  # Adapter does not overwrite actual channel counts.
+    queued = _delivery_accounting(initial)
+    assert queued['delivery_failed']==0 and queued['delivery_pending']==153
+    final = dict(initial,status='partial',sent=143,failed=29,telegram_sent=124,telegram_failed=29)
+    actual = _delivery_accounting(final)
+    assert (actual['app_delivered'],actual['telegram_delivered'],actual['delivery_failed'],actual['no_route']) == (19,124,29,0)
+    assert sum(actual[key] for key in ('app_delivered','telegram_delivered','delivery_failed','no_route'))==172
+    assert actual['delivery_pending']==actual['delivery_unknown']==0 and actual['delivery_accounting_valid']
+    assert confirmation_response(final)['sent']==143 and confirmation_response(final)['failed']==29
+    unknown = _delivery_accounting(dict(final,telegram_failed=28,telegram_unknown=1))
+    assert unknown['delivery_failed']==29 and unknown['delivery_unknown']==1
+    invalid = _delivery_accounting(dict(final,target_users=100))
+    assert invalid['delivery_accounting_valid'] is False and invalid['delivery_failed'] is None

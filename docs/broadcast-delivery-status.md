@@ -37,6 +37,11 @@ For old App Store clients, the confirmation POST keeps HTTP 202 but maps an
 unfinished `status` to `partial`, which their existing success guard accepts.
 The additive `delivery_status` always contains the actual state. Read-only
 status, token reconciliation and history continue returning actual `status`.
+In an unfinished confirmation only, legacy `sent` is `target_users` and
+`failed` is zero: those recipients were accepted atomically, not yet all
+delivered externally. `accepted_recipients` and
+`sent_semantics=accepted_recipients` make this explicit to newer clients.
+A completed confirmation uses actual counts and `sent_semantics=delivered_users`.
 
 Apply additive `20261027_broadcast_routing_accounting.sql` for this contract.
 It does not classify historical recipients, queue work or replay a broadcast.
@@ -44,7 +49,7 @@ New job accounting persists independently of later account deletion/merging:
 `target_users = app_routed_users + telegram_routed_users + no_delivery_channel`.
 `app_inbox_created` counts APP recipients; the older
 `app_notifications_created` remains the number of all physical recipient rows
-created at publication. `sent` is APP inbox deliveries plus successful Telegram
+created at publication. In status/history, `sent` is APP inbox deliveries plus successful Telegram
 deliveries, never APNs devices added a second time. `apns_users` counts users
 with a known APNs attempt; `apns_devices_sent` and `apns_failed` count device
 acknowledgements. Telegram success/failure counts users, with error-class
@@ -52,6 +57,21 @@ summaries and unknown outcomes recorded separately. Unrecoverable historical
 route metrics remain null, not fabricated zeroes.
 Legacy channel counters are null: their old mixed `recipients_count` cannot prove
 how many APNs/Telegram sends occurred. Delivery success never means read.
+
+Primary final accounting is separate from APNs transport outcomes:
+`target_users = app_delivered + telegram_delivered + delivery_failed + no_route`.
+`app_delivered` counts committed APP inbox recipients even without a push token;
+`telegram_delivered` counts acknowledged Telegram recipient deliveries.
+`no_route` aliases the older `no_delivery_channel`: no APP/Telegram route was
+available, rather than a later delivery error. `delivery_failed` counts selected
+routes with no confirmed primary delivery; uncertain Telegram outcomes are also
+reported separately as its `delivery_unknown` subset. While a job is unfinished,
+`delivery_pending` accounts for recipients still awaiting their outcome.
+APNs failures never turn an existing inbox delivery into primary delivery failure.
+These metrics derive from durable original-target accounting, surviving account
+cleanup and without replay/backfill. Legacy unknown metrics remain null; an
+inconsistent negative remainder sets `delivery_accounting_valid=false` instead
+of inventing a successful partition.
 
 ## Approved new products
 
