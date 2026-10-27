@@ -65,6 +65,15 @@ def status(db, broadcast_id):
         return delivery_status(connection, broadcast_id)
 
 
+def add_push_device(db,user_id,*,enabled=True):
+    db.query('''CREATE TABLE IF NOT EXISTS app_push_devices(id BIGSERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(id),device_token TEXT NOT NULL,
+        platform TEXT NOT NULL DEFAULT 'ios',environment TEXT NOT NULL DEFAULT 'production',
+        notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE)''')
+    db.query('INSERT INTO app_push_devices(user_id,device_token,notifications_enabled) VALUES(%s,%s,%s)',
+             (user_id,f'{user_id:064x}',enabled))
+
+
 def test_confirmation_queues_immediately_and_reconciles_same_action(jobs_database, jobs_api):
     db, client = jobs_database, jobs_api
     token = db.staff_token()
@@ -88,7 +97,7 @@ def test_confirmation_queues_immediately_and_reconciles_same_action(jobs_databas
     assert reconciled.status_code == 200
     actual = reconciled.json()
     assert actual['status'] == actual['delivery_status'] == 'queued'
-    assert actual['sent'] == actual['app_inbox_created']+actual['telegram_sent']
+    assert actual['sent'] == actual['app_delivered']+actual['telegram_delivered']
     assert 'sent_semantics' not in actual and 'accepted_recipients' not in actual
     assert len(db.query('SELECT id FROM broadcasts')) == 1
     assert len(db.query('SELECT * FROM broadcast_delivery_jobs')) == 1
@@ -126,6 +135,8 @@ def test_app_priority_full_snapshot_counts_and_no_repeat(jobs_database):
     db = jobs_database
     db.db.create_app_session(2)
     db.db.create_app_session(4)
+    add_push_device(db,2)
+    add_push_device(db,4)
     bid = queue(db)
     bot = fake_bot()
     async def push(broadcast, recipient, *, audit):
@@ -154,6 +165,7 @@ def test_app_priority_full_snapshot_counts_and_no_repeat(jobs_database):
 def test_temporary_app_error_never_falls_back_to_telegram(jobs_database):
     db = jobs_database
     db.db.create_app_session(4)
+    add_push_device(db,4)
     bid = queue(db,users=(4,))
     async def push(*args, audit):
         audit.update(attempted=1,sent=0,failed=1)
@@ -163,7 +175,7 @@ def test_temporary_app_error_never_falls_back_to_telegram(jobs_database):
     result = status(db,bid)
     assert result['status'] == 'partial' and result['apns_failed'] == 1
     assert result['telegram_attempted'] == 0 and result['failed'] == 1
-    assert result['app_delivered'] == 1 and result['delivery_failed'] == 0
+    assert result['app_inbox_created'] == 1 and result['app_delivered'] == 0 and result['delivery_failed'] == 1
     assert result['delivery_pending'] == 0 and result['no_route'] == 0
     bot.send_message.assert_not_awaited()
 
@@ -173,6 +185,7 @@ def test_interrupted_external_attempt_is_unknown_and_never_replayed(jobs_databas
     db = jobs_database
     if interrupted == 'app':
         db.db.create_app_session(4)
+        add_push_device(db,4)
     bid = queue(db,users=(4,6))
     if interrupted == 'app':
         db.query("UPDATE broadcast_recipient_deliveries SET app_status='sending' WHERE user_id=4")
@@ -271,6 +284,7 @@ def test_legacy_history_unknown_channel_counts_and_never_replayed(jobs_database)
 
 def test_merge_receipt_preserves_delivery_and_blocks_duplicate_pending_fallback(jobs_database):
     db = jobs_database
+    add_push_device(db,2)
     bid = queue(db,users=(2,4))
     db.query("UPDATE broadcast_recipient_deliveries SET app_status='sent',apns_attempted=1,apns_success=1,telegram_status='skipped' WHERE user_id=2")
     with db.db.get_connection() as connection:
@@ -292,6 +306,7 @@ def test_initial_target_counts_survive_recipient_account_cleanup(jobs_database):
 def test_merge_during_inflight_attempt_records_unknown_without_new_send(jobs_database):
     db = jobs_database
     db.db.create_app_session(2)
+    add_push_device(db,2)
     bid = queue(db,users=(2,))
     db.query("UPDATE broadcast_recipient_deliveries SET app_status='sending'")
     with db.db.get_connection() as connection:
@@ -309,6 +324,7 @@ def test_merge_during_inflight_attempt_records_unknown_without_new_send(jobs_dat
 def test_successful_app_device_plus_failed_device_keeps_priority_and_partial_status(jobs_database):
     db = jobs_database
     db.db.create_app_session(4)
+    add_push_device(db,4)
     bid = queue(db,users=(4,))
     bot = fake_bot()
     async def push(*args,audit):
@@ -359,31 +375,64 @@ def test_old_app_store_send_receipt_accepts_pending_and_new_status_stays_truthfu
     assert network['status'] == 'partial' and network['delivery_status'] == 'queued'
 
 
-def test_app_evidence_without_enabled_token_never_falls_back_to_telegram(jobs_database):
+@pytest.mark.parametrize('push_state',['missing','disabled','permanently_invalid'])
+def test_app_identity_without_usable_push_falls_back_without_duplicate_or_lost_inbox(jobs_database,push_state):
     db = jobs_database
+    db.query('UPDATE users SET telegram_user_id=1002 WHERE id=2')
     db.query("INSERT INTO user_identities(user_id,provider,provider_user_id) VALUES(2,'google','local-app-account') ON CONFLICT(user_id,provider) DO NOTHING")
-    db.query('''CREATE TABLE app_push_devices(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES users(id),
-        notifications_enabled BOOLEAN); INSERT INTO app_push_devices(user_id,notifications_enabled) VALUES(4,FALSE)''')
-    db.db.create_app_session(6)
-    db.query("UPDATE app_sessions SET revoked_at=NOW() WHERE user_id=6 AND purpose='client'")
-    bid = queue(db)
+    db.db.create_app_session(2)
+    if push_state!='missing':
+        add_push_device(db,2,enabled=push_state!='disabled')
+    add_push_device(db,4)
+    bid = queue(db,users=(2,4))
     async def push(broadcast,recipient,*,audit):
-        audit.update(attempted=1 if recipient['user_id']==6 else 0,sent=0,failed=1 if recipient['user_id']==6 else 0)
-        return None  # No token/disabled or all invalid: none is no longer a TG route.
+        if recipient['user_id']==2:
+            assert push_state=='permanently_invalid'
+            # Even if invalid-token cleanup fails, its acknowledged permanent
+            # rejection must not promote this same action back to APP forever.
+            audit.update(attempted=1,sent=0,failed=1)
+            return None
+        assert recipient['user_id']==4
+        audit.update(attempted=1,sent=1,failed=0)
+        return True
     bot = fake_bot()
-    drain(db,push,bot)
+    sender=AsyncMock(side_effect=push)
+    drain(db,sender,bot)
     result = status(db,bid)
-    assert result['app_routed_users'] == result['app_inbox_created'] == result['sent'] == 3
-    assert result['telegram_routed_users'] == result['telegram_sent'] == result['telegram_attempted'] == 0
-    assert result['apns_users'] == result['apns_failed'] == 1
-    assert result['apns_devices_sent'] == 0 and result['status'] == 'partial'
-    assert {row['delivery_route'] for row in db.query('SELECT delivery_route FROM broadcast_recipient_deliveries')} == {'APP'}
+    assert result['app_inbox_created']==2 and result['app_routed_users']==result['app_delivered']==1
+    assert result['telegram_routed_users']==result['telegram_sent']==result['telegram_attempted']==1
+    assert result['sent']==result['target_users']==2 and result['delivery_failed']==result['no_route']==0
+    assert result['app_delivered']+result['telegram_delivered']+result['delivery_failed']+result['no_route']==2
+    assert db.query('SELECT user_id FROM broadcast_recipients WHERE broadcast_id=%s ORDER BY user_id',(bid,))==[{'user_id':2},{'user_id':4}]
+    routes=db.query('SELECT user_id,delivery_route,telegram_status FROM broadcast_recipient_deliveries ORDER BY user_id')
+    assert routes==[{'user_id':2,'delivery_route':'TELEGRAM','telegram_status':'sent'},
+                    {'user_id':4,'delivery_route':'APP','telegram_status':'skipped'}]
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.kwargs['chat_id']==1002
+    drain(db,sender,bot)
+    bot.send_message.assert_awaited_once()
+
+
+def test_app_identity_without_push_or_telegram_keeps_inbox_and_counts_no_route(jobs_database):
+    db=jobs_database
+    db.db.create_app_session(2)
+    db.query('UPDATE users SET telegram_user_id=NULL WHERE id=2')
+    bid=queue(db,users=(2,))
+    push,bot=AsyncMock(),fake_bot()
+    drain(db,push,bot)
+    result=status(db,bid)
+    assert result['app_inbox_created']==1 and result['no_route']==1
+    assert result['app_delivered']==result['telegram_delivered']==result['delivery_failed']==0
+    assert result['target_users']==1 and result['delivery_accounting_valid']
+    assert db.query('SELECT user_id FROM broadcast_recipients WHERE broadcast_id=%s',(bid,))==[{'user_id':2}]
+    push.assert_not_awaited()
     bot.send_message.assert_not_awaited()
 
 
 def test_route_snapshot_exact_counts_and_acknowledgements_survive_account_cleanup(jobs_database):
     db = jobs_database
     db.db.create_app_session(2)
+    add_push_device(db,2)
     db.query('UPDATE users SET telegram_user_id=NULL WHERE id=6')
     bid = queue(db)
     async def push(*args,audit):
@@ -408,17 +457,21 @@ def test_route_snapshot_exact_counts_and_acknowledgements_survive_account_cleanu
     bot.send_message.assert_awaited_once()
 
 
-def test_telegram_error_summary_and_new_app_identity_before_delivery_are_safe(jobs_database):
+def test_telegram_error_summary_and_new_push_device_before_delivery_are_safe(jobs_database):
     db = jobs_database
     bid = queue(db,users=(4,6))
     db.query("INSERT INTO user_identities(user_id,provider,provider_user_id) VALUES(6,'apple','local-new-app-account')")
-    bot,push = fake_bot(),AsyncMock(return_value=None)
+    add_push_device(db,6)
+    async def success(*args,audit):
+        audit.update(attempted=1,sent=1,failed=0)
+        return True
+    bot,push = fake_bot(),AsyncMock(side_effect=success)
     bot.send_message.side_effect = TelegramForbiddenError(method=SendMessage(chat_id=1004,text='safe'),message='blocked')
     drain(db,push,bot)
     result = status(db,bid)
     assert result['telegram_routed_users'] == result['app_routed_users'] == 1
     assert result['target_users'] == result['telegram_routed_users'] + result['app_routed_users'] + result['no_delivery_channel']
-    assert result['app_inbox_created'] == result['sent'] == 1 and result['status']=='queued'
+    assert result['app_delivered'] == result['sent'] == 0 and result['status']=='queued'
     assert result['telegram_attempted'] == result['telegram_failed'] == 1
     assert result['telegram_sent'] == 0 and result['telegram_error_classes'] == {'TelegramForbiddenError':1}
     assert bot.send_message.await_args.kwargs['chat_id'] == 1004

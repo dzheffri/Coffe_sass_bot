@@ -35,22 +35,33 @@ def existing_confirmation(connection, token, user_id, shop_id=None, network_id=N
     return row['broadcast_id'] if row else None
 
 
+def _push_device_evidence(connection, alias='u'):
+    """Match the existing enabled iOS sender; identity alone is not a channel."""
+    if connection.execute("SELECT to_regclass('app_push_devices') AS name").fetchone()['name'] is None:
+        return 'FALSE'
+    return (f"EXISTS(SELECT 1 FROM app_push_devices d WHERE d.user_id={alias}.id "
+            "AND d.platform='ios' AND d.notifications_enabled IS TRUE "
+            "AND BTRIM(d.device_token)<>'')")
+
+
 def enqueue_broadcast(connection, broadcast, token, actor_user_id):
     """Same transaction as publication/one-use preview: zero external calls."""
     from app.community_telegram import _app_evidence
 
     recipients = {row['user_id']:row for row in broadcast['recipients']}
-    evidence = connection.execute(f'''SELECT u.id,({_app_evidence(connection)}) AS is_app
+    evidence = connection.execute(f'''SELECT u.id,({_app_evidence(connection)}) AS is_app,
+        ({_push_device_evidence(connection)}) AS has_push_device
         FROM users u WHERE u.id=ANY(%s)''',(list(recipients),)).fetchall()
-    routes = {row['id']:'APP' if row['is_app'] else 'TELEGRAM' if recipients[row['id']].get('telegram_user_id') else 'NONE'
+    routes = {row['id']:'APP' if row['has_push_device'] else 'TELEGRAM' if recipients[row['id']].get('telegram_user_id') else 'NONE'
               for row in evidence}
-    accounting = dict(app_routed_users=list(routes.values()).count('APP'),
-                      app_inbox_created=list(routes.values()).count('APP'),
+    accounting = dict(routing_policy='push_device_priority',app_delivered=0,
+                      app_routed_users=list(routes.values()).count('APP'),
+                      app_inbox_created=sum(row['is_app'] for row in evidence),
                       telegram_routed_users=list(routes.values()).count('TELEGRAM'),
                       no_delivery_channel=list(routes.values()).count('NONE'),
                       apns_users=0,apns_devices_attempted=0,apns_devices_sent=0,apns_failed=0,
                       telegram_attempted=0,telegram_sent=0,telegram_failed=0,
-                      app_unknown=0,telegram_unknown=0,sent=list(routes.values()).count('APP'),failed=0,telegram_error_classes={})
+                      app_unknown=0,telegram_unknown=0,sent=0,failed=0,telegram_error_classes={})
     saved = connection.execute('SELECT media_key FROM broadcasts WHERE id=%s', (broadcast['broadcast_id'],)).fetchone()
     fallback = broadcast.get('media') if not saved['media_key'] else None
     connection.execute('''INSERT INTO broadcast_delivery_jobs
@@ -108,14 +119,19 @@ def _delivery_accounting(result):
               'delivery_pending','delivery_unknown','delivery_accounting_valid')
     if any(result.get(key) is None for key in ('app_inbox_created','telegram_sent','no_delivery_channel')):
         return dict.fromkeys(fields)
-    app,telegram,no_route = (result[key] for key in ('app_inbox_created','telegram_sent','no_delivery_channel'))
+    # Older jobs counted APP inbox as primary delivery. New jobs keep inbox
+    # copies independent of the one active push/Telegram route.
+    app = result.get('app_delivered',result['app_inbox_created'])
+    telegram,no_route = result['telegram_sent'],result['no_delivery_channel']
     remaining = result['target_users']-app-telegram-no_route
+    unknown = result['telegram_unknown']+(result['app_unknown'] if result.get('routing_policy')=='push_device_priority' else 0)
     counts = dict(app_delivered=app,telegram_delivered=telegram,no_route=no_route,
-                  delivery_unknown=result['telegram_unknown'])
+                  delivery_unknown=unknown)
     if remaining < 0:
         return dict(counts,delivery_failed=None,delivery_pending=None,delivery_accounting_valid=False)
     pending = result['status'] in ('queued','sending')
-    failed = min(remaining,result['telegram_failed']+result['telegram_unknown']) if pending else remaining
+    known_failed = result['failed'] if result.get('routing_policy')=='push_device_priority' else result['telegram_failed']+unknown
+    failed = min(remaining,known_failed) if pending else remaining
     return dict(counts,delivery_failed=failed,delivery_pending=remaining-failed,
                 delivery_accounting_valid=True)
 
@@ -224,11 +240,12 @@ async def process_job(connection, broadcast_id, *, push_sender=None, bot_factory
         push_sender = send_broadcast_app_push
     with connection.transaction():
         job = connection.execute('''SELECT b.*,j.scope AS delivery_scope,j.display_name,j.fallback_media_kind,j.fallback_media_filename,
-            j.fallback_media_bytes,j.telegram_file_id FROM broadcasts b JOIN broadcast_delivery_jobs j ON j.broadcast_id=b.id
+            j.fallback_media_bytes,j.telegram_file_id,j.route_accounting FROM broadcasts b JOIN broadcast_delivery_jobs j ON j.broadcast_id=b.id
             WHERE b.id=%s''',(broadcast_id,)).fetchone()
         if not job:
             return
         broadcast = dict(job,broadcast_id=broadcast_id,shop_name=job['display_name'],scope=job['delivery_scope'])
+        push_priority = (job['route_accounting'] or {}).get('routing_policy')=='push_device_priority'
         interrupted_app = connection.execute("UPDATE broadcast_recipient_deliveries SET app_status='unknown',telegram_status='skipped',error_class='InterruptedAppAttempt' WHERE broadcast_id=%s AND app_status='sending' RETURNING user_id",(broadcast_id,)).fetchall()
         interrupted = connection.execute("UPDATE broadcast_recipient_deliveries SET telegram_status='unknown',error_class='InterruptedTelegramAttempt' WHERE broadcast_id=%s AND telegram_status='sending' RETURNING user_id",(broadcast_id,)).fetchall()
         if interrupted_app:
@@ -269,33 +286,48 @@ async def process_job(connection, broadcast_id, *, push_sender=None, bot_factory
                     audit['error_class'] = type(error).__name__
                 with connection.transaction():
                     app_state = ('sent' if outcome is True else 'none' if outcome is None else 'unknown' if audit.get('error_class') else 'failed')
+                    route = row['delivery_route']
+                    fallback = outcome is None and (push_priority or route is None)
+                    if push_priority and fallback:
+                        route = 'TELEGRAM' if row['telegram_user_id'] else 'NONE'
                     updated = connection.execute('''UPDATE broadcast_recipient_deliveries SET app_status=%s,
                         apns_attempted=%s,apns_success=%s,apns_failed=%s,
-                        telegram_status=%s,error_class=%s WHERE broadcast_id=%s AND user_id=%s RETURNING user_id''',
+                        telegram_status=%s,error_class=%s,delivery_route=%s WHERE broadcast_id=%s AND user_id=%s RETURNING user_id''',
                         (app_state,
                          audit.get('attempted',0),audit.get('sent',0),audit.get('failed',0),
-                         'pending' if outcome is None and row['delivery_route'] is None else 'skipped',audit.get('error_class'),broadcast_id,user_id)).fetchone()
+                         'pending' if fallback and row['telegram_user_id'] else 'skipped',audit.get('error_class'),route,broadcast_id,user_id)).fetchone()
                     if updated:
                         _account(connection,broadcast_id,apns_users=int(audit.get('attempted',0)>0),
                             apns_devices_attempted=audit.get('attempted',0),apns_devices_sent=audit.get('sent',0),
                             apns_failed=audit.get('failed',0),
                             app_unknown=int(app_state=='unknown'),failed=int(app_state in ('failed','unknown')))
+                        if push_priority:
+                            if outcome is True:
+                                _account(connection,broadcast_id,app_delivered=1,sent=1)
+                            elif fallback:
+                                _account(connection,broadcast_id,app_routed_users=-1,
+                                    telegram_routed_users=int(route=='TELEGRAM'),no_delivery_channel=int(route=='NONE'))
             with connection.transaction():
                 row = connection.execute('SELECT * FROM broadcast_recipient_deliveries WHERE broadcast_id=%s AND user_id=%s FOR UPDATE',
                                          (broadcast_id,user_id)).fetchone()
                 if not row:
                     continue
                 if row['telegram_status'] == 'pending':
-                    if row['delivery_route']=='TELEGRAM':
+                    permanent_push_fallback = push_priority and row['app_status']=='none' and row['apns_attempted']>0
+                    if row['delivery_route']=='TELEGRAM' and not permanent_push_fallback:
                         from app.community_telegram import _app_evidence
-                        app = connection.execute(f'SELECT ({_app_evidence(connection)}) AS is_app FROM users u WHERE u.id=%s',(user_id,)).fetchone()
+                        predicate = _push_device_evidence(connection) if push_priority else _app_evidence(connection)
+                        app = connection.execute(f'SELECT ({predicate}) AS is_app FROM users u WHERE u.id=%s',(user_id,)).fetchone()
                         if app and app['is_app']:
                             connection.execute("UPDATE broadcast_recipient_deliveries SET delivery_route='APP',app_status='pending',telegram_status='skipped',error_class=NULL WHERE broadcast_id=%s AND user_id=%s",(broadcast_id,user_id))
-                            _account(connection,broadcast_id,app_routed_users=1,app_inbox_created=1,sent=1,telegram_routed_users=-1)
+                            _account(connection,broadcast_id,app_routed_users=1,telegram_routed_users=-1,
+                                     **({} if push_priority else {'app_inbox_created':1,'sent':1}))
                             continue
                     target = connection.execute('SELECT telegram_user_id FROM users WHERE id=%s',(user_id,)).fetchone()
                     if not target or not row['telegram_user_id'] or target['telegram_user_id'] != row['telegram_user_id']:
-                        connection.execute("UPDATE broadcast_recipient_deliveries SET telegram_status='skipped' WHERE broadcast_id=%s AND user_id=%s",(broadcast_id,user_id))
+                        connection.execute("UPDATE broadcast_recipient_deliveries SET telegram_status='skipped',delivery_route=CASE WHEN %s THEN 'NONE' ELSE delivery_route END WHERE broadcast_id=%s AND user_id=%s",(push_priority,broadcast_id,user_id))
+                        if push_priority:
+                            _account(connection,broadcast_id,telegram_routed_users=-1,no_delivery_channel=1)
                         continue
                     connection.execute("UPDATE broadcast_recipient_deliveries SET telegram_status='sending' WHERE broadcast_id=%s AND user_id=%s",(broadcast_id,user_id))
                     telegram = True
